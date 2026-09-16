@@ -1,0 +1,46 @@
+// Root build for the modtest-mcp Java side (Stage 2).
+// Deliberately small: everything protocol-related lives in ./core and is testable without a game.
+plugins {
+    id 'base'
+}
+
+allprojects {
+    group = rootProject.group
+    version = rootProject.version
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects {
+    apply plugin: 'java-library'
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.release = 17
+        options.compilerArgs << '-Xlint:all'
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        testLogging {
+            events 'passed', 'failed', 'skipped'
+            showStandardStreams = false
+            exceptionFormat = 'full'
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Release rail (M6 item 1, stood up now): a *product* artifact must never contain
+// harness classes. Run:  ./gradlew verifyProductJar -PjarPath=<path-to-jar>
+// Exit code 0 = clean, 1 = harness entries found inside a product jar.
+// ---------------------------------------------------------------------------
+tasks.register('verifyProductJar', JavaExec) {
+    group = 'verification'
+    description = 'Fails if a product jar contains harness entries (io/github/minatoai/modtest/**)'
+    dependsOn ':core:jar'
+    classpath = files(project(':core').tasks.named('jar').map { it.archiveFile })
+    mainClass = 'io.github.minatoai.modtest.core.HarnessEntryCheck'
+    args = [project.findProperty('jarPath') ?: project(':core').tasks.named('jar').get().archiveFile.get().asFile.absolutePath]
+}

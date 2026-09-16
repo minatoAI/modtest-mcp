@@ -1,0 +1,11 @@
+rootProject.name = 'modtest-mcp'
+
+// Stage 2: the Java side of the harness.
+//  core  - protocol relay (M1), input-injection guard (M2) and ticket executor (M3), pure JVM:
+//          no Minecraft and no Forge on the classpath, so every rule is unit-testable.
+//  forge - the thin Forge 1.20.1 adapter (mixins + ClientModel implementation) that makes a real
+//          client answerable to the protocol. It is a *consumer* of core, never the other way round.
+include 'core'
+if (file('forge/build.gradle').exists()) {
+    include 'forge'
+}

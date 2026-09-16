@@ -1,0 +1,22 @@
+// core: the protocol relay (M1), the input-injection guard (M2) and the ticket executor (M3).
+// Pure JVM. No Minecraft, no Forge, no networking: the whole point is that the rules can be
+// executed and asserted in a unit test.
+dependencies {
+    implementation 'com.google.code.gson:gson:2.10.1'
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+jar {
+    archiveBaseName = 'modtest-harness-core'
+    manifest {
+        attributes(
+                'Implementation-Title': 'modtest-mcp harness core (DEV ONLY)',
+                'Implementation-Version': project.version,
+                'Modtest-Artifact': 'harness',
+                'Modtest-Warning': 'Development harness. Must never be bundled into a product jar.'
+        )
+    }
+}

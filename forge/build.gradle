@@ -26,6 +26,14 @@ minecraft {
 
 dependencies {
     minecraft 'net.minecraftforge:forge:1.20.1-47.1.3'
+    // :core stays an independent pure-JVM module (its own sources, its own 81 tests, no Minecraft on
+    // its classpath). Its *compiled classes* are merged into this jar below.
+    //
+    // Why not Forge's standard JarJar: JarJar refuses a dependency whose version carries a
+    // prerelease qualifier — "The given version specification is invalid: 1.0.0-alpha.1 … convert
+    // this to a maven compatible format" (and "1.0.0-alpha-1" fails identically). The version line
+    // is a project decision, and faking an embedded version to satisfy the tool would make the
+    // artifact lie about itself, so the sanctioned fallback (merge) is used instead.
     implementation project(':core')
     annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 }
@@ -141,8 +149,79 @@ tasks.register('verifyMixinRefmap') {
     }
 }
 
+// ---- guardrail: the artifact must carry the :core library -----------------------------------
+// The P0c crash was NoClassDefFoundError for a :core class at mod construction time: the jar had
+// 15 entries and zero of them were :core. This check asserts the packaged artifact actually
+// contains the compiled core classes — either nested (JarJar, META-INF/jarjar/*.jar) or top-level —
+// and that the embedded count matches what :core compiled. Fewer than compiled => build fails.
+tasks.register('verifySelfContainedJar') {
+    group = 'verification'
+    description = 'Fails the build when the packaged jar does not carry the :core library'
+    dependsOn 'jar'
+    outputs.upToDateWhen { false }
+    doLast {
+        def coreClassesDir = project(':core').layout.buildDirectory.dir('classes/java/main').get().asFile
+        def coreClasses = coreClassesDir.exists()
+                ? fileTree(coreClassesDir) { include 'io/github/minatoai/modtest/core/**/*.class' }.files.size()
+                : 0
+        def jarFile = tasks.named('jar').get().archiveFile.get().asFile
+        if (!jarFile.exists()) {
+            throw new GradleException("[modtest] self-contained guardrail: no jar at ${jarFile}")
+        }
+        int topLevelCore = 0
+        def nestedJars = [:]
+        def metadata = null
+        new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
+            zf.entries().each { e ->
+                if (e.name.startsWith('io/github/minatoai/modtest/core/') && e.name.endsWith('.class')) {
+                    topLevelCore++
+                }
+                if (e.name.startsWith('META-INF/jarjar/') && e.name.endsWith('.jar')) {
+                    def tmp = File.createTempFile('modtest-nested', '.jar')
+                    try {
+                        zf.getInputStream(e).withStream { ins -> tmp.withOutputStream { os -> os << ins } }
+                        new java.util.zip.ZipFile(tmp).withCloseable { nz ->
+                            nestedJars[e.name] = nz.entries().findAll {
+                                it.name.startsWith('io/github/minatoai/modtest/core/') && it.name.endsWith('.class')
+                            }.size()
+                        }
+                    } finally {
+                        tmp.delete()
+                    }
+                }
+                if (e.name == 'META-INF/jarjar/metadata.json') {
+                    zf.getInputStream(e).withStream { ins -> metadata = ins.getText('UTF-8') }
+                }
+            }
+        }
+        int nestedCore = nestedJars.values().sum() ?: 0
+        logger.lifecycle("[modtest] self-contained check: :core compiled=${coreClasses} class(es); " +
+                "top-level core=${topLevelCore}; nested jars=${nestedJars}; metadata=${metadata}")
+        if (topLevelCore + nestedCore == 0) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: the jar carries NO " +
+                    ":core classes (top-level=0, nested=0). Use jarJar(implementation(project(':core'))) " +
+                    "or provide core another way — do not merge core's sources into :forge.")
+        }
+        if (coreClasses > 0 && topLevelCore + nestedCore < coreClasses) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: only " +
+                    "${topLevelCore + nestedCore} of ${coreClasses} compiled :core classes are packaged")
+        }
+        if (!nestedJars.isEmpty() && (metadata == null || !metadata.contains('modtest-harness-core'))) {
+            logger.warn("[modtest] self-contained guardrail: META-INF/jarjar/metadata.json missing or " +
+                    "does not name modtest-harness-core (nested jar may not be registered)")
+        }
+        logger.lifecycle("[modtest] self-contained guardrail OK: ${topLevelCore + nestedCore} :core " +
+                "class(es) packaged (top-level=${topLevelCore}, nested=${nestedCore})")
+    }
+}
+
 tasks.named('jar') {
     finalizedBy 'verifyMixinRefmap'
+    finalizedBy 'verifySelfContainedJar'
+    // Merge :core's compiled classes into this jar (no source merging: :core keeps its own module,
+    // its own test suite and a Minecraft-free classpath). reobfJar then reobfuscates everything;
+    // :core contains no Minecraft references, so reobf is a no-op for it.
+    from(project(':core').sourceSets.main.output)
     archiveBaseName = 'modtest-harness-forge'
     manifest {
         attributes(

@@ -22,7 +22,71 @@ dependencies {
 // Same build flag as :core, so both artifacts identify the same way (see Guard.BuildVariant).
 def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
 
+// ---- mixin refmap (production / SRG domain) -----------------------------------------------
+// Without a refmap, Mixin resolves the annotation's *named* string ("aiStep") against the
+// *SRG-domain* runtime class, finds nothing, and kills the game at startup:
+//   "Reference map 'modtest.refmap.json' … could not be read … No refMap loaded"
+// No Mixin annotation processor is wired under ForgeGradle 6, so the map is written from the very
+// TSRG table `reobfJar` uses; the refmap therefore cannot disagree with the reobfuscated bytecode.
+def mixinConfig = 'modtest.harness.mixins.json'
+def refmapFileName = 'modtest.refmap.json'
+// mixin class (slash path, as mixins.json package+name resolves) -> owner -> officialMember -> desc
+def mixinTargets = [
+        'io/github/minatoai/modtest/forge/mixin/InputInjectionMixin': [
+                'net/minecraft/client/player/LocalPlayer': ['aiStep': '()V']
+        ]
+]
+
+tasks.register('generateRefmap') {
+    group = 'build'
+    description = 'Writes the Mixin refmap (named -> SRG) for the production domain'
+    dependsOn 'createMcpToSrg'
+    def tsrg = file("$buildDir/createMcpToSrg/output.tsrg")
+    def out = file("$buildDir/generated/refmap/${refmapFileName}")
+    inputs.file tsrg
+    outputs.file out
+    doLast {
+        def lines = tsrg.readLines('UTF-8')
+        // TSRG v1: a class header is "<owner> <srgOwner>"; its members are tab-indented
+        // "<officialName> <desc> <srgName>" lines.
+        def lookup = { String owner, String member, String desc ->
+            int start = lines.findIndexOf { it.startsWith(owner + ' ') && !it.startsWith("\t") }
+            if (start < 0) {
+                throw new GradleException("[modtest] TSRG has no class ${owner}")
+            }
+            for (int i = start + 1; i < lines.size() && lines[i].startsWith("\t"); i++) {
+                def f = lines[i].trim().split(/\s+/)
+                if (f.length >= 3 && f[0] == member && f[1] == desc) {
+                    return f[2]
+                }
+            }
+            throw new GradleException("[modtest] TSRG has no member ${owner}.${member}${desc}")
+        }
+        def mappings = [:]
+        mixinTargets.each { mixinClass, owners ->
+            def per = [:]
+            owners.each { owner, members ->
+                members.each { member, desc ->
+                    def srg = lookup(owner, member, desc)
+                    per[member] = "L${owner};${srg}${desc}"
+                    logger.lifecycle("[modtest] refmap ${mixinClass}.${member} -> L${owner};${srg}${desc}")
+                }
+            }
+            mappings[mixinClass] = per
+            // Mixin also accepts the dotted class name; an extra key is ignored unless it is looked up.
+            mappings[mixinClass.replace('/', '.')] = per
+        }
+        out.parentFile.mkdirs()
+        out.text = '{\n  "mappings": ' + groovy.json.JsonOutput.toJson(mappings) + ',\n  "data": {}\n}\n'
+        logger.lifecycle("[modtest] refmap written: ${out}")
+    }
+}
+
 jar {
+    dependsOn 'generateRefmap'
+    from("$buildDir/generated/refmap") {
+        include refmapFileName
+    }
     archiveBaseName = 'modtest-harness-forge'
     manifest {
         attributes(

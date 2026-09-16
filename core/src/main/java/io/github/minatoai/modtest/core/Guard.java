@@ -234,8 +234,66 @@ public final class Guard {
     /** One injection request. Values are player-input axes, never world mutations. */
     public record InputCommand(float forward, float strafe, float yawDelta, float pitchDelta,
                                boolean jump, boolean sneak, boolean sprint) {
+        /**
+         * Parameter names accepted by {@code input.set}. {@code ticks} is a hold duration consumed
+         * by the executor, not part of the command value.
+         */
+        public static final java.util.Set<String> PARAMS = java.util.Set.of(
+                "forward", "strafe", "yawDelta", "pitchDelta", "jump", "sneak", "sprint", "ticks");
+
         public static InputCommand none() {
             return new InputCommand(0f, 0f, 0f, 0f, false, false, false);
+        }
+
+        /**
+         * Builds a command from {@code input.set} params. Missing fields default to zero, so an
+         * empty {@code params} object is byte-for-byte the old behaviour (a no-op command).
+         */
+        public static InputCommand fromParams(com.google.gson.JsonObject params) {
+            if (params == null || params.isEmpty()) {
+                return none();
+            }
+            for (String key : params.keySet()) {
+                if (!PARAMS.contains(key)) {
+                    throw badParam(key, "unknown input param");
+                }
+            }
+            return new InputCommand(num(params, "forward"), num(params, "strafe"), num(params, "yawDelta"),
+                    num(params, "pitchDelta"), flag(params, "jump"), flag(params, "sneak"), flag(params, "sprint"));
+        }
+
+        /** Human-readable command summary for the audit line. */
+        public String summary() {
+            return String.format(java.util.Locale.ROOT,
+                    "forward=%.3f strafe=%.3f yaw=%.3f pitch=%.3f jump=%s sneak=%s sprint=%s",
+                    forward, strafe, yawDelta, pitchDelta, jump, sneak, sprint);
+        }
+
+        private static float num(com.google.gson.JsonObject p, String key) {
+            com.google.gson.JsonElement e = p.get(key);
+            if (e == null || e.isJsonNull()) {
+                return 0f;
+            }
+            if (!e.isJsonPrimitive() || !e.getAsJsonPrimitive().isNumber()) {
+                throw badParam(key, "param must be a number");
+            }
+            return e.getAsFloat();
+        }
+
+        private static boolean flag(com.google.gson.JsonObject p, String key) {
+            com.google.gson.JsonElement e = p.get(key);
+            if (e == null || e.isJsonNull()) {
+                return false;
+            }
+            if (!e.isJsonPrimitive() || !e.getAsJsonPrimitive().isBoolean()) {
+                throw badParam(key, "param must be a boolean");
+            }
+            return e.getAsBoolean();
+        }
+
+        private static Protocol.ProtocolException badParam(String key, String why) {
+            return (Protocol.ProtocolException) new Protocol.ProtocolException(
+                    Protocol.ErrorCode.E_BAD_PARAMS, why + ": " + key).with("path", "params." + key);
         }
     }
 
@@ -244,14 +302,14 @@ public final class Guard {
         void write(InputCommand command);
     }
 
-    /** A loud, auditable record of one allowance. */
+    /** A loud, auditable record of one allowance, including the command that was actually written. */
     public record Allowance(String executorId, String host, String dimension, long atMs,
-                            String tokenFingerprint, String op, String reason) {
+                            String tokenFingerprint, String op, String command, String reason) {
         /** One line, deliberately greppable and deliberately not containing the token value. */
         public String format() {
             return "ALLOWED-INPUT executor=" + executorId + " host=" + (host == null ? "singleplayer" : host)
                     + " dimension=" + dimension + " at=" + atMs + " token=" + tokenFingerprint
-                    + " op=" + op + " reason=" + reason;
+                    + " op=" + op + " cmd=[" + command + "] reason=" + reason;
         }
     }
 
@@ -348,12 +406,13 @@ public final class Guard {
                     + "' is not whitelisted (default deny)");
         }
 
-        /** Builds the audit record for an allowance. */
+        /** Builds the audit record for an allowance, including the command that will be written. */
         public Allowance allowanceFor(Protocol.OpSpec op, SessionState session, ActivationState activation,
-                                      Bridge.Clock clock, String reason) {
+                                      Bridge.Clock clock, InputCommand command, String reason) {
             ActivationToken token = activation == null ? null : activation.token();
             return new Allowance(executorId, session.serverAddress(), dimension.get(), clock.nowMs(),
-                    token == null ? "none" : token.fingerprint(), op == null ? "?" : op.name(), reason);
+                    token == null ? "none" : token.fingerprint(), op == null ? "?" : op.name(),
+                    command == null ? "none" : command.summary(), reason);
         }
     }
 
@@ -432,15 +491,17 @@ public final class Guard {
                 noops++;
                 return decision;
             }
-            if (op != null && op.sideEffects() != null
-                    && op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
-                Allowance allowance = policy.allowanceFor(op, session, activation, clock, decision.reason());
-                allowances.add(allowance);
-                audit.allowance(allowance);   // loud by design: who, which host, when, which token
-            }
             HumanSpeedClamp.Result clamped = clamp.apply(command);
             clampedAxes += clamped.clamped().size();
             lastCommand = clamped.command();
+            if (op != null && op.sideEffects() != null
+                    && op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
+                // Audited after clamping: the line records the values actually handed to the client.
+                Allowance allowance = policy.allowanceFor(op, session, activation, clock, clamped.command(),
+                        decision.reason());
+                allowances.add(allowance);
+                audit.allowance(allowance);   // loud by design: who, which host, when, which token, what
+            }
             delegate.write(clamped.command());
             performed++;
             return decision;

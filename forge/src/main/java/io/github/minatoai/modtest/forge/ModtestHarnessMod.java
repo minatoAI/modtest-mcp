@@ -40,6 +40,11 @@ public final class ModtestHarnessMod {
     private static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
 
     private static final AtomicReference<Guard.InputCommand> PENDING = new AtomicReference<>();
+    /** Remaining ticks to hold the queued command (0 = nothing queued). */
+    private static final java.util.concurrent.atomic.AtomicInteger PENDING_TICKS =
+            new java.util.concurrent.atomic.AtomicInteger();
+    /** Upper bound on a hold duration, so one ticket cannot drive input indefinitely. */
+    public static final int MAX_TICKS = 200;
 
     private static Bridge.BridgeConfig config;
     private static Relay.BridgeRelay relay;
@@ -71,8 +76,8 @@ public final class ModtestHarnessMod {
 
         Executor.OpCatalog catalog = VanillaOps.install(
                 new Executor.OpCatalog("forge-client", "0.1.0", "modtest-harness-forge"));
-        inputOp = new Protocol.OpSpec("input.set", "Queue a player-input command",
-                io.github.minatoai.modtest.core.Json.object(), io.github.minatoai.modtest.core.Json.object(),
+        inputOp = new Protocol.OpSpec("input.set", "Queue a player-input command", inputParamsSchema(),
+                io.github.minatoai.modtest.core.Json.object(),
                 List.of(Protocol.Precondition.of("permitted-session")),
                 List.of(Protocol.SideEffect.PLAYER_INPUT), "forge-client", null, "1.0");
         catalog.register(inputOp, ModtestHarnessMod::queueInput);
@@ -104,17 +109,67 @@ public final class ModtestHarnessMod {
                 config.dir(), devFlag, activation.active(Bridge.Clock.system()), config.allowedHosts().hosts());
     }
 
+    /** The authoritative params schema for {@code input.set} (mirrored in docs/PROTOCOL.md §6.2). */
+    private static JsonObject inputParamsSchema() {
+        JsonObject schema = new JsonObject();
+        schema.addProperty("type", "object");
+        schema.addProperty("additionalProperties", false);
+        JsonObject props = new JsonObject();
+        for (String f : List.of("forward", "strafe", "yawDelta", "pitchDelta")) {
+            JsonObject p = new JsonObject();
+            p.addProperty("type", "number");
+            props.add(f, p);
+        }
+        for (String f : List.of("jump", "sneak", "sprint")) {
+            JsonObject p = new JsonObject();
+            p.addProperty("type", "boolean");
+            props.add(f, p);
+        }
+        JsonObject ticks = new JsonObject();
+        ticks.addProperty("type", "integer");
+        props.add("ticks", ticks);
+        schema.add("properties", props);
+        return schema;
+    }
+
     /** Op handler: never writes directly — it queues, and the mixin submits through the guard. */
     private static JsonObject queueInput(Protocol.Ticket.Op op, Executor.ExecContext ctx) {
         Minecraft mc = Minecraft.getInstance();
-        Guard.Decision decision = guardedWriter.submit(Guard.InputCommand.none(), inputOp,
+        // The ticket's params decide *what* to write; an empty params object is the old no-op
+        // command, byte for byte. `ticks` is a hold duration, not part of the command value.
+        Guard.InputCommand command = Guard.InputCommand.fromParams(op.params());
+        int ticks = readTicks(op.params());
+        Guard.Decision decision = guardedWriter.submit(command, inputOp,
                 new MinecraftSessionState(mc), activation, Bridge.Clock.system());
-        JsonObject out = JsonObject.class.cast(
-                com.google.gson.JsonParser.parseString("{\"queued\":true}"));
+        if (decision.allowed() && !decision.noop() && ticks > 1) {
+            PENDING_TICKS.set(ticks - 1);
+        }
+        JsonObject out = new JsonObject();
+        out.addProperty("queued", true);
         out.addProperty("allowed", decision.allowed());
         out.addProperty("noop", decision.noop());
         out.addProperty("reason", decision.reason());
+        out.addProperty("ticks", ticks);
+        out.addProperty("command", command.summary());
         return out;
+    }
+
+    /** Hold duration for a queued command; 1 means "this tick only". Bounded by design. */
+    private static int readTicks(com.google.gson.JsonObject params) {
+        com.google.gson.JsonElement e = params == null ? null : params.get("ticks");
+        if (e == null || e.isJsonNull()) {
+            return 1;
+        }
+        if (!e.isJsonPrimitive() || !e.getAsJsonPrimitive().isNumber()) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
+                    "param 'ticks' must be a number");
+        }
+        int ticks = e.getAsInt();
+        if (ticks < 1 || ticks > MAX_TICKS) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
+                    "param 'ticks' must be within 1.." + MAX_TICKS);
+        }
+        return ticks;
     }
 
     /** Called from the mixin right after vanilla updated the player input for this tick. */
@@ -126,10 +181,23 @@ public final class ModtestHarnessMod {
         Guard.Decision decision = guardedWriter.submit(pending, inputOp, new MinecraftSessionState(mc),
                 activation, Bridge.Clock.system());
         if (decision.allowed() && !decision.noop()) {
-            mc.player.input.forwardImpulse = pending.forward();
-            mc.player.input.leftImpulse = pending.strafe();
-            mc.player.setYRot(mc.player.getYRot() + pending.yawDelta());
-            mc.player.setXRot(mc.player.getXRot() + pending.pitchDelta());
+            // Re-submitted every tick of the hold, so the guard decides every single write.
+            int remaining = PENDING_TICKS.getAndSet(0);
+            if (remaining > 0) {
+                PENDING.set(pending);
+                PENDING_TICKS.set(remaining - 1);
+            }
+            var clamped = guardedWriter.lastCommand() == null ? pending : guardedWriter.lastCommand();
+            mc.player.input.forwardImpulse = clamped.forward();
+            mc.player.input.leftImpulse = clamped.strafe();
+            mc.player.setYRot(mc.player.getYRot() + clamped.yawDelta());
+            mc.player.setXRot(mc.player.getXRot() + clamped.pitchDelta());
+            if (clamped.jump()) {
+                mc.player.input.jumping = true;
+            }
+            if (clamped.sneak()) {
+                mc.player.input.shiftKeyDown = true;
+            }
         }
     }
 

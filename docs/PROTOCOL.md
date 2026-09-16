@@ -251,6 +251,41 @@ Allowed JSON Schema keywords in 1.0 (validators may reject others):
 `oneOf`, `anyOf`, `default`, `description`, `title`, `minimum`, `maximum`, `minLength`,
 `maxLength`, `pattern`, `minItems`, `maxItems`.
 
+**Example — `input.set`, the one op that writes player input** (see §7.2 for its gates):
+
+```json
+{
+  "name": "input.set",
+  "title": "Queue a player-input command",
+  "paramsSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "forward":    { "type": "number" },
+      "strafe":     { "type": "number" },
+      "yawDelta":   { "type": "number" },
+      "pitchDelta": { "type": "number" },
+      "jump":       { "type": "boolean" },
+      "sneak":      { "type": "boolean" },
+      "sprint":     { "type": "boolean" },
+      "ticks":      { "type": "integer" }
+    }
+  },
+  "resultSchema": { "type": "object" },
+  "preconditions": [{ "kind": "permitted-session" }],
+  "sideEffects": ["player.input"],
+  "executorId": "forge-client",
+  "since": "1.0"
+}
+```
+
+Field semantics: every field is optional and **missing fields default to zero/false**, so
+`{"params": {}}` is a no-op command (equivalent to the pre-parameter behaviour). Values are clamped
+to the human-speed envelope (§7.2) *before* they reach the client, and the audit line records the
+values actually written. `ticks` is a **hold duration** (the reference implementation allows 1..200);
+it is a scheduling hint, not part of the command value, and every tick of the hold is re-evaluated
+by the guard.
+
 ### 6.3 Preconditions
 
 | Kind | Payload | Satisfied when |

@@ -133,7 +133,17 @@ public final class MinecraftClientModel implements ClientModel {
 
     @Override
     public void placeBlock(int x, int y, int z, String block) {
-        player().level().setBlockAndUpdate(new BlockPos(x, y, z), Blocks.STONE.defaultBlockState());
+        // Honour the requested block instead of silently placing stone: the ticket contract says
+        // `world.place {block}`, so an unknown id is an error, not a substitution.
+        String id = io.github.minatoai.modtest.core.BlockIds.normalize(block);
+        net.minecraft.world.level.block.Block target =
+                net.minecraftforge.registries.ForgeRegistries.BLOCKS.getValue(
+                        net.minecraft.resources.ResourceLocation.tryParse(id));
+        if (target == null || target == net.minecraft.world.level.block.Blocks.AIR) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
+                    "unknown block: " + id);
+        }
+        player().level().setBlockAndUpdate(new BlockPos(x, y, z), target.defaultBlockState());
     }
 
     @Override

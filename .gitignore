@@ -19,3 +19,8 @@ venv/
 out/
 scratch/
 *.tmp
+
+# gradle / java build state (never commit: it embeds local absolute paths and machine-specific caches)
+.gradle/
+build/
+.kotlin/

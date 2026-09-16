@@ -33,10 +33,13 @@ looks) and the one that must be impossible to misuse.
 | # | Item | Acceptance |
 |---|---|---|
 | 1 | Port the input writer (post-`Input.tick` write inside `aiStep`) as a self-contained unit | zero mod-specific imports; compiles against a vanilla dev workspace |
-| 2 | **Default OFF + explicit activation token** (not just a probe flag): activation requires a dev-build flag *and* a one-shot token with an expiry | without both, a ticket op touching input fails `E_PRECONDITION`; unit test proves the refusal |
-| 3 | **Remote-server refusal guard** (normative, §7.2): if `hasSingleplayerServer()` is false / `getCurrentServer() != null`, every mutating op fails `E_PRECONDITION` before any write | integration test: fake a remote session → no input write happens (assert via a counter in the writer) |
-| 4 | Rate/amplitude clamps (human-speed envelope) documented as *safety* limits, not features | a ticket asking for superhuman speed is clamped or rejected, and the receipt says which |
-| 5 | No-op when the client is paused/not in a world; no writes during server handshake | unit tests for both states |
+| 2 | **Default OFF + explicit activation token** (not just a probe flag): a dev-build flag *and* a token with an expiry, issued out-of-band by the operator | without both, an op touching input fails `E_PRECONDITION`; unit test proves the refusal |
+| 3 | **Guard tier 1 — read-only ops are never gated** by the injection policy | a read-only op is allowed on any host and performs zero writes |
+| 4 | **Guard tier 2 — writing input requires the armed state** (dev flag + unexpired token, §7.2) | missing/expired token ⇒ `E_PRECONDITION` and no write; a token that expires mid-session stops working |
+| 5 | **Guard tier 3 — default deny + explicit host allow-list**: single-player, or a host the operator declared as theirs (`localhost`/`127.0.0.1`/own dev server); **undeclared hosts are refused before any write**; **every allowance is audited loudly** (who / host / time / token *fingerprint* / op — never the token value) | fake an undeclared remote session ⇒ zero writes (counter in the writer); declared host ⇒ exactly one write plus an `ALLOWED-INPUT …` audit line |
+| 6 | Rate/amplitude clamps (human-speed envelope) documented as *safety* limits, not features | a ticket asking for superhuman speed is clamped or rejected, and the receipt says which |
+| 7 | No-op when the client is paused / not in a world / in handshake | unit tests for all three states |
+| 8 | **Two variants from one source tree**: guarded (default, the only released one) and unguarded (`-Punguarded`, self-compiled) | artifact self-identifies: manifest `Modtest-Guard-Variant`, version line `guard=…`, startup warning; an unstamped artifact counts as guarded; every release artifact is guarded |
 
 ## M3. `ticket-executor` (generic primitives)
 

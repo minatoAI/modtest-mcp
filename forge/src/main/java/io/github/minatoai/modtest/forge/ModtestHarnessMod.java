@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *       sessions before any write.</li>
  * </ul>
  */
-@Mod(value = "modtestharness", dist = Dist.CLIENT)
+@Mod(ModtestHarnessMod.MOD_ID)
 public final class ModtestHarnessMod {
     public static final String MOD_ID = "modtestharness";
     private static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
@@ -50,6 +50,10 @@ public final class ModtestHarnessMod {
     private static int writeCount;
 
     public ModtestHarnessMod() {
+        if (!net.minecraftforge.fml.loading.FMLEnvironment.dist.isClient()) {
+            LOG.info("[modtest-mcp] dedicated server detected: harness stays inert");
+            return;
+        }
         Map<String, String> env = System.getenv();
         if (env.get("MODTEST_AGENT_DIR") == null) {
             LOG.info("[modtest-mcp] harness idle: MODTEST_AGENT_DIR is not set (off by default)");
@@ -67,8 +71,9 @@ public final class ModtestHarnessMod {
 
         Executor.OpCatalog catalog = VanillaOps.install(
                 new Executor.OpCatalog("forge-client", "0.1.0", "modtest-harness-forge"));
-        inputOp = new Protocol.OpSpec("input.set", "Queue a player-input command", Json.object(), Json.object(),
-                List.of(Protocol.Precondition.of("singleplayer")),
+        inputOp = new Protocol.OpSpec("input.set", "Queue a player-input command",
+                io.github.minatoai.modtest.core.Json.object(), io.github.minatoai.modtest.core.Json.object(),
+                List.of(Protocol.Precondition.of("permitted-session")),
                 List.of(Protocol.SideEffect.PLAYER_INPUT), "forge-client", null, "1.0");
         catalog.register(inputOp, ModtestHarnessMod::queueInput);
 

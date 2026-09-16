@@ -1,3 +1,13 @@
+// Must be the first statement in a settings script.
+// ForgeGradle is published to the Forge maven; the Gradle Plugin Portal mirrors it only sometimes.
+// Declaring the repository is build configuration, not proxy/credential persistence.
+pluginManagement {
+    repositories {
+        maven { url = uri('https://maven.minecraftforge.net/') }
+        gradlePluginPortal()
+    }
+}
+
 rootProject.name = 'modtest-mcp'
 
 // Stage 2: the Java side of the harness.

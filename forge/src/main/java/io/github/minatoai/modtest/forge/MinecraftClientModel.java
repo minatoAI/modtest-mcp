@@ -63,7 +63,7 @@ public final class MinecraftClientModel implements ClientModel {
     @Override
     public String heldItemId() {
         ItemStack held = player().getMainHandItem();
-        return held.isEmpty() ? "" : net.minecraft.core.registries.BuiltInRegistries.ITEM
+        return held.isEmpty() ? "" : net.minecraftforge.registries.ForgeRegistries.ITEMS
                 .getKey(held.getItem()).toString();
     }
 
@@ -85,7 +85,7 @@ public final class MinecraftClientModel implements ClientModel {
         LocalPlayer p = player();
         for (int i = 0; i < p.getInventory().getContainerSize(); i++) {
             ItemStack s = p.getInventory().getItem(i);
-            out.add(s.isEmpty() ? "" : net.minecraft.core.registries.BuiltInRegistries.ITEM
+            out.add(s.isEmpty() ? "" : net.minecraftforge.registries.ForgeRegistries.ITEMS
                     .getKey(s.getItem()).toString());
         }
         return out;

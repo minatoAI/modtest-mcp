@@ -20,7 +20,7 @@ import sys
 import time
 from typing import Any, Callable
 
-__version__ = "1.0.0"
+__version__ = "1.0.0a1"
 
 PROTOCOL_ID = "modtest-bridge/1.0"
 SERVER_NAME = "modtest-mcp"

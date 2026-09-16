@@ -19,6 +19,9 @@ dependencies {
     implementation project(':core')
 }
 
+// Same build flag as :core, so both artifacts identify the same way (see Guard.BuildVariant).
+def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
+
 jar {
     archiveBaseName = 'modtest-harness-forge'
     manifest {
@@ -26,8 +29,11 @@ jar {
                 'Implementation-Title': 'modtest-mcp Forge adapter (DEV ONLY)',
                 'Implementation-Version': project.version,
                 'Modtest-Artifact': 'harness',
+                'Modtest-Guard-Variant': guardVariant,
                 'MixinConfigs': 'modtest.harness.mixins.json',
-                'Modtest-Warning': 'Development harness. Never bundle into a product jar.'
+                'Modtest-Warning': guardVariant == 'guarded'
+                        ? 'Development harness. Guarded build. Never bundle into a product jar.'
+                        : 'UNGUARDED DEVELOPMENT HARNESS BUILD: the injection policy is disabled. Use only on servers you own. Never redistribute.'
         )
     }
 }

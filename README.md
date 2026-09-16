@@ -10,6 +10,10 @@
 > changes between preview releases, and pin a commit if you build against it.
 > The Java side is built from one source tree in two variants — a **guarded** default and a
 > self-compiled **unguarded** one; see [§8](#8-guarded-and-unguarded-builds--read-this-before-building-from-source).
+> **Versions:** tag `v1.0.0` marks the **first preview drop** (there is no stable release yet —
+> current version line is `1.0.0a1` / `1.0.0-alpha.1`). The **protocol version**
+> (`modtest-bridge/1.0`) and the **product version** are independent: the protocol can stay at 1.0
+> while the tool is still a preview.
 
 `mcp-name: io.github.minatoAI/modtest-mcp`
 
@@ -154,7 +158,7 @@ is the injection guard described in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §7.2
 **Both variants identify themselves**, so a build can never be passed off as the other one:
 
 * the jar manifest carries `Modtest-Guard-Variant: guarded` or `unguarded`;
-* the version line reports it — `modtest-harness-core 0.1.0 guard=GUARDED`;
+* the version line reports it — `modtest-harness-core 1.0.0-alpha.1 guard=GUARDED`;
 * an **unguarded** build logs a warning at startup: *"UNGUARDED BUILD: the injection policy is
   disabled…"*;
 * an artifact with no stamp at all is treated as **guarded** (fail closed).

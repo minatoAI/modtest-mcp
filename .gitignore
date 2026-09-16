@@ -1,0 +1,21 @@
+# bridge runtime (never commit tickets, receipts or telemetry)
+.modtest-agent/
+*.result.json
+
+# local overrides
+.env
+*.local
+
+# python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# analyzer scratch output
+out/
+scratch/
+*.tmp

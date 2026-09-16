@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modtest-mcp"
+version = "1.0.0"
+description = "MCP server for a local Minecraft mod-test file bridge (modtest-bridge/1.0): structured tickets in, structured telemetry out."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "modtest-mcp contributors" }]
+keywords = ["mcp", "model-context-protocol", "minecraft", "modding", "testing", "qa", "harness"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = []          # standard library only, by design
+
+[project.urls]
+Homepage = "https://github.com/minatoAI/modtest-mcp"
+Repository = "https://github.com/minatoAI/modtest-mcp"
+Documentation = "https://github.com/minatoAI/modtest-mcp/blob/main/docs/PROTOCOL.md"
+
+[project.scripts]
+modtest-mcp = "modtest_mcp.server:main"
+modtest-mcp-smoke = "modtest_mcp.smoke:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -461,18 +461,41 @@ public final class Guard {
         private final List<Allowance> allowances = new ArrayList<>();
         private InputCommand lastCommand;
 
-        public GuardedInputWriter(InputWriter delegate, InputInjectionPolicy policy, HumanSpeedClamp clamp) {
-            this(delegate, policy, clamp, allowance -> {
-            });
-        }
-
+        /**
+         * The only constructor: the audit sink is mandatory.
+         *
+         * <p>A convenience overload that defaulted the sink to a no-op used to exist and production
+         * silently took it, so "loud by design" allowances were invisible on a real client while
+         * every unit test (which passed a sink) stayed green. Same family as compiling against a
+         * different library version than the one that runs: the tested path was not the shipped path.
+         * {@code AuditWiringTest} asserts this class exposes exactly one constructor, so the silent
+         * shortcut cannot return unnoticed.
+         */
         public GuardedInputWriter(InputWriter delegate, InputInjectionPolicy policy, HumanSpeedClamp clamp,
                                   AuditSink audit) {
+            if (audit == null) {
+                throw new IllegalArgumentException(
+                        "an audit sink is mandatory: an allowance must never go unlogged");
+            }
             this.delegate = delegate;
             this.policy = policy;
             this.clamp = clamp;
-            this.audit = audit == null ? allowance -> {
-            } : audit;
+            this.audit = audit;
+        }
+
+        /**
+         * Production entry point — the same construction path the tests exercise. Every allowance
+         * goes to {@code log} (who, which host, when, token fingerprint, which op, which command).
+         * The token <i>value</i> never appears; only its fingerprint does.
+         */
+        public static GuardedInputWriter audited(InputWriter delegate, InputInjectionPolicy policy,
+                                                 HumanSpeedClamp clamp,
+                                                 java.util.function.Consumer<String> log) {
+            if (log == null) {
+                throw new IllegalArgumentException(
+                        "a log sink is mandatory: an allowance must never go unlogged");
+            }
+            return new GuardedInputWriter(delegate, policy, clamp, AuditSink.to(log));
         }
 
         public Decision submit(InputCommand command, Protocol.OpSpec op, SessionState session,

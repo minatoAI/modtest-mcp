@@ -64,9 +64,13 @@ public final class ModtestHarnessMod {
             LOG.info("[modtest-mcp] harness idle: MODTEST_AGENT_DIR is not set (off by default)");
             return;
         }
+        // The declared-host whitelist must be wired here: assembling the 7-arg BridgeConfig left it
+        // at its empty default, which silently disabled the whole "hosts I own" feature in production
+        // (a self-hosted dev server could never be used), while the config looked perfectly valid.
         config = new Bridge.BridgeConfig(Path.of(env.get("MODTEST_AGENT_DIR")), 500L, "forge-client",
                 "0.1.0", Boolean.parseBoolean(env.getOrDefault("MODTEST_ALLOW_MUTATE", "false")),
-                Bridge.BusyPolicy.ANSWER_BUSY, 64);
+                Bridge.BusyPolicy.ANSWER_BUSY, 64,
+                Guard.HostWhitelist.parse(env.get("MODTEST_ALLOWED_HOSTS")));
 
         boolean devFlag = Boolean.parseBoolean(env.getOrDefault("MODTEST_DEV_HARNESS", "false"));
         String tokenValue = env.get("MODTEST_ACTIVATION_TOKEN");
@@ -82,12 +86,21 @@ public final class ModtestHarnessMod {
                 List.of(Protocol.SideEffect.PLAYER_INPUT), "forge-client", null, "1.0");
         catalog.register(inputOp, ModtestHarnessMod::queueInput);
 
-        guardedWriter = new Guard.GuardedInputWriter(
+        // Production goes through the same "audited" factory the tests use: an allowance is written
+        // to the game log as ALLOWED-INPUT (SLF4J), with the token fingerprint only — never its value.
+        Guard.InputInjectionPolicy policy = new Guard.InputInjectionPolicy(
+                config.allowedHosts(), Guard.BuildVariant.current(), config.executorId(),
+                () -> {
+                    Minecraft m = Minecraft.getInstance();
+                    return m.level == null ? "no-world" : m.level.dimension().location().toString();
+                });
+        guardedWriter = Guard.GuardedInputWriter.audited(
                 command -> {
                     writeCount++;
                     PENDING.set(command);
                 },
-                new Guard.InputInjectionPolicy(), new Guard.HumanSpeedClamp());
+                policy, new Guard.HumanSpeedClamp(),
+                line -> LOG.info("[modtest-mcp] {}", line));
 
         Executor.TicketExecutor executor = new Executor.TicketExecutor(config, catalog);
         Minecraft mc = Minecraft.getInstance();

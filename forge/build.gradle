@@ -7,86 +7,142 @@
 // root `verifyProductJar` task) and never run it against a server you do not own.
 plugins {
     id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    // MixinGradle wires the Mixin annotation processor to ForgeGradle's mapping files, so the refmap
+    // is derived mechanically from the annotations: every member reference is remapped by the AP,
+    // not enumerated by hand (a hand-written generator previously covered only the injection method
+    // name and therefore missed the @At target member).
+    id 'org.spongepowered.mixin' version '0.7.+'
+}
+
+mixin {
+    add sourceSets.main, 'modtest.refmap.json'
+    config 'modtest.harness.mixins.json'
 }
 
 minecraft {
     mappings channel: 'official', version: '1.20.1'
-    // The adapter needs the mixin annotation processor only; no access transformers.
+    // The mixin annotation processor handles remapping; no access transformers.
 }
 
 dependencies {
     minecraft 'net.minecraftforge:forge:1.20.1-47.1.3'
     implementation project(':core')
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 }
 
 // Same build flag as :core, so both artifacts identify the same way (see Guard.BuildVariant).
 def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
 
-// ---- mixin refmap (production / SRG domain) -----------------------------------------------
-// Without a refmap, Mixin resolves the annotation's *named* string ("aiStep") against the
-// *SRG-domain* runtime class, finds nothing, and kills the game at startup:
-//   "Reference map 'modtest.refmap.json' … could not be read … No refMap loaded"
-// No Mixin annotation processor is wired under ForgeGradle 6, so the map is written from the very
-// TSRG table `reobfJar` uses; the refmap therefore cannot disagree with the reobfuscated bytecode.
-def mixinConfig = 'modtest.harness.mixins.json'
-def refmapFileName = 'modtest.refmap.json'
-// mixin class (slash path, as mixins.json package+name resolves) -> owner -> officialMember -> desc
-def mixinTargets = [
-        'io/github/minatoai/modtest/forge/mixin/InputInjectionMixin': [
-                'net/minecraft/client/player/LocalPlayer': ['aiStep': '()V']
-        ]
-]
+// ---- guardrail: fail the build when a mixin member reference would not be remapped -----------
+// "0/1 injection points matched" is otherwise only observable when a real client starts (and then
+// it is fatal). This task reads the mixin sources, resolves every member reference against the same
+// TSRG table reobfJar uses, and requires the packaged refmap to contain the resolved SRG member.
+//
+// Reference categories it extracts, and the criterion for each:
+//   C1  @Inject/@Redirect/@ModifyArg/… `method = "<name>"`  -> refmap must contain the key "<name>"
+//   C2  @At(value="INVOKE", target="Lowner;name(desc)ret")  -> refmap must contain the SRG method name
+//   C3  @At(value="FIELD",  target="Lowner;name:desc")      -> refmap must contain the SRG field name
+//   C4  @Accessor/@Invoker value="…" (bare or full ref)     -> covered by C1/C2 rules
+// Any new annotation kind must be added here with its own criterion; the extraction is
+// source-driven precisely so that a future annotation cannot pass unnoticed.
+tasks.register('verifyMixinRefmap') {
+    group = 'verification'
+    description = 'Fails the build when a mixin member reference is missing from the packaged refmap'
+    dependsOn 'compileJava'
+    def tsrgFile = file("$buildDir/createMcpToSrg/output.tsrg")
+    def refmapName = 'modtest.refmap.json'
+    def sources = fileTree('src/main/java') { include '**/*Mixin*.java' }
+    inputs.files sources
+    inputs.file tsrgFile
+    outputs.upToDateWhen { false }
 
-tasks.register('generateRefmap') {
-    group = 'build'
-    description = 'Writes the Mixin refmap (named -> SRG) for the production domain'
-    dependsOn 'createMcpToSrg'
-    def tsrg = file("$buildDir/createMcpToSrg/output.tsrg")
-    def out = file("$buildDir/generated/refmap/${refmapFileName}")
-    inputs.file tsrg
-    outputs.file out
     doLast {
-        def lines = tsrg.readLines('UTF-8')
-        // TSRG v1: a class header is "<owner> <srgOwner>"; its members are tab-indented
-        // "<officialName> <desc> <srgName>" lines.
-        def lookup = { String owner, String member, String desc ->
+        def lines = tsrgFile.exists() ? tsrgFile.readLines('UTF-8') : []
+        def member = { String owner, String name, String desc ->
             int start = lines.findIndexOf { it.startsWith(owner + ' ') && !it.startsWith("\t") }
             if (start < 0) {
-                throw new GradleException("[modtest] TSRG has no class ${owner}")
+                throw new GradleException("[modtest] guardrail: ${owner} is absent from the mapping table")
             }
             for (int i = start + 1; i < lines.size() && lines[i].startsWith("\t"); i++) {
                 def f = lines[i].trim().split(/\s+/)
-                if (f.length >= 3 && f[0] == member && f[1] == desc) {
+                if (f.length >= 3 && f[0] == name && f[1] == desc) {
                     return f[2]
                 }
             }
-            throw new GradleException("[modtest] TSRG has no member ${owner}.${member}${desc}")
+            throw new GradleException("[modtest] guardrail: ${owner}.${name}${desc} is absent from the mapping table")
         }
-        def mappings = [:]
-        mixinTargets.each { mixinClass, owners ->
-            def per = [:]
-            owners.each { owner, members ->
-                members.each { member, desc ->
-                    def srg = lookup(owner, member, desc)
-                    per[member] = "L${owner};${srg}${desc}"
-                    logger.lifecycle("[modtest] refmap ${mixinClass}.${member} -> L${owner};${srg}${desc}")
+
+        def bareNames = [] as Set
+        def fullRefs = [] as Set
+        sources.each { File f ->
+            def text = f.getText('UTF-8')
+            // Bare method names come from `method = "..."` (and accessor `value = "..."` is handled
+            // below as a full ref). `@At(value = "INVOKE")` is an enum constant, NOT a member name,
+            // so it must never enter the bare-name set.
+            (text =~ /(?m)\bmethod\s*=\s*"([^"]+)"/).each { m ->
+                def ref = m[1]
+                if (ref.startsWith('L') && ref.contains(';')) {
+                    fullRefs << ref
+                } else if (ref ==~ /[A-Za-z_$][\w$]*/) {
+                    bareNames << ref
                 }
             }
-            mappings[mixinClass] = per
-            // Mixin also accepts the dotted class name; an extra key is ignored unless it is looked up.
-            mappings[mixinClass.replace('/', '.')] = per
+            // Full member references: @At(target = "Lowner;member…") and accessor/invoker refs.
+            (text =~ /(?m)\b(?:target|value)\s*=\s*"(L[^"]*;[^"]*)"/).each { m -> fullRefs << m[1] }
         }
-        out.parentFile.mkdirs()
-        out.text = '{\n  "mappings": ' + groovy.json.JsonOutput.toJson(mappings) + ',\n  "data": {}\n}\n'
-        logger.lifecycle("[modtest] refmap written: ${out}")
+
+        def expected = [:]   // annotation string -> SRG member name it must resolve to
+        fullRefs.each { ref ->
+            def semi = ref.indexOf(';')
+            String owner = ref.substring(1, semi)
+            String rest = ref.substring(semi + 1)
+            String name, desc
+            if (rest.contains(':')) {
+                name = rest.substring(0, rest.indexOf(':'))
+                desc = rest.substring(rest.indexOf(':') + 1)
+            } else {
+                def op = rest.indexOf('(')
+                name = rest.substring(0, op)
+                // Everything from '(' on is the descriptor plus return type, e.g. "(ZF)V".
+                desc = rest.substring(op)
+            }
+            expected[ref] = member(owner, name, desc)
+        }
+
+        def jarFile = tasks.named('jar').get().archiveFile.get().asFile
+        if (!jarFile.exists()) {
+            throw new GradleException("[modtest] guardrail: jar not built: ${jarFile}")
+        }
+        def refmapText = null
+        new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
+            def entry = zf.getEntry(refmapName)
+            if (entry == null) {
+                throw new GradleException("[modtest] guardrail: the jar contains no ${refmapName}")
+            }
+            refmapText = zf.getInputStream(entry).getText('UTF-8')
+        }
+
+        def problems = []
+        expected.each { ref, srg ->
+            if (!refmapText.contains(srg)) {
+                problems << "C2/C3 ${ref} -> expected SRG member ${srg} in ${refmapName}"
+            }
+        }
+        bareNames.each { name ->
+            if (!refmapText.contains("\"${name}\"")) {
+                problems << "C1 method=\"${name}\" is absent from ${refmapName}"
+            }
+        }
+        if (!problems.isEmpty()) {
+            throw new GradleException("[modtest] guardrail FAILED:\n  " + problems.join("\n  "))
+        }
+        logger.lifecycle("[modtest] guardrail OK — C1 bare names ${bareNames} present, " +
+                "C2/C3 member refs resolved: ${expected}")
     }
 }
 
-jar {
-    dependsOn 'generateRefmap'
-    from("$buildDir/generated/refmap") {
-        include refmapFileName
-    }
+tasks.named('jar') {
+    finalizedBy 'verifyMixinRefmap'
     archiveBaseName = 'modtest-harness-forge'
     manifest {
         attributes(

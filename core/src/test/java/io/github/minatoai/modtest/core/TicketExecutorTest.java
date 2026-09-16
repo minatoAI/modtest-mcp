@@ -104,8 +104,23 @@ class TicketExecutorTest {
                         Bridge.Clock.system(), Map.of("allow-mutate", true)));
 
         assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
-        assertTrue(r.ops().get(0).error().message().contains("single-player"));
-        assertTrue(client.placed.isEmpty(), "no world write on a remote session");
+        assertTrue(r.ops().get(0).error().message().contains("not whitelisted"));
+        assertTrue(client.placed.isEmpty(), "no world write on an undeclared host");
+    }
+
+    @Test
+    void mutatingOpsAreAllowedOnAnExplicitlyWhitelistedHost() {
+        FakeClient client = new FakeClient();
+        Protocol.Ticket t = ticket("{\"op\":\"world.place\",\"params\":{\"x\":0,\"y\":64,\"z\":0,"
+                + "\"block\":\"minecraft:stone\"}}");
+        Bridge.BridgeConfig cfg = new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test", "0.1.0", true,
+                Bridge.BusyPolicy.ANSWER_BUSY, 64, Guard.HostWhitelist.of("127.0.0.1"));
+        Executor.ExecContext ctx = new Executor.ExecContext(cfg, Guard.SessionState.remote("127.0.0.1:25575"),
+                Guard.ActivationState.off(), Bridge.Clock.system(), Map.of("allow-mutate", true), client);
+        Protocol.Receipt r = new Executor.TicketExecutor(cfg, catalog).execute(t, Executor.quietLog(), ctx);
+
+        assertTrue(r.ok(), "a declared dev-server host must be usable: " + r.ops());
+        assertEquals(1, client.placed.size());
     }
 
     @Test

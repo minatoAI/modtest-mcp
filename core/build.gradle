@@ -1,6 +1,14 @@
 // core: the protocol relay (M1), the input-injection guard (M2) and the ticket executor (M3).
 // Pure JVM. No Minecraft, no Forge, no networking: the whole point is that the rules can be
 // executed and asserted in a unit test.
+//
+// Two variants, ONE source tree:
+//   ./gradlew :core:jar                 -> guarded   (default; this is what releases ship)
+//   ./gradlew :core:jar -Punguarded     -> unguarded (self-compiled only; bypasses the policy)
+// The variant is stamped into the jar manifest as `Modtest-Guard-Variant`, printed by
+// BuildInfo.describe(), and re-read at runtime by Guard.BuildVariant.current().
+def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
+
 dependencies {
     implementation 'com.google.code.gson:gson:2.10.1'
 
@@ -16,7 +24,18 @@ jar {
                 'Implementation-Title': 'modtest-mcp harness core (DEV ONLY)',
                 'Implementation-Version': project.version,
                 'Modtest-Artifact': 'harness',
-                'Modtest-Warning': 'Development harness. Must never be bundled into a product jar.'
+                'Modtest-Guard-Variant': guardVariant,
+                'Modtest-Warning': guardVariant == 'guarded'
+                        ? 'Development harness. Guarded build: refuses undeclared hosts. Never bundle into a product jar.'
+                        : 'UNGUARDED DEVELOPMENT HARNESS BUILD: the injection policy is disabled. Use only on servers you own. Never redistribute.'
         )
+    }
+}
+
+tasks.register('printGuardVariant') {
+    group = 'verification'
+    description = 'Prints which guard variant this build produces'
+    doLast {
+        println "GUARD-VARIANT=" + guardVariant
     }
 }

@@ -8,6 +8,8 @@
 > [`docs/STAGE2-TODO.md`](docs/STAGE2-TODO.md)), which is in progress.
 > The wire format is published for review and **may still change before 1.0**; expect breaking
 > changes between preview releases, and pin a commit if you build against it.
+> The Java side is built from one source tree in two variants — a **guarded** default and a
+> self-compiled **unguarded** one; see [§8](#8-guarded-and-unguarded-builds--read-this-before-building-from-source).
 
 `mcp-name: io.github.minatoAI/modtest-mcp`
 
@@ -138,3 +140,35 @@ pwsh tools/rcon.ps1 -ServerHost 127.0.0.1 -Password (Read-Host -AsSecureString) 
 
 GPL-3.0-or-later — see [`LICENSE`](LICENSE). Third-party attributions and the "ideas only, no
 verbatim copying" statement for prior art are in [`THIRD_PARTY.md`](THIRD_PARTY.md).
+
+## 8. Guarded and unguarded builds — read this before building from source
+
+The Java side is built from **one source tree** and can be compiled in two variants. The difference
+is the injection guard described in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §7.2–7.3.
+
+| Variant | Command | What it does |
+|---|---|---|
+| **guarded** (default) | `./gradlew :core:jar` | Enforces the policy: **default deny**, read-only ops always allowed, input injection needs a dev flag + an unexpired activation token, and a host must be either single-player or **explicitly declared by you**. Every allowance is logged loudly. |
+| **unguarded** | `./gradlew :core:jar -Punguarded` | **Bypasses the injection policy entirely.** Any host, no token requirement. |
+
+**Both variants identify themselves**, so a build can never be passed off as the other one:
+
+* the jar manifest carries `Modtest-Guard-Variant: guarded` or `unguarded`;
+* the version line reports it — `modtest-harness-core 0.1.0 guard=GUARDED`;
+* an **unguarded** build logs a warning at startup: *"UNGUARDED BUILD: the injection policy is
+  disabled…"*;
+* an artifact with no stamp at all is treated as **guarded** (fail closed).
+
+We document the unguarded build instead of hiding it, because the value of the guard is in its
+**defaults and its audit trail**, not in pretending source code can be made un-editable. But be
+clear about what you are switching off:
+
+> **Responsibility.** The unguarded variant is intended **only** for single-player worlds and for
+> test servers **you own or administer** — for example a local development server you started
+> yourself. It **must not** be used on public servers, on servers you do not own, or in any
+> competitive setting. If you compile or run the unguarded variant, **you** are responsible for
+> where it runs and for the consequences; the project's maintainers provide it as documented source
+> for local development and take no responsibility for its use. All released artifacts of this
+> project are the **guarded** variant; the unguarded variant is source-only and is not offered as a
+> download.
+

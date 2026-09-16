@@ -1,22 +1,61 @@
 package io.github.minatoai.modtest.core;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * M2 input-injection: the safety surface.
  *
- * <p>Two invariants, both enforced here rather than by convention:
+ * <p>The rule is <b>default deny, plus an explicit allow-list of hosts you own</b>:
  * <ol>
- *   <li>Injection is <b>off by default</b>: it needs an explicit dev flag <i>and</i> an unexpired
- *       activation token.</li>
- *   <li>The guard runs <b>before any write</b>: {@link GuardedInputWriter#submit} evaluates the
- *       policy first and never touches the delegate when the decision is a refusal.</li>
+ *   <li><b>Read-only ops are always allowed.</b> Injection is the only thing being gated.</li>
+ *   <li><b>Injection is off by default</b>: it needs an explicit dev flag <i>and</i> an unexpired
+ *       activation token. A ticket can never activate anything.</li>
+ *   <li>With injection armed, writing input is allowed in a <b>single-player</b> world, or against
+ *       a host that the operator listed explicitly (e.g. {@code localhost}, {@code 127.0.0.1}, a
+ *       self-hosted dev server). <b>Every such allowance is logged loudly</b> — who, which host,
+ *       when, and which token (fingerprint, never the token value).</li>
+ *   <li>Any other host is <b>refused</b>. Default safety does not move: a host nobody declared is
+ *       a host we do not act on.</li>
  * </ol>
- * The remote/multiplayer refusal is part of the policy (rule 4), so a session that is connected to
- * a remote server can never reach the writer, whatever the ticket asks for.
+ * The guard runs <b>before any write</b>: {@link GuardedInputWriter#submit} evaluates the policy
+ * first and never touches the delegate when the decision is a refusal.
+ *
+ * <p>Two build variants share this one source tree; see {@link BuildVariant}.
  */
 public final class Guard {
     private Guard() {
+    }
+
+    /** Which build produced this artifact; stamped into the jar manifest at build time. */
+    public enum BuildVariant {
+        /** Ships in releases. The policy below is enforced. */
+        GUARDED,
+        /** Self-compiled with {@code -Punguarded}; the policy is bypassed, loudly. */
+        UNGUARDED;
+
+        public static final String MANIFEST_KEY = "Modtest-Guard-Variant";
+
+        /** Reads the variant from this artifact's manifest; defaults to GUARDED when unknown. */
+        public static BuildVariant current() {
+            try (java.io.InputStream in = Guard.class.getResourceAsStream("/META-INF/MANIFEST.MF")) {
+                if (in != null) {
+                    java.util.jar.Manifest mf = new java.util.jar.Manifest(in);
+                    String v = mf.getMainAttributes().getValue(MANIFEST_KEY);
+                    if (v != null) {
+                        return valueOf(v.trim().toUpperCase(Locale.ROOT));
+                    }
+                }
+            } catch (Exception ignored) {
+                // fall through: an unstamped class path is treated as guarded
+            }
+            return GUARDED;
+        }
     }
 
     /** What the client currently is. Injected, so tests can construct any environment. */
@@ -31,54 +70,111 @@ public final class Guard {
 
         boolean handshakeInProgress();
 
-        /** Convenience: a single-player world that is safe for mutating ops. */
+        /** {@code host[:port]} of the current connection, or {@code null} in single-player. */
+        default String serverAddress() {
+            return null;
+        }
+
+        /** Convenience: a single-player world. */
         static SessionState singleplayer() {
+            return of(true, false, false, true, false, null);
+        }
+
+        /** A remote/multiplayer session. */
+        static SessionState remote(String host) {
+            return of(false, true, false, true, false, host);
+        }
+
+        static SessionState of(boolean integrated, boolean remote, boolean paused, boolean inWorld,
+                               boolean handshake, String address) {
             return new SessionState() {
                 public boolean hasIntegratedServer() {
-                    return true;
+                    return integrated;
                 }
 
                 public boolean connectedToRemoteServer() {
-                    return false;
+                    return remote;
                 }
 
                 public boolean paused() {
-                    return false;
+                    return paused;
                 }
 
                 public boolean inWorld() {
-                    return true;
+                    return inWorld;
                 }
 
                 public boolean handshakeInProgress() {
-                    return false;
+                    return handshake;
+                }
+
+                public String serverAddress() {
+                    return address;
                 }
             };
         }
+    }
 
-        /** A remote/multiplayer session: the case that MUST always be refused. */
-        static SessionState remote(String server) {
-            return new SessionState() {
-                public boolean hasIntegratedServer() {
-                    return false;
-                }
+    /** Hosts the operator explicitly declared as theirs. Empty by default: deny everything remote. */
+    public static final class HostWhitelist {
+        private final Set<String> hosts;
 
-                public boolean connectedToRemoteServer() {
-                    return true;
-                }
+        private HostWhitelist(Set<String> hosts) {
+            this.hosts = hosts;
+        }
 
-                public boolean paused() {
-                    return false;
-                }
+        public static HostWhitelist empty() {
+            return new HostWhitelist(Set.of());
+        }
 
-                public boolean inWorld() {
-                    return true;
+        /** Accepts {@code host} or {@code host:port}; matching ignores case and a trailing default port. */
+        public static HostWhitelist of(String... entries) {
+            Set<String> set = new LinkedHashSet<>();
+            for (String e : entries) {
+                if (e != null && !e.isBlank()) {
+                    set.add(normalize(e));
                 }
+            }
+            return new HostWhitelist(set);
+        }
 
-                public boolean handshakeInProgress() {
-                    return false;
-                }
-            };
+        public static HostWhitelist parse(String csv) {
+            return csv == null || csv.isBlank() ? empty() : of(csv.split(","));
+        }
+
+        static String normalize(String raw) {
+            String h = raw.trim().toLowerCase(Locale.ROOT);
+            if (h.endsWith(":25565")) {
+                h = h.substring(0, h.length() - 6);
+            }
+            if (h.startsWith("[") && h.contains("]")) {
+                h = h.substring(1, h.indexOf(']'));
+            }
+            int colon = h.lastIndexOf(':');
+            if (colon > 0 && h.indexOf(':') == colon) {
+                h = h.substring(0, colon);
+            }
+            return h;
+        }
+
+        public Set<String> hosts() {
+            return Set.copyOf(hosts);
+        }
+
+        public boolean isEmpty() {
+            return hosts.isEmpty();
+        }
+
+        public boolean permitsHost(String host) {
+            return host != null && hosts.contains(normalize(host));
+        }
+
+        /** Single-player is always permitted; otherwise the address must be declared. */
+        public boolean permits(SessionState session) {
+            if (session.hasIntegratedServer() && !session.connectedToRemoteServer()) {
+                return true;
+            }
+            return permitsHost(session.serverAddress());
         }
     }
 
@@ -86,6 +182,24 @@ public final class Guard {
     public record ActivationToken(String value, long expiresAtMs) {
         public boolean isActive(Bridge.Clock clock) {
             return value != null && !value.isBlank() && clock.nowMs() < expiresAtMs;
+        }
+
+        /** Stable short fingerprint so logs can name the token without ever recording its value. */
+        public String fingerprint() {
+            if (value == null) {
+                return "none";
+            }
+            try {
+                MessageDigest md = MessageDigest.getInstance("SHA-256");
+                byte[] d = md.digest(value.getBytes(StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 4; i++) {
+                    sb.append(String.format("%02x", d[i]));
+                }
+                return sb.toString();
+            } catch (Exception e) {
+                return "unknown";
+            }
         }
     }
 
@@ -130,10 +244,30 @@ public final class Guard {
         void write(InputCommand command);
     }
 
+    /** A loud, auditable record of one allowance. */
+    public record Allowance(String executorId, String host, String dimension, long atMs,
+                            String tokenFingerprint, String op, String reason) {
+        /** One line, deliberately greppable and deliberately not containing the token value. */
+        public String format() {
+            return "ALLOWED-INPUT executor=" + executorId + " host=" + (host == null ? "singleplayer" : host)
+                    + " dimension=" + dimension + " at=" + atMs + " token=" + tokenFingerprint
+                    + " op=" + op + " reason=" + reason;
+        }
+    }
+
+    /** Where allowances go. Implementations should write them somewhere durable. */
+    public interface AuditSink {
+        void allowance(Allowance allowance);
+
+        static AuditSink to(java.util.function.Consumer<String> sink) {
+            return allowance -> sink.accept(allowance.format());
+        }
+    }
+
     /** Policy decision. {@code noop} means "allowed but nothing to do" (paused/handshake). */
     public record Decision(boolean allowed, boolean noop, Protocol.ErrorCode code, String reason) {
-        public static Decision allow() {
-            return new Decision(true, false, null, "allowed");
+        public static Decision allow(String reason) {
+            return new Decision(true, false, null, reason);
         }
 
         public static Decision noop(String reason) {
@@ -147,6 +281,30 @@ public final class Guard {
 
     /** The single place where injection permission is decided. Order is normative. */
     public static final class InputInjectionPolicy {
+        private final HostWhitelist whitelist;
+        private final BuildVariant variant;
+        private final String executorId;
+        private final java.util.function.Supplier<String> dimension;
+
+        public InputInjectionPolicy(HostWhitelist whitelist, BuildVariant variant, String executorId,
+                                    java.util.function.Supplier<String> dimension) {
+            this.whitelist = whitelist == null ? HostWhitelist.empty() : whitelist;
+            this.variant = variant == null ? BuildVariant.GUARDED : variant;
+            this.executorId = executorId;
+            this.dimension = dimension == null ? () -> "unknown" : dimension;
+        }
+
+        public InputInjectionPolicy() {
+            this(HostWhitelist.empty(), BuildVariant.current(), "unknown", null);
+        }
+
+        public HostWhitelist whitelist() {
+            return whitelist;
+        }
+
+        public BuildVariant variant() {
+            return variant;
+        }
 
         public Decision decide(Protocol.OpSpec op, SessionState session, ActivationState activation,
                                Bridge.Clock clock) {
@@ -159,15 +317,15 @@ public final class Guard {
             if (session.paused()) {
                 return Decision.noop("client paused");
             }
-            // Rule 4 — remote/multiplayer refusal, checked before activation so that no
-            // activation token can ever unlock a remote session.
-            if (session.connectedToRemoteServer() || !session.hasIntegratedServer()) {
-                return Decision.deny("refused: session is remote/multiplayer");
-            }
+            // Tier 1: read-only ops are never gated by the injection policy.
             if (op != null && op.sideEffects() != null
                     && !op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
-                return Decision.deny("op does not declare sideEffects [PLAYER_INPUT]");
+                return Decision.allow("read-only op (no PLAYER_INPUT side effect)");
             }
+            if (variant == BuildVariant.UNGUARDED) {
+                return Decision.allow("unguarded build: policy bypassed (self-compiled variant)");
+            }
+            // Tier 2: armed injection needs the dev flag plus an unexpired token.
             if (!activation.devFlag()) {
                 return Decision.deny("injection is off by default (dev flag not set)");
             }
@@ -178,11 +336,28 @@ public final class Guard {
             if (!token.isActive(clock)) {
                 return Decision.deny("activation token expired");
             }
-            return Decision.allow();
+            // Tier 3: single-player, or a host the operator explicitly declared.
+            if (session.hasIntegratedServer() && !session.connectedToRemoteServer()) {
+                return Decision.allow("single-player world");
+            }
+            String host = session.serverAddress();
+            if (whitelist.permitsHost(host)) {
+                return Decision.allow("explicitly whitelisted host: " + host);
+            }
+            return Decision.deny("refused: host '" + (host == null ? "unknown" : host)
+                    + "' is not whitelisted (default deny)");
+        }
+
+        /** Builds the audit record for an allowance. */
+        public Allowance allowanceFor(Protocol.OpSpec op, SessionState session, ActivationState activation,
+                                      Bridge.Clock clock, String reason) {
+            ActivationToken token = activation == null ? null : activation.token();
+            return new Allowance(executorId, session.serverAddress(), dimension.get(), clock.nowMs(),
+                    token == null ? "none" : token.fingerprint(), op == null ? "?" : op.name(), reason);
         }
     }
 
-    /** Human-speed envelope; clamping is a safety limit, not a feature (§M2 item 4). */
+    /** Human-speed envelope; clamping is a safety limit, not a feature. */
     public static final class HumanSpeedClamp {
         public static final float MAX_FORWARD = 0.215f;   // blocks/tick, ~4.3 m/s
         public static final float MAX_YAW_DEG = 7.5f;     // deg/tick, ~150 deg/s
@@ -192,7 +367,7 @@ public final class Guard {
         }
 
         public Result apply(InputCommand in) {
-            List<String> clamped = new java.util.ArrayList<>();
+            List<String> clamped = new ArrayList<>();
             float forward = clampAxis(in.forward(), MAX_FORWARD, "forward", clamped);
             float strafe = clampAxis(in.strafe(), MAX_FORWARD, "strafe", clamped);
             float yaw = clampAxis(in.yawDelta(), MAX_YAW_DEG, "yaw", clamped);
@@ -215,22 +390,39 @@ public final class Guard {
         private final InputWriter delegate;
         private final InputInjectionPolicy policy;
         private final HumanSpeedClamp clamp;
+        private final AuditSink audit;
         private int attempts;
         private int performed;
         private int denied;
         private int noops;
         private int clampedAxes;
+        private final List<Allowance> allowances = new ArrayList<>();
         private InputCommand lastCommand;
 
         public GuardedInputWriter(InputWriter delegate, InputInjectionPolicy policy, HumanSpeedClamp clamp) {
+            this(delegate, policy, clamp, allowance -> {
+            });
+        }
+
+        public GuardedInputWriter(InputWriter delegate, InputInjectionPolicy policy, HumanSpeedClamp clamp,
+                                  AuditSink audit) {
             this.delegate = delegate;
             this.policy = policy;
             this.clamp = clamp;
+            this.audit = audit == null ? allowance -> {
+            } : audit;
         }
 
         public Decision submit(InputCommand command, Protocol.OpSpec op, SessionState session,
                                ActivationState activation, Bridge.Clock clock) {
             attempts++;
+            // This writer only ever carries input. A read-only op is allowed by the policy but has
+            // nothing to write, so it must not reach the client.
+            if (op != null && op.sideEffects() != null
+                    && !op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
+                noops++;
+                return Decision.noop("read-only op: nothing to inject");
+            }
             Decision decision = policy.decide(op, session, activation, clock);
             if (!decision.allowed()) {
                 denied++;
@@ -239,6 +431,12 @@ public final class Guard {
             if (decision.noop()) {
                 noops++;
                 return decision;
+            }
+            if (op != null && op.sideEffects() != null
+                    && op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
+                Allowance allowance = policy.allowanceFor(op, session, activation, clock, decision.reason());
+                allowances.add(allowance);
+                audit.allowance(allowance);   // loud by design: who, which host, when, which token
             }
             HumanSpeedClamp.Result clamped = clamp.apply(command);
             clampedAxes += clamped.clamped().size();
@@ -267,6 +465,10 @@ public final class Guard {
 
         public int clampedAxes() {
             return clampedAxes;
+        }
+
+        public List<Allowance> allowances() {
+            return List.copyOf(allowances);
         }
 
         public InputCommand lastCommand() {

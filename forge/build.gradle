@@ -1,0 +1,33 @@
+// forge: the thin Forge 1.20.1 adapter that makes a real client answerable to modtest-bridge/1.0.
+//
+// This module is the ONLY place that knows about Minecraft, Forge or mixins. All protocol and
+// safety logic lives in :core (pure JVM, fully unit-tested); this module just wires it to a client.
+//
+// It is a development artifact: never bundle it into a product jar (see HarnessEntryCheck / the
+// root `verifyProductJar` task) and never run it against a server you do not own.
+plugins {
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+    // The adapter needs the mixin annotation processor only; no access transformers.
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.1.3'
+    implementation project(':core')
+}
+
+jar {
+    archiveBaseName = 'modtest-harness-forge'
+    manifest {
+        attributes(
+                'Implementation-Title': 'modtest-mcp Forge adapter (DEV ONLY)',
+                'Implementation-Version': project.version,
+                'Modtest-Artifact': 'harness',
+                'MixinConfigs': 'modtest.harness.mixins.json',
+                'Modtest-Warning': 'Development harness. Never bundle into a product jar.'
+        )
+    }
+}

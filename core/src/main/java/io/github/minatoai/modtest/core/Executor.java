@@ -155,7 +155,16 @@ public final class Executor {
                     case "singleplayer" -> {
                         if (!ctx.session().hasIntegratedServer() || ctx.session().connectedToRemoteServer()) {
                             return new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
-                                    "requires a single-player session");
+                                    "requires a strictly single-player session");
+                        }
+                    }
+                    case "permitted-session" -> {
+                        // Default deny, plus the hosts the operator explicitly declared as theirs.
+                        if (!ctx.config().allowedHosts().permits(ctx.session())) {
+                            String host = ctx.session().serverAddress();
+                            return new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                                    "requires a single-player world or a whitelisted host (host '"
+                                            + (host == null ? "unknown" : host) + "' is not whitelisted)");
                         }
                     }
                     case "flag" -> {
@@ -348,10 +357,13 @@ public final class Executor {
                                 Protocol.Receipt.Error.of(Protocol.ErrorCode.E_PRECONDITION,
                                         "mutating op requires allow-mutate"), 0L));
                     }
-                    if (!ctx.session().hasIntegratedServer() || ctx.session().connectedToRemoteServer()) {
+                    if (!config.allowedHosts().permits(ctx.session())) {
+                        String host = ctx.session().serverAddress();
                         return log(log, op, Protocol.Receipt.OpResult.failed(op.id(), op.op(),
                                 Protocol.Receipt.Error.of(Protocol.ErrorCode.E_PRECONDITION,
-                                        "mutating op refused: session is not single-player"), 0L));
+                                        "mutating op refused: host '" + (host == null ? "unknown" : host)
+                                                + "' is not whitelisted and this is not a single-player world"),
+                                0L));
                     }
                 }
                 OpHandler handler = catalog.handler(op.op());

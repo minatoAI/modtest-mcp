@@ -1,0 +1,23 @@
+modLoader = "javafml"
+loaderVersion = "[47,)"
+license = "GPL-3.0-or-later"
+issueTrackerURL = "https://github.com/minatoAI/modtest-mcp/issues"
+
+[[mods]]
+modId = "modtestharness"
+version = "0.1.0"
+displayName = "modtest-mcp harness (DEV ONLY)"
+authors = "modtest-mcp contributors"
+description = '''
+Development-only bridge executor for the modtest-mcp harness. It polls a local file bridge and
+answers tickets against a single-player development client. NOT AN OFFICIAL MINECRAFT PRODUCT.
+NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT. Do not install this on a normal profile:
+it is a development harness, it is off by default, and it refuses to act on remote servers.
+'''
+
+[[dependencies.modtestharness]]
+modId = "forge"
+mandatory = true
+versionRange = "[47,)"
+ordering = "NONE"
+side = "BOTH"

@@ -295,24 +295,64 @@ An executor MUST treat any value other than `none` / `telemetry.recording` as **
 
 ### 7.2 Safety requirements (normative)
 
-A compliant executor **MUST**:
+The rule is **default deny, plus an explicit allow-list of hosts you own**. A compliant executor
+**MUST** implement three tiers, in this order:
 
-1. **Refuse remote sessions.** If the client is connected to a multiplayer/remote server
-   (`mc.getCurrentServer() != null` or `hasSingleplayerServer() == false`), any op whose
-   `sideEffects` are mutating MUST fail with `E_PRECONDITION` and MUST NOT run. Read-only ops
-   (`sideEffects: ["none"]`) MAY run.
-2. **Default to read-only.** Mutating ops MUST additionally require the executor to have been
-   started with an explicit opt-in flag (convention: `allow-mutate`); without it they fail with
-   `E_PRECONDITION`.
-3. **Refuse unsupported ops** with `E_UNKNOWN_OP` / `E_UNSUPPORTED` rather than silently skipping.
-4. **Never bypass authentication or server checks**, and never modify the client's network layer.
-5. **Leave a trace:** every executed op writes a line to the executor's log with ticket, op id,
-   name and outcome.
+1. **Read-only ops are always allowed.** An op whose `sideEffects` are only `none` /
+   `telemetry.recording` is never blocked by this policy, on any host: reading is not the risk.
+2. **Writing player input is off by default.** It requires (a) the executor to have been started
+   with an explicit development opt-in and (b) an **activation token supplied out-of-band by the
+   operator, with an expiry**. A ticket can never activate anything, and an expired token stops
+   working immediately.
+3. **With input armed, a session is usable only if it is yours:** either a **single-player**
+   (integrated-server) world, or a host the operator **explicitly declared** as theirs
+   (`localhost`, `127.0.0.1`, a self-hosted dev server) through configuration — never through the
+   ticket. Every other host **MUST** be refused with `E_PRECONDITION`. An empty allow-list is the
+   default and means "refuse every non-single-player session".
 
-These requirements implement the project's positioning: a **local, single-player development
-harness**, not a gameplay automation tool.
+**Loud audit.** Every tier-3 allowance **MUST** be recorded — who acted, which host, at what time,
+which token, which op — in a durable log. Never log the token *value*: record a fingerprint
+(e.g. the first bytes of its SHA-256) instead.
 
-### 7.3 Crash and restart behaviour
+Mutating ops in general (`sideEffects` beyond `none`/`telemetry.recording`) **MUST** additionally
+require the executor's explicit `allow-mutate` opt-in, and fail with `E_PRECONDITION` without it.
+Ops that may run on a declared host SHOULD declare the `permitted-session` precondition (§6.3);
+`singleplayer` remains the strictly-local variant.
+
+**Rationale.** The question that matters is **"is this a server you own?"**, not **"is it
+remote?"**. A blanket remote refusal is at once too strict — it breaks the supported local
+multi-instance workflow (a development server you started yourself) — and too blunt, because it
+never asks about ownership. Declaring hosts is the operator's explicit statement of ownership, and
+the empty default keeps the posture fail-closed.
+
+**Also required:** refuse unsupported ops with `E_UNKNOWN_OP` / `E_UNSUPPORTED` rather than silently
+skipping; never bypass authentication or server checks; never modify the client's network layer;
+and log every executed op (ticket, op id, name, outcome) so a run stays auditable.
+
+### 7.3 Build variants (guarded / unguarded)
+
+The reference implementation ships **one source tree** and two artifacts:
+
+| Variant | How it is produced | Behaviour |
+|---|---|---|
+| **guarded** — default, and the only one released | `./gradlew :core:jar` | Enforces §7.2 in full |
+| **unguarded** — self-compiled, never distributed as a download | `./gradlew :core:jar -Punguarded` | **Bypasses** the injection policy; every decision says so |
+
+An unguarded artifact **MUST** identify itself, so that using it leaves a trace:
+
+* its jar manifest carries `Modtest-Guard-Variant: guarded|unguarded`;
+* a version/startup line reports the variant (`… guard=GUARDED` / `guard=UNGUARDED`), and an
+  unguarded build logs an explicit warning that the policy is disabled;
+* the implementation re-reads the manifest at runtime; an **unstamped** artifact is treated as
+  **guarded** (fail closed).
+
+The unguarded variant exists for an operator's own local iteration on hardware they control. See the
+repository README for the responsibility statement that comes with it.
+
+*(The previous flat wording — "refuse remote sessions" / "default to read-only" — is superseded by
+the three tiers above; a flat remote refusal was both too strict and imprecise about ownership.)*
+
+### 7.4 Crash and restart behaviour
 
 * A `.tmp` file older than the poll interval SHOULD be ignored (never renamed by the reader).
 * Tickets in `inbox/` that were never answered are retried after restart; implementations SHOULD

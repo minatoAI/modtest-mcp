@@ -92,34 +92,34 @@ public final class VanillaOps {
     /** Registers the vanilla op set. */
     public static Executor.OpCatalog install(Executor.OpCatalog catalog) {
         catalog.register(spec("state.query", "Read player/world state", schema("what"), null,
-                        List.of(Protocol.Precondition.of("singleplayer")), List.of(Protocol.SideEffect.NONE)),
+                        List.of(), List.of(Protocol.SideEffect.NONE)),
                 new StateOps());
         catalog.register(spec("pose.set", "Teleport/rotate with settle", schema("x", "y", "z", "yaw", "pitch"), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_STATE)), new PoseOps());
         catalog.register(spec("inv.select", "Select a hotbar slot", schema("slot"), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_INVENTORY)), new InvOps("select"));
         catalog.register(spec("inv.click", "Click an inventory slot", schema("slot", "button", "mode"), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_INVENTORY)), new InvOps("click"));
         catalog.register(spec("inv.toss", "Drop items from a slot", schema("slot", "count"), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_INVENTORY)), new InvOps("toss"));
         catalog.register(spec("use.item", "Use the held item", Json.object(), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_STATE)), new UseOps());
         catalog.register(spec("world.place", "Place a block", schema("x", "y", "z", "block"), null,
-                        List.of(Protocol.Precondition.of("singleplayer"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.WORLD_BLOCKS)), new WorldOps());
         catalog.register(spec("shot.capture", "Capture a screenshot", schema("name"), null,
-                        List.of(Protocol.Precondition.of("singleplayer")),
+                        List.of(),
                         List.of(Protocol.SideEffect.TELEMETRY_RECORDING)), new MiscOps("shot"));
         catalog.register(spec("bench.read", "Read a frame-time sample", Json.object(), null,
-                        List.of(Protocol.Precondition.of("singleplayer")), List.of(Protocol.SideEffect.NONE)),
+                        List.of(), List.of(Protocol.SideEffect.NONE)),
                 new MiscOps("bench"));
         catalog.register(spec("wait.frames", "Wait client frames", schema("frames"), null,
-                        List.of(Protocol.Precondition.of("singleplayer")), List.of(Protocol.SideEffect.NONE)),
+                        List.of(), List.of(Protocol.SideEffect.NONE)),
                 new MiscOps("wait"));
         return catalog;
     }

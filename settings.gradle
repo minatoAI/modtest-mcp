@@ -6,6 +6,9 @@ rootProject.name = 'modtest-mcp'
 //  forge - the thin Forge 1.20.1 adapter (mixins + ClientModel implementation) that makes a real
 //          client answerable to the protocol. It is a *consumer* of core, never the other way round.
 include 'core'
-if (file('forge/build.gradle').exists()) {
+// The Forge adapter needs the ForgeGradle toolchain (plugin + Minecraft artifacts), so it is opt-in:
+//   ./gradlew :forge:compileJava -PwithForge
+// That keeps the protocol core buildable with an empty dependency cache and with no network.
+if (file('forge/build.gradle').exists() && gradle.startParameter.projectProperties.containsKey('withForge')) {
     include 'forge'
 }

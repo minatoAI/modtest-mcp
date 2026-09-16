@@ -39,17 +39,28 @@ public final class Bridge {
 
     /** Injected configuration; there is no hardcoded path and no default credential anywhere. */
     public record BridgeConfig(Path dir, long pollIntervalMs, String executorId, String executorVersion,
-                               boolean allowMutate, BusyPolicy busyPolicy, int maxOpsPerTicket) {
+                               boolean allowMutate, BusyPolicy busyPolicy, int maxOpsPerTicket,
+                               Guard.HostWhitelist allowedHosts) {
 
         public static final String ENV_DIR = "MODTEST_AGENT_DIR";
         public static final String ENV_ALLOW_MUTATE = "MODTEST_ALLOW_MUTATE";
         public static final String ENV_EXECUTOR_ID = "MODTEST_EXECUTOR_ID";
+        /** Comma-separated hosts the operator declares as their own; empty means "remote = denied". */
+        public static final String ENV_ALLOWED_HOSTS = "MODTEST_ALLOWED_HOSTS";
+
+        /** Convenience: no declared hosts, i.e. the default-deny posture. */
+        public BridgeConfig(Path dir, long pollIntervalMs, String executorId, String executorVersion,
+                            boolean allowMutate, BusyPolicy busyPolicy, int maxOpsPerTicket) {
+            this(dir, pollIntervalMs, executorId, executorVersion, allowMutate, busyPolicy,
+                    maxOpsPerTicket, Guard.HostWhitelist.empty());
+        }
 
         public static BridgeConfig fromEnv(Map<String, String> env, String defaultExecutorId, String version) {
             String dir = env.getOrDefault(ENV_DIR, "./.modtest-agent");
             boolean allowMutate = Boolean.parseBoolean(env.getOrDefault(ENV_ALLOW_MUTATE, "false"));
             String id = env.getOrDefault(ENV_EXECUTOR_ID, defaultExecutorId);
-            return new BridgeConfig(Path.of(dir), 500L, id, version, allowMutate, BusyPolicy.ANSWER_BUSY, 64);
+            Guard.HostWhitelist hosts = Guard.HostWhitelist.parse(env.get(ENV_ALLOWED_HOSTS));
+            return new BridgeConfig(Path.of(dir), 500L, id, version, allowMutate, BusyPolicy.ANSWER_BUSY, 64, hosts);
         }
     }
 

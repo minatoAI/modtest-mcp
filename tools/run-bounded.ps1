@@ -25,6 +25,9 @@
 #   <EvidenceDir>/run-bounded-<yyyyMMdd-HHmmss>.txt    same, human-readable
 #   per instance: pid, wall seconds, peak process CPU%, peak working set MB, exit code, outcome,
 #   kill reason, post-run audit readings (system CPU% and available MB before/after)
+#   NOTE ON UNITS: peakCpuPct is the sum over cores (a busy 8-core process can read >100%), and
+#   peakMemoryMB is Win32_Process.WorkingSetSize sampled every poll (not the .NET object's stale
+#   WorkingSet64).
 #   EvidenceDir default: $env:MODTEST_BOUNDED_EVIDENCE_DIR, else <temp>/modtest-bounded-runs
 #
 # DRY RUN (proves the logic WITHOUT ever starting a JVM)
@@ -152,10 +155,28 @@ function Test-ProcessAlive([int]$ProcessId) {
 }
 
 function Get-ProcessSample([System.Diagnostics.Process]$ProcessObject) {
+    # Prefer CIM: a Start-Process .NET Process object can report a stale/early WorkingSet64 (a JVM
+    # read 3.1 MB that way), which would make the required "peak memory" metric worthless.
     $cpuSeconds = -1.0
     $workingSetMB = -1.0
-    try { $cpuSeconds = $ProcessObject.TotalProcessorTime.TotalSeconds } catch { $cpuSeconds = -1.0 }
-    try { $workingSetMB = [math]::Round(([double]$ProcessObject.WorkingSet64) / 1MB, 1) } catch { $workingSetMB = -1.0 }
+    try {
+        $ownerPid = $ProcessObject.Id
+        $row = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId={0}" -f $ownerPid) -ErrorAction Stop
+        if ($null -ne $row) {
+            $workingSetMB = [math]::Round(([double]$row.WorkingSetSize) / 1MB, 1)
+            # Win32_Process times are 100-ns units; sum of user+kernel = CPU seconds used
+            $cpuSeconds = ([double]$row.UserModeTime + [double]$row.KernelModeTime) / 10000000.0
+        }
+    } catch {
+        $cpuSeconds = -1.0
+        $workingSetMB = -1.0
+    }
+    if ($workingSetMB -lt 0) {
+        try { $workingSetMB = [math]::Round(([double]$ProcessObject.WorkingSet64) / 1MB, 1) } catch { $workingSetMB = -1.0 }
+    }
+    if ($cpuSeconds -lt 0) {
+        try { $cpuSeconds = $ProcessObject.TotalProcessorTime.TotalSeconds } catch { $cpuSeconds = -1.0 }
+    }
     return [pscustomobject]@{ cpuSeconds = $cpuSeconds; workingSetMB = $workingSetMB }
 }
 

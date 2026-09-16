@@ -213,7 +213,7 @@ public final class Executor {
 
         /** Throws {@code E_ASSERT} on the first failing assertion. */
         public void evaluate(JsonObject result, JsonObject expect) {
-            if (expect == null || expect.isEmpty()) {
+            if (expect == null || expect.size() == 0) {   // size(), not isEmpty(): Gson 2.10 needs it
                 return;
             }
             for (Map.Entry<String, JsonElement> e : expect.entrySet()) {

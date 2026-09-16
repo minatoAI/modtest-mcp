@@ -250,7 +250,10 @@ public final class Guard {
          * empty {@code params} object is byte-for-byte the old behaviour (a no-op command).
          */
         public static InputCommand fromParams(com.google.gson.JsonObject params) {
-            if (params == null || params.isEmpty()) {
+            // `size() == 0`, never `isEmpty()`: JsonObject.isEmpty() only exists from Gson 2.10.1,
+            // while Minecraft 1.20.1 ships Gson 2.10 — there it is a NoSuchMethodError at runtime,
+            // which unit tests compiled against 2.10.1 can never catch. See :core:verifyGsonApiSurface.
+            if (params == null || params.size() == 0) {
                 return none();
             }
             for (String key : params.keySet()) {

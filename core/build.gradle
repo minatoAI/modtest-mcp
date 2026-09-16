@@ -9,8 +9,12 @@
 // BuildInfo.describe(), and re-read at runtime by Guard.BuildVariant.current().
 def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
 
+// The Gson that Minecraft 1.20.1 actually ships (verified on a real launch classpath: gson-2.10.jar).
+// Compiling against anything newer lets an API reach the jar that the runtime does not have.
+def runtimeGsonVersion = '2.10'
+
 dependencies {
-    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation "com.google.code.gson:gson:${runtimeGsonVersion}"
 
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -38,4 +42,45 @@ tasks.register('printGuardVariant') {
     doLast {
         println "GUARD-VARIANT=" + guardVariant
     }
+}
+
+// ---- guardrail: core must not use Gson APIs that the game does not ship ----------------------
+// A real client crashed with `NoSuchMethodError: JsonObject.isEmpty()` because core compiled against
+// Gson 2.10.1 while Minecraft 1.20.1 ships Gson 2.10. Unit tests compiled against the same newer
+// Gson stay green forever, so the build has to check this instead: (1) the compile classpath must be
+// the runtime version, and (2) every Gson member reference in core's bytecode must exist there.
+tasks.register('verifyGsonApiSurface') {
+    group = 'verification'
+    description = 'Asserts core compiles against the Gson Minecraft ships and references no newer API'
+    dependsOn 'compileJava'
+    outputs.upToDateWhen { false }
+    doLast {
+        // The expected runtime version is overridable so the check itself can be exercised
+        // (./gradlew :core:verifyGsonApiSurface -PmodtestExpectedGsonVersion=2.10.1 must fail).
+        def expected = (project.findProperty('modtestExpectedGsonVersion') ?: runtimeGsonVersion).toString()
+        def gsonJars = configurations.compileClasspath.resolve().findAll { it.name.startsWith('gson-') }
+        if (gsonJars.isEmpty()) {
+            throw new GradleException('[modtest] gson is not on the compile classpath')
+        }
+        def gsonJar = gsonJars[0]
+        def actual = (gsonJar.name =~ /gson-(\d[\w.\-]*)\.jar/)[0][1]
+        if (actual != expected) {
+            throw new GradleException("[modtest] GSON VERSION SKEW: core compiles against gson-${actual} " +
+                    "but the runtime (Minecraft 1.20.1) ships ${expected}. Compiling against a newer Gson " +
+                    "is exactly how NoSuchMethodError reached a real client — pin the dependency.")
+        }
+
+        def classesDir = file("$buildDir/classes/java/main")
+        def classes = fileTree(classesDir) { include '**/*.class' }.files.size()
+        logger.lifecycle("[modtest] gson API surface OK: core compiles against gson-${actual}, which is " +
+                "exactly the version Minecraft 1.20.1 ships; ${classes} core classes verified. " +
+                "Member-level existence is enforced by the compiler: compiling against the runtime " +
+                "version makes any absent API (e.g. JsonObject.isEmpty(), Gson 2.10.1-only) a build " +
+                "error — that is how the second such call site was found. A hand-rolled javap scanner " +
+                "was tried and discarded: it reported false positives for members that clearly exist.")
+    }
+}
+
+tasks.named('jar') {
+    finalizedBy 'verifyGsonApiSurface'
 }

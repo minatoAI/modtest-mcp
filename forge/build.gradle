@@ -169,6 +169,7 @@ tasks.register('verifySelfContainedJar') {
             throw new GradleException("[modtest] self-contained guardrail: no jar at ${jarFile}")
         }
         int topLevelCore = 0
+        boolean packMcmeta = false
         def nestedJars = [:]
         def metadata = null
         new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
@@ -192,6 +193,9 @@ tasks.register('verifySelfContainedJar') {
                 if (e.name == 'META-INF/jarjar/metadata.json') {
                     zf.getInputStream(e).withStream { ins -> metadata = ins.getText('UTF-8') }
                 }
+                if (e.name == 'pack.mcmeta') {
+                    packMcmeta = true
+                }
             }
         }
         int nestedCore = nestedJars.values().sum() ?: 0
@@ -209,6 +213,14 @@ tasks.register('verifySelfContainedJar') {
         if (!nestedJars.isEmpty() && (metadata == null || !metadata.contains('modtest-harness-core'))) {
             logger.warn("[modtest] self-contained guardrail: META-INF/jarjar/metadata.json missing or " +
                     "does not name modtest-harness-core (nested jar may not be registered)")
+        }
+        // P0d: a jar without pack.mcmeta makes Forge log "Missing metadata in pack" and raise a
+        // *blocking* "mod loading warnings" screen (client.showLoadWarnings defaults to true), which
+        // stalls every automated real-machine run at the main menu.
+        if (!packMcmeta) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: the jar has no " +
+                    "pack.mcmeta — Forge would raise a blocking mod-loading warning screen. " +
+                    "Add forge/src/main/resources/pack.mcmeta.")
         }
         logger.lifecycle("[modtest] self-contained guardrail OK: ${topLevelCore + nestedCore} :core " +
                 "class(es) packaged (top-level=${topLevelCore}, nested=${nestedCore})")

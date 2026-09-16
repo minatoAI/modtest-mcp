@@ -1,5 +1,14 @@
 # modtest-mcp — a development harness for Minecraft mod authors (MCP)
 
+> **Status: EARLY PREVIEW — agent side only.**
+> This repository currently ships the **agent side** of the bridge (the MCP server, the
+> `modtest-bridge/1.0` specification and the analysis tools) plus the protocol itself. There is
+> **no game-side executor yet**: cloning this repository will *not* let you drive a Minecraft
+> client — the executor that answers tickets lands in **Stage 2** (see
+> [`docs/STAGE2-TODO.md`](docs/STAGE2-TODO.md)), which is in progress.
+> The wire format is published for review and **may still change before 1.0**; expect breaking
+> changes between preview releases, and pin a commit if you build against it.
+
 `mcp-name: io.github.minatoAI/modtest-mcp`
 
 modtest-mcp is a **developer tool**: it drives a **local development client** in a

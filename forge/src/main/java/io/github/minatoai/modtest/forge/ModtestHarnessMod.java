@@ -107,13 +107,21 @@ public final class ModtestHarnessMod {
 
         Executor.TicketExecutor executor = new Executor.TicketExecutor(config, catalog);
         Minecraft mc = Minecraft.getInstance();
+        // The write-op guard: every op that can change the player (input.set, inv.select, inv.click,
+        // inv.toss, use.item, pose.set, world.place) passes through this one object, so an allowance is
+        // logged exactly once (token FINGERPRINT only, never its value), a refusal leaves no line, and a
+        // no-op writes nothing. Leaving it out is not "no guard": ExecContext substitutes a fail-closed
+        // one, which is why the same policy instance used by the input writer is reused here.
+        Guard.MutationGuard mutationGuard = new Guard.MutationGuard(
+                policy, new MinecraftSessionState(mc), activation, Bridge.Clock.system(),
+                line -> LOG.info("[modtest-mcp] {}", line));
         relay = new Relay.BridgeRelay(config, new Bridge.NioBridgeFs(config.dir()),
                 new Relay.TicketValidator(catalog), executor,
                 new Relay.ReceiptStore(new Bridge.NioBridgeFs(config.dir()), Bridge.Clock.system()),
                 Bridge.Clock.system(), line -> LOG.info("[modtest-mcp] {}", line),
                 () -> new Executor.ExecContext(config, new MinecraftSessionState(mc), activation,
                         Bridge.Clock.system(), Map.of("allow-mutate", config.allowMutate()),
-                        new MinecraftClientModel(mc)));
+                        new MinecraftClientModel(mc, config.dir().resolve("recordings")), mutationGuard));
         MinecraftForge.EVENT_BUS.register(this);
         LOG.warn("[modtest-mcp] {} — this is a DEVELOPMENT harness, not a gameplay mod",
                 io.github.minatoai.modtest.core.BuildInfo.describe());
@@ -237,7 +245,18 @@ public final class ModtestHarnessMod {
     }
 
     public static ClientModel clientModel() {
-        return new MinecraftClientModel(Minecraft.getInstance());
+        return new MinecraftClientModel(Minecraft.getInstance(), config == null ? null : config.dir());
+    }
+
+    /**
+     * Per-frame hook: one frame duration per rendered frame, so {@code bench.read} can report a real
+     * window without any op ever blocking the render thread waiting for future frames.
+     */
+    @SubscribeEvent
+    public void onRenderTick(TickEvent.RenderTickEvent event) {
+        if (event.phase == TickEvent.Phase.END) {
+            MinecraftClientModel.recordFrame(System.nanoTime());
+        }
     }
 
     @SubscribeEvent

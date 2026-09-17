@@ -209,8 +209,11 @@ variants were exercised:
 2. **Refusal by default, and each allowance path works**: injection is off unless the dev flag *and*
    an unexpired token are present; single-player is allowed; an **undeclared** remote host is
    refused; a host declared in `MODTEST_ALLOWED_HOSTS` is allowed and audited.
-3. **The five unimplemented ops keep refusing** (`inv.click`, `inv.toss`, `use.item`,
-   `shot.capture`, `bench.read`) with `E_UNSUPPORTED` — a deliberate scope decision, not a defect.
+3. **(superseded by the task-70 batch)** The five ops that used to answer `E_UNSUPPORTED`
+   (`inv.click`, `inv.toss`, `use.item`, `shot.capture`, `bench.read`) are now **implemented in
+   `:core`** and **wired in the Forge adapter**. They are no longer a refused scope decision; the
+   real-machine pass for them — and for the three older write ops that were newly brought under the
+   guard (`inv.select`, `pose.set`, `world.place`) — is the open item listed in §9.4.
 4. **Both variants build** (4a) and the **Mixin really applies** (4b: `@At` injection resolved in
    the production (SRG) domain, zero mixin errors).
 5. **End-to-end ticket loop closes** (ticket → receipt → archive).
@@ -263,7 +266,20 @@ length, not the number of writes performed** (the audit lines are the record of 
   client.
 * **No verification on public or third-party servers.** Everything above was verified on worlds and
   servers owned by the operator, on loopback/LAN.
-* **The five `E_UNSUPPORTED` ops are a scope decision** (§9.2 item 3), not an unfinished accident.
+* **The task-70 ops have not had their real-machine pass yet.** `inv.click`, `inv.toss`, `use.item`,
+  `shot.capture` and `bench.read` are implemented in `:core` with a full unit-test matrix, and the
+  Forge adapter now wires them — but every claim about what they do to a *real* client is still
+  unverified. The same applies to `inv.select`, `pose.set` and `world.place`, which now pass the
+  write-op guard and are audited for the first time (§7.2 has the three-path criteria).
+* **Frame telemetry on a real client is bounded by the frames already rendered.** The relay runs on
+  the client/render thread, so `bench.read` reports the **most recent** rendered window
+  (`sampleCount` may be shorter than requested; core says so in the note) rather than waiting for
+  future frames — waiting there would deadlock the tick loop that drives the relay. `shot.capture`
+  reads the framebuffer synchronously on that same thread (`Screenshot.takeScreenshot`); it never
+  invents a frame, but it also cannot wait for a future one, so a "waited for a frame" `E_TIMEOUT`
+  is not produced by this adapter (the per-op budget timeout still applies).
+* **`RENDER_PIPELINE` is read-only for the injection gate but not for `allow-mutate`.** See §6.4:
+  the two predicates differ by design, and the whole vocabulary is classified explicitly.
 * (Updated status: the earlier `pose.set` false-green is **fixed** — §9.3; the fixture-threshold
   branch that could mask resource leftovers was proven in both directions and is **not** an open
   item.)

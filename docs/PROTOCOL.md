@@ -323,14 +323,31 @@ ownership; refusing instead of assuming it is allowed"* — and MUST NOT guess a
 treat an unknown address as an allowance. (Single-player needs no address: the policy allows it
 before the allow-list is consulted.)
 
-**Partial application.** An op that can only partially take effect — `pose.set` against a
-server-authoritative session is the reference case — MUST report what actually happened:
-`applied:{field: value}` and `skipped:{field: {requested, actual}}`, plus
-`authority: "client" | "server"` and a `note` naming the authority. `ok:true` keeps meaning "the op
-executed" (§6.2a) and never implies "every requested field took effect". Semantics by session:
-single-player (client authority) — a settled teleport *is* the real pose, so `applied` should be
-complete; multiplayer (server authority) — the server owns the player position, so position fields
-may land in `skipped` while client-side rotation still applies.
+**Partial application.** An op that can only partially take effect — `pose.set` is the reference
+case — MUST report what actually happened: `applied:{field: value}` and
+`skipped:{field: {requested, actual, reason}}`, plus `authority: "client" | "server"` and a `note`.
+`ok:true` keeps meaning "the op executed" (§6.2a) and never implies "every requested field took
+effect".
+
+**`applied` MUST come from a settled read-back — never from the value read immediately after the
+request.** The transient value a client sets exists only locally and for an instant; the authority
+publishes the real pose on a later tick. A receipt that reported five applied fields while the
+position never moved (real-machine, round D/E) was produced exactly that way. Rules:
+
+* wait **≥ 1 client tick** before reading back; a remote session gets a longer bounded budget for the
+  server round trip;
+* a field may be reported as `applied` **only** when the pose settled *and* the settled value matches
+  the request (within a small epsilon);
+* if the pose did not settle in the budget, **nothing** may be reported as applied: every requested
+  field goes to `skipped` with `reason: "not settled"`;
+* `authority` and `note` are derived from the same verdict as `applied`/`skipped`, so they cannot
+  contradict it.
+
+**Authority is not "single-player vs multiplayer".** A single-player world's **integrated server is
+authoritative too**: client-side `moveTo` values are overwritten by the next authoritative update, so
+`authority: "client"` does **not** imply that a teleport will stick. What does stick on both session
+types is client-side **rotation**; position may land in `skipped` in either case, and the receipt
+must say so.
 
 ### 6.3 Preconditions
 

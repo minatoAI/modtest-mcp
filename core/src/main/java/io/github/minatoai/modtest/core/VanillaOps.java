@@ -164,10 +164,26 @@ public final class VanillaOps {
         }
     }
 
-    /** {@code pose.set} — teleport then read back, reporting what actually took effect. */
+    /**
+     * {@code pose.set} — apply, then report what <b>actually took effect</b>.
+     *
+     * <p>The verdict MUST come from a <b>settled</b> read-back, never from the value immediately after
+     * {@code teleport()}. That instantaneous value is only the local/transient pose: the integrated
+     * server (single-player included) or the remote server overwrites it on the next tick, which is
+     * exactly how a real receipt reported five applied fields while the position never moved.
+     *
+     * <p>Rule for every "report what happened" op: a field may only be called applied when the pose
+     * settled <i>and</i> the settled value matches the request; otherwise it goes to {@code skipped},
+     * with {@code reason: "not settled"} when the settle loop timed out.
+     */
     public static final class PoseOps implements Executor.OpHandler {
         private static final double COORD_EPS = 1.0e-3;
         private static final double ANGLE_EPS = 1.0e-3;
+        /** Bounded settle budget, in client ticks, before a field is declared not to have settled. */
+        private static final int CLIENT_SETTLE_TICKS = 4;
+        private static final int SERVER_SETTLE_TICKS = 8;
+        private static final java.util.List<String> FIELDS =
+                java.util.List.of("x", "y", "z", "yaw", "pitch");
 
         @Override
         public JsonObject handle(Protocol.Ticket.Op op, Executor.ExecContext ctx) {
@@ -180,6 +196,16 @@ public final class VanillaOps {
             float rpitch = p.get("pitch").getAsFloat();
             c.teleport(rx, ry, rz, ryaw, rpitch, Json.intOr(p, "settle_ms", 250));
 
+            boolean integrated = ctx.session().hasIntegratedServer() && !ctx.session().connectedToRemoteServer();
+            // Wait for the authority to publish: >= 1 client tick always, more for a remote server.
+            int budget = integrated ? CLIENT_SETTLE_TICKS : SERVER_SETTLE_TICKS;
+            boolean settled = false;
+            for (int i = 0; i < budget && !settled; i++) {
+                c.waitFrames(1);
+                settled = c.settled();
+            }
+
+            // Read back ONLY now — after the settle loop, never from the instantaneous value.
             double ax = c.x();
             double ay = c.y();
             double az = c.z();
@@ -192,41 +218,66 @@ public final class VanillaOps {
             pose.addProperty("yaw", ayaw);
             pose.addProperty("pitch", apitch);
 
-            // "requested" is not "applied". On a server-authoritative session the position the client
-            // sets is rubber-banded back while client-side rotation survives, so the receipt must say
-            // which fields actually took effect instead of letting ok:true imply "all of them did".
             JsonObject applied = Json.object();
             JsonObject skipped = Json.object();
-            compare(applied, skipped, "x", rx, ax, COORD_EPS);
-            compare(applied, skipped, "y", ry, ay, COORD_EPS);
-            compare(applied, skipped, "z", rz, az, COORD_EPS);
-            compare(applied, skipped, "yaw", ryaw, ayaw, ANGLE_EPS);
-            compare(applied, skipped, "pitch", rpitch, apitch, ANGLE_EPS);
+            if (settled) {
+                compare(applied, skipped, "x", rx, ax, COORD_EPS, integrated);
+                compare(applied, skipped, "y", ry, ay, COORD_EPS, integrated);
+                compare(applied, skipped, "z", rz, az, COORD_EPS, integrated);
+                compare(applied, skipped, "yaw", ryaw, ayaw, ANGLE_EPS, integrated);
+                compare(applied, skipped, "pitch", rpitch, apitch, ANGLE_EPS, integrated);
+            } else {
+                // Nothing may be reported as applied when the pose never settled.
+                notSettled(skipped, "x", rx);
+                notSettled(skipped, "y", ry);
+                notSettled(skipped, "z", rz);
+                notSettled(skipped, "yaw", ryaw);
+                notSettled(skipped, "pitch", rpitch);
+            }
 
-            boolean integrated = ctx.session().hasIntegratedServer() && !ctx.session().connectedToRemoteServer();
+            // authority + note are derived from the SAME verdict as applied/skipped, so they cannot
+            // contradict it (a real receipt once claimed every position field was applied while its
+            // own note said the server owns the position).
+            String note = (integrated
+                    ? "single-player: the integrated server is authoritative too, so a field is reported "
+                            + "as applied only after the pose settled"
+                    : "multiplayer: the server owns the player position; position fields that did not "
+                            + "settle are reported under skipped")
+                    + (settled
+                            ? (applied.size() == FIELDS.size()
+                                    ? "; every requested field took effect"
+                                    : "; not applied: " + skipped.keySet())
+                            : "; the pose did not settle within " + budget
+                                    + " client ticks, so nothing is reported as applied");
+
             JsonObject out = Json.object();
             out.add("pose", pose);
-            out.addProperty("settled", c.settled());
+            out.addProperty("settled", settled);
             out.add("applied", applied);
             out.add("skipped", skipped);
             out.addProperty("authority", integrated ? "client" : "server");
-            out.addProperty("note", integrated
-                    ? "single-player: the client is authoritative, so a settled pose is the real pose"
-                    : "multiplayer: the server owns the player position, so position fields may be "
-                            + "requested but not take effect (rotation is client-side and usually does)");
+            out.addProperty("note", note);
             return out;
         }
 
-        private static void compare(JsonObject applied, JsonObject skipped, String field,
-                                    double requested, double actual, double eps) {
+        private static void compare(JsonObject applied, JsonObject skipped, String field, double requested,
+                                    double actual, double eps, boolean integrated) {
             if (Math.abs(requested - actual) <= eps) {
                 applied.addProperty(field, actual);
             } else {
                 JsonObject s = Json.object();
                 s.addProperty("requested", requested);
                 s.addProperty("actual", actual);
+                s.addProperty("reason", integrated ? "did not take effect" : "server-authoritative position");
                 skipped.add(field, s);
             }
+        }
+
+        private static void notSettled(JsonObject skipped, String field, double requested) {
+            JsonObject s = Json.object();
+            s.addProperty("requested", requested);
+            s.addProperty("reason", "not settled");
+            skipped.add(field, s);
         }
     }
 

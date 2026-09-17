@@ -202,24 +202,29 @@ public final class ModtestHarnessMod {
         }
         Guard.Decision decision = guardedWriter.submit(pending, inputOp, new MinecraftSessionState(mc),
                 activation, Bridge.Clock.system());
-        if (decision.allowed() && !decision.noop()) {
-            // Re-submitted every tick of the hold, so the guard decides every single write.
-            int remaining = PENDING_TICKS.getAndSet(0);
-            if (remaining > 0) {
-                PENDING.set(pending);
-                PENDING_TICKS.set(remaining - 1);
-            }
-            var clamped = guardedWriter.lastCommand() == null ? pending : guardedWriter.lastCommand();
-            mc.player.input.forwardImpulse = clamped.forward();
-            mc.player.input.leftImpulse = clamped.strafe();
-            mc.player.setYRot(mc.player.getYRot() + clamped.yawDelta());
-            mc.player.setXRot(mc.player.getXRot() + clamped.pitchDelta());
-            if (clamped.jump()) {
-                mc.player.input.jumping = true;
-            }
-            if (clamped.sneak()) {
-                mc.player.input.shiftKeyDown = true;
-            }
+        // The hold budget is consumed UNCONDITIONALLY: if this tick is refused or is a no-op the hold
+        // ends here. Leaving PENDING_TICKS untouched on that path would let a stale tick budget leak
+        // into the next ticket, so a later injection could run longer than the ticket asked for.
+        int remaining = PENDING_TICKS.getAndSet(0);
+        if (!decision.allowed() || decision.noop()) {
+            return;
+        }
+        if (remaining > 0) {
+            // Re-submitted every tick of the hold, so the guard decides every single write, and the
+            // hold can never outlive the requested tick count.
+            PENDING.set(pending);
+            PENDING_TICKS.set(remaining - 1);
+        }
+        var clamped = guardedWriter.lastCommand() == null ? pending : guardedWriter.lastCommand();
+        mc.player.input.forwardImpulse = clamped.forward();
+        mc.player.input.leftImpulse = clamped.strafe();
+        mc.player.setYRot(mc.player.getYRot() + clamped.yawDelta());
+        mc.player.setXRot(mc.player.getXRot() + clamped.pitchDelta());
+        if (clamped.jump()) {
+            mc.player.input.jumping = true;
+        }
+        if (clamped.sneak()) {
+            mc.player.input.shiftKeyDown = true;
         }
     }
 

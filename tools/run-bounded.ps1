@@ -346,15 +346,33 @@ function Test-PostRunAudit {
         # PIDs of orphan-name-matching processes that already existed BEFORE this round started.
         # They are not "our" leftovers: a round may intentionally run alongside a pre-existing JVM
         # (e.g. a LAN round with its own dedicated server). Only NEW survivors are orphans.
-        [int[]]$BaselineProcessIds = @()
+        [int[]]$BaselineProcessIds = @(),
+        # A distinctive substring of OUR launch command line (normally the --gameDir value). On a
+        # shared machine another teammate's build JVM can appear *during* our round and survive it;
+        # without attribution it would be reported as our orphan and the audit would be a false red.
+        # When empty (e.g. dry runs) no attribution filtering happens.
+        [string]$LaunchSignature = ''
     )
     $problems = New-Object System.Collections.Generic.List[string]
     $targetAlive = $false
     if ($Record.pid -gt 0) { $targetAlive = Test-ProcessAlive -ProcessId $Record.pid }
     if ($targetAlive) { $problems.Add(('target pid {0} is still alive after the instance' -f $Record.pid)) | Out-Null }
     $matching = Get-BlockingProcesses -Names $OrphanNames -TitlePattern $TitlePattern
-    $orphans = @($matching | Where-Object { $BaselineProcessIds -notcontains [int]$_.pid })
+    $newSinceLaunch = @($matching | Where-Object { $BaselineProcessIds -notcontains [int]$_.pid })
     $preexisting = @($matching | Where-Object { $BaselineProcessIds -contains [int]$_.pid })
+    $unattributed = @()
+    if ($LaunchSignature.Length -gt 0) {
+        $ours = New-Object System.Collections.Generic.List[object]
+        foreach ($candidate in $newSinceLaunch) {
+            $cmdLine = ''
+            $ci = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f [int]$candidate.pid) -ErrorAction SilentlyContinue
+            if ($null -ne $ci -and $null -ne $ci.CommandLine) { $cmdLine = [string]$ci.CommandLine }
+            if ($cmdLine.Contains($LaunchSignature)) { $ours.Add($candidate) | Out-Null } else { $unattributed += $candidate }
+        }
+        $orphans = @($ours)
+    } else {
+        $orphans = @($newSinceLaunch)
+    }
     if (@($orphans).Count -gt 0) {
         foreach ($orphan in $orphans) { $problems.Add(('orphan process: pid={0} name={1} title={2}' -f $orphan.pid, $orphan.name, $orphan.title)) | Out-Null }
     }
@@ -378,6 +396,7 @@ function Test-PostRunAudit {
         ok = ($problems.Count -eq 0); problems = $problems.ToArray()
         targetGone = (-not $targetAlive); orphanCount = @($orphans).Count
         preexistingExcluded = @($preexisting).Count
+        unattributedExcluded = @($unattributed).Count
         cpuRecovered = $cpuRecovered; memoryRecovered = $memoryRecovered
         targetCheck = ('Get-Process -Id {0} => {1}' -f $Record.pid, $(if ($targetAlive) { 'ALIVE' } else { 'not found (gone)' }))
         baseline = $BaselineSnapshot; after = $AfterSnapshot
@@ -438,6 +457,20 @@ if ($DryRun) {
 }
 if ($launchExe.Length -eq 0) { Write-Output 'ERROR: -FilePath is required unless -DryRun is used'; exit $EXIT_BAD_PARAMS }
 
+# Attribution signature for the post-run orphan audit: a substring that appears in OUR launch command
+# line but not in an unrelated JVM. Prefer the --gameDir value, else a dotted main class, else the
+# executable path. Left empty for dry runs, where the "our child" shape is different.
+$launchSignature = ''
+if (-not $DryRun) {
+    for ($i = 0; $i -lt ($launchArgs.Count - 1); $i++) {
+        if ($launchArgs[$i] -eq '--gameDir') { $launchSignature = [string]$launchArgs[$i + 1]; break }
+    }
+    if ($launchSignature.Length -eq 0) {
+        foreach ($a in $launchArgs) { if (($a -notlike '-*') -and ($a -like '*.*')) { $launchSignature = [string]$a; break } }
+    }
+    if ($launchSignature.Length -eq 0) { $launchSignature = [string]$launchExe }
+}
+
 $roundStartedAt = Get-Date
 $baselineSnapshot = Get-SystemSnapshot
 $baselineSnapshotForAudit = $baselineSnapshot
@@ -493,11 +526,11 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Start-Sleep -Seconds $PollSeconds
     $afterSnapshot = Get-SystemSnapshot
     $audit = Test-PostRunAudit -Record $record -OrphanNames $orphanNameList -TitlePattern $BlockingWindowTitlePattern `
-        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids
+        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids -LaunchSignature $launchSignature
     $record | Add-Member -NotePropertyName audit -NotePropertyValue $audit -Force
     $instanceRecords.Add($record) | Out-Null
     Write-Output ('instance #{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB kill={6}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.killPerformed)
-    Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} cpuRecovered={3} memRecovered={4} ok={5}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
+    Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} unattributedExcluded={3} cpuRecovered={4} memRecovered={5} ok={6}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.unattributedExcluded, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
     foreach ($problem in @($audit.problems)) { Write-Output ('  problem: {0}' -f $problem) }
     if ($record.outcome -eq 'timeout-killed') { $verdict = 'FAIL:instance-timeout'; $finalExit = $EXIT_INSTANCE_TIMEOUT }
     elseif ($record.outcome -eq 'stall-killed') { $verdict = 'FAIL:instance-stall'; $finalExit = $EXIT_INSTANCE_STALL }

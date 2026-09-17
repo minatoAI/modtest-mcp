@@ -11,7 +11,9 @@
 #   * watchdog kills the instance itself (Stop-Process -Force) on deadline OR on stall
 #   * before starting: any java/javaw/Minecraft window present -> REFUSE (never kills other people's
 #     processes; it only declines to start)
-#   * after every instance, mandatory post-run audit: this PID is gone, no orphan java/javaw remain,
+#   * after every instance, mandatory post-run audit: this PID is gone, no orphan java/javaw remain
+#     (a pre-launch baseline of matching PIDs is excluded: a round explicitly allowed to run next to
+#     a pre-existing JVM, e.g. a LAN round with its own dedicated server, must not be blamed for it),
 #     and system CPU / available memory have come back to the pre-round baseline
 #   * any cap breach or failed audit => stop the whole round immediately with a non-zero exit code
 #
@@ -340,13 +342,19 @@ function Test-PostRunAudit {
         [System.Collections.Generic.List[string]]$OrphanNames,
         [string]$TitlePattern,
         [object]$BaselineSnapshot,
-        [object]$AfterSnapshot
+        [object]$AfterSnapshot,
+        # PIDs of orphan-name-matching processes that already existed BEFORE this round started.
+        # They are not "our" leftovers: a round may intentionally run alongside a pre-existing JVM
+        # (e.g. a LAN round with its own dedicated server). Only NEW survivors are orphans.
+        [int[]]$BaselineProcessIds = @()
     )
     $problems = New-Object System.Collections.Generic.List[string]
     $targetAlive = $false
     if ($Record.pid -gt 0) { $targetAlive = Test-ProcessAlive -ProcessId $Record.pid }
     if ($targetAlive) { $problems.Add(('target pid {0} is still alive after the instance' -f $Record.pid)) | Out-Null }
-    $orphans = Get-BlockingProcesses -Names $OrphanNames -TitlePattern $TitlePattern
+    $matching = Get-BlockingProcesses -Names $OrphanNames -TitlePattern $TitlePattern
+    $orphans = @($matching | Where-Object { $BaselineProcessIds -notcontains [int]$_.pid })
+    $preexisting = @($matching | Where-Object { $BaselineProcessIds -contains [int]$_.pid })
     if (@($orphans).Count -gt 0) {
         foreach ($orphan in $orphans) { $problems.Add(('orphan process: pid={0} name={1} title={2}' -f $orphan.pid, $orphan.name, $orphan.title)) | Out-Null }
     }
@@ -369,6 +377,7 @@ function Test-PostRunAudit {
     return [pscustomobject]@{
         ok = ($problems.Count -eq 0); problems = $problems.ToArray()
         targetGone = (-not $targetAlive); orphanCount = @($orphans).Count
+        preexistingExcluded = @($preexisting).Count
         cpuRecovered = $cpuRecovered; memoryRecovered = $memoryRecovered
         targetCheck = ('Get-Process -Id {0} => {1}' -f $Record.pid, $(if ($targetAlive) { 'ALIVE' } else { 'not found (gone)' }))
         baseline = $BaselineSnapshot; after = $AfterSnapshot
@@ -432,6 +441,10 @@ if ($launchExe.Length -eq 0) { Write-Output 'ERROR: -FilePath is required unless
 $roundStartedAt = Get-Date
 $baselineSnapshot = Get-SystemSnapshot
 $baselineSnapshotForAudit = $baselineSnapshot
+# Snapshot which orphan-name-matching processes already exist BEFORE we launch. A round may be
+# allowed to run alongside a pre-existing JVM (LAN round + its dedicated server); those must not be
+# reported as our orphans afterwards.
+$baselineOrphanPids = @(Get-BlockingProcesses -Names $orphanNameList -TitlePattern $BlockingWindowTitlePattern | ForEach-Object { [int]$_.pid })
 
 # 3) refuse to start when a client process is already there -- refuse only, never kill
 $blocking = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern
@@ -480,11 +493,11 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Start-Sleep -Seconds $PollSeconds
     $afterSnapshot = Get-SystemSnapshot
     $audit = Test-PostRunAudit -Record $record -OrphanNames $orphanNameList -TitlePattern $BlockingWindowTitlePattern `
-        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot
+        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids
     $record | Add-Member -NotePropertyName audit -NotePropertyValue $audit -Force
     $instanceRecords.Add($record) | Out-Null
     Write-Output ('instance #{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB kill={6}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.killPerformed)
-    Write-Output ('  audit: target[{0}] orphans={1} cpuRecovered={2} memRecovered={3} ok={4}' -f $audit.targetCheck, $audit.orphanCount, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
+    Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} cpuRecovered={3} memRecovered={4} ok={5}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
     foreach ($problem in @($audit.problems)) { Write-Output ('  problem: {0}' -f $problem) }
     if ($record.outcome -eq 'timeout-killed') { $verdict = 'FAIL:instance-timeout'; $finalExit = $EXIT_INSTANCE_TIMEOUT }
     elseif ($record.outcome -eq 'stall-killed') { $verdict = 'FAIL:instance-stall'; $finalExit = $EXIT_INSTANCE_STALL }

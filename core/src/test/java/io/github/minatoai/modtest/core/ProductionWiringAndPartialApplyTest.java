@@ -261,7 +261,7 @@ class ProductionWiringAndPartialApplyTest {
         for (String f : List.of("x", "y", "z")) {
             assertTrue(skipped.has(f), f + " must be reported as skipped: " + out);
             assertTrue(skipped.getAsJsonObject(f).has("requested"), out.toString());
-            assertTrue(skipped.getAsJsonObject(f).has("actual"), out.toString());
+            assertTrue(skipped.getAsJsonObject(f).has("observedAtReadback"), out.toString());
         }
         JsonObject applied = out.getAsJsonObject("applied");
         assertTrue(applied.has("yaw") && applied.has("pitch"),

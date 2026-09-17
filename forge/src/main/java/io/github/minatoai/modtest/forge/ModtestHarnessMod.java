@@ -5,6 +5,7 @@ import io.github.minatoai.modtest.core.Bridge;
 import io.github.minatoai.modtest.core.ClientModel;
 import io.github.minatoai.modtest.core.Executor;
 import io.github.minatoai.modtest.core.Guard;
+import io.github.minatoai.modtest.core.InputHold;
 import io.github.minatoai.modtest.core.Protocol;
 import io.github.minatoai.modtest.core.Relay;
 import io.github.minatoai.modtest.core.VanillaOps;
@@ -39,10 +40,12 @@ public final class ModtestHarnessMod {
     public static final String MOD_ID = "modtestharness";
     private static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
 
-    private static final AtomicReference<Guard.InputCommand> PENDING = new AtomicReference<>();
-    /** Remaining ticks to hold the queued command (0 = nothing queued). */
-    private static final java.util.concurrent.atomic.AtomicInteger PENDING_TICKS =
-            new java.util.concurrent.atomic.AtomicInteger();
+    /**
+     * The single owner of "how long does this injection keep writing". A hold is installed once per
+     * ticket and is replaced (never extended) by the next ticket; every path that ends a hold clears
+     * it explicitly. See {@link InputHold} for why this is core state, not adapter state.
+     */
+    private static final InputHold HOLD = new InputHold();
     /** Upper bound on a hold duration, so one ticket cannot drive input indefinitely. */
     public static final int MAX_TICKS = 200;
 
@@ -95,10 +98,10 @@ public final class ModtestHarnessMod {
                     return m.level == null ? "no-world" : m.level.dimension().location().toString();
                 });
         guardedWriter = Guard.GuardedInputWriter.audited(
-                command -> {
-                    writeCount++;
-                    PENDING.set(command);
-                },
+                // Count only. Arming the hold from this callback re-armed it on EVERY write, which is
+                // what made a hold self-perpetuating and produced 106 audit lines for a ticks:20
+                // request (P7). The hold is owned solely by InputHold.
+                command -> writeCount++,
                 policy, new Guard.HumanSpeedClamp(),
                 line -> LOG.info("[modtest-mcp] {}", line));
 
@@ -157,8 +160,10 @@ public final class ModtestHarnessMod {
         // A refusal is NOT a successful op: `ok:true` must mean "this op really executed". The
         // executor turns this exception into ops[].ok=false + error.code (see Guard.requireAllowed).
         Guard.requireAllowed(decision, "input.set");
-        if (decision.allowed() && !decision.noop() && ticks > 1) {
-            PENDING_TICKS.set(ticks - 1);
+        if (decision.allowed() && !decision.noop()) {
+            // Install this ticket's hold — REPLACING any previous one, so a new ticket can never
+            // extend a running hold. Exactly `ticks` writes follow, then it clears itself.
+            HOLD.install(op.id(), command, ticks);
         }
         JsonObject out = new JsonObject();
         out.addProperty("queued", true);
@@ -196,24 +201,19 @@ public final class ModtestHarnessMod {
 
     /** Called from the mixin right after vanilla updated the player input for this tick. */
     public static void onAiStepAfterInput(Minecraft mc) {
-        Guard.InputCommand pending = PENDING.getAndSet(null);
+        // Exactly one tick's worth is consumed here, and only here: the hold decrements atomically and
+        // clears itself at expiry, so a ticket can never write more times than it asked for.
+        Guard.InputCommand pending = HOLD.nextWrite();
         if (pending == null || mc.player == null) {
             return;
         }
         Guard.Decision decision = guardedWriter.submit(pending, inputOp, new MinecraftSessionState(mc),
                 activation, Bridge.Clock.system());
-        // The hold budget is consumed UNCONDITIONALLY: if this tick is refused or is a no-op the hold
-        // ends here. Leaving PENDING_TICKS untouched on that path would let a stale tick budget leak
-        // into the next ticket, so a later injection could run longer than the ticket asked for.
-        int remaining = PENDING_TICKS.getAndSet(0);
         if (!decision.allowed() || decision.noop()) {
+            // Refusal or no-op ends the hold immediately: no tick budget may survive into a later
+            // ticket (leaking budget was the other half of the P7 defect).
+            HOLD.clear();
             return;
-        }
-        if (remaining > 0) {
-            // Re-submitted every tick of the hold, so the guard decides every single write, and the
-            // hold can never outlive the requested tick count.
-            PENDING.set(pending);
-            PENDING_TICKS.set(remaining - 1);
         }
         var clamped = guardedWriter.lastCommand() == null ? pending : guardedWriter.lastCommand();
         mc.player.input.forwardImpulse = clamped.forward();

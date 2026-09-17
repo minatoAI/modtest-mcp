@@ -346,7 +346,16 @@ shorter than the revert delay. Rules for ops that report what took effect:
   request; a remote session gets a longer bounded budget for the server round trip;
 * if the pose did not settle in the budget, **nothing** may be reported as applied: every requested
   field goes to `skipped` with `reason: "not settled"`;
-* every skipped field carries `requested` + `actual` + `reason`;
+* every skipped field carries `requested` + `reason`, and for server-owned fields the client's
+  snapshot is reported as **`observedAtReadback`** — deliberately *not* `actual`: it is a
+  client-side reading taken inside the settle window, it is **not** the authoritative value (the
+  server owns position and never reports it synchronously), and naming it `actual` made a receipt
+  read as "the position really is 12" while the truth was 2.851… . The `applied` branch (client-owned
+  fields) keeps `actual`, because there the client's value *is* the truth;
+* the top-level `pose` object is a client-side snapshot as well and is marked
+  **`poseSource: "client-readback"`**; `settled` means "the settle loop converged", not "this pose is
+  authoritative"; and `ticks` on an `input.set` receipt is the **requested hold length**, not the
+  number of writes performed (those appear only in the audit lines);
 * `authority` and `note` are derived from the same verdict as `applied`/`skipped`, so they cannot
   contradict it;
 * **when in doubt, report `skipped`.** An honest "not applied / cannot be determined" is required;

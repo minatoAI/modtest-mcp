@@ -200,7 +200,7 @@ class PoseSettleVerdictTest {
         for (String f : List.of("x", "y", "z")) {
             assertFalse(applied.has(f), f + " must NOT be reported as applied: " + out);
             assertTrue(skipped.has(f), f + " must be reported as skipped: " + out);
-            assertTrue(skipped.getAsJsonObject(f).has("actual"), out.toString());
+            assertTrue(skipped.getAsJsonObject(f).has("observedAtReadback"), out.toString());
             assertTrue(skipped.getAsJsonObject(f).has("requested"), out.toString());
         }
         // The transient value read immediately after teleport() WAS the requested one, so the old

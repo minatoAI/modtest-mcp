@@ -254,6 +254,9 @@ public final class VanillaOps {
 
             JsonObject out = Json.object();
             out.add("pose", pose);
+            // The top-level pose is a client-side snapshot as well; without this marker it reads like
+            // an authoritative value (a real receipt showed pose.z = 12 while the truth was 2.851…).
+            out.addProperty("poseSource", "client-readback");
             out.addProperty("settled", settled);
             out.add("applied", applied);
             out.add("skipped", skipped);
@@ -274,7 +277,10 @@ public final class VanillaOps {
         private static void serverOwned(JsonObject skipped, String field, double requested, double observed) {
             JsonObject s = Json.object();
             s.addProperty("requested", requested);
-            s.addProperty("actual", observed);
+            // Named for what it is: a client-side snapshot taken inside the settle window. It is NOT
+            // the authoritative value (the server owns position and never reports it synchronously),
+            // so it must not be called `actual` — that read as "the position really is 12".
+            s.addProperty("observedAtReadback", observed);
             s.addProperty("reason", "server-authoritative position");
             skipped.add(field, s);
         }

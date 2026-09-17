@@ -239,9 +239,19 @@ class ProductionWiringAndPartialApplyTest {
     private static Executor.ExecContext ctx(ClientModel client, boolean singleplayer) {
         Bridge.BridgeConfig cfg = new Bridge.BridgeConfig(java.nio.file.Path.of("."), 500L, "exec-test",
                 "1.0.0-alpha.1", true, Bridge.BusyPolicy.ANSWER_BUSY, 64);
-        return new Executor.ExecContext(cfg,
-                singleplayer ? Guard.SessionState.singleplayer() : Guard.SessionState.remote("127.0.0.1:25585"),
-                armed(), CLOCK, java.util.Map.of("allow-mutate", true), client);
+        Guard.SessionState session = singleplayer ? Guard.SessionState.singleplayer()
+                : Guard.SessionState.remote("127.0.0.1:25585");
+        return new Executor.ExecContext(cfg, session, armed(), CLOCK,
+                java.util.Map.of("allow-mutate", true), client, guard(session));
+    }
+
+    /** pose.set is a write: the handler must be given a wired, armed guard. */
+    private static Guard.MutationGuard guard(Guard.SessionState session) {
+        return new Guard.MutationGuard(
+                new Guard.InputInjectionPolicy(Guard.HostWhitelist.of("127.0.0.1"),
+                        Guard.BuildVariant.GUARDED, "forge-client", () -> "minecraft:overworld"),
+                session, armed(), CLOCK, Guard.AuditSink.to(line -> {
+        }));
     }
 
     private static JsonObject poseParams() {

@@ -29,7 +29,7 @@
         },
         "additionalProperties": true
       },
-      "preconditions": [{ "kind": "singleplayer" }],
+      "preconditions": [],
       "sideEffects": ["none"],
       "executorId": "example-client",
       "divergence": { "vanilla": "none", "fakePlayer": "n/a (drives the real client player)" },
@@ -57,7 +57,7 @@
         "additionalProperties": true
       },
       "preconditions": [
-        { "kind": "singleplayer" },
+        { "kind": "permitted-session" },
         { "kind": "flag", "name": "allow-mutate" }
       ],
       "sideEffects": ["player.state"],
@@ -67,23 +67,32 @@
     },
     {
       "name": "shot.capture",
-      "title": "Capture a screenshot into the bridge dir",
+      "title": "Capture a screenshot and report its bytes",
+      "llmSummary": "Byte-level evidence that a frame was rendered. The content of the image is NOT interpreted.",
       "paramsSchema": {
         "type": "object",
         "properties": {
-          "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
-          "delay_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 0 }
+          "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
         },
-        "required": ["name"],
+        "required": [],
         "additionalProperties": false
       },
       "resultSchema": {
         "type": "object",
-        "properties": { "file": { "type": "string" }, "width": { "type": "integer" }, "height": { "type": "integer" } },
-        "required": ["file"],
+        "properties": {
+          "bytes": { "type": "integer" },
+          "format": { "type": "string" },
+          "width": { "type": "integer" },
+          "height": { "type": "integer" },
+          "sha256": { "type": "string" },
+          "tick": { "type": "integer" },
+          "path": { "type": "string" },
+          "note": { "type": "string" }
+        },
+        "required": ["bytes", "format"],
         "additionalProperties": true
       },
-      "preconditions": [{ "kind": "singleplayer" }],
+      "preconditions": [],
       "sideEffects": ["telemetry.recording"],
       "executorId": "example-client",
       "divergence": { "vanilla": "none", "fakePlayer": "fake players render nothing client-side" },
@@ -92,11 +101,12 @@
     {
       "name": "bench.read",
       "title": "Read a frame-time/fps sample",
+      "llmSummary": "Client-side frame durations with their sampling window; no GPU/vendor counters, not comparable across machines.",
       "paramsSchema": {
         "type": "object",
         "properties": {
           "warmup_frames": { "type": "integer", "minimum": 0, "default": 60 },
-          "sample_frames": { "type": "integer", "minimum": 1, "default": 600 }
+          "sample_frames": { "type": "integer", "minimum": 1, "maximum": 600, "default": 300 }
         },
         "required": [],
         "additionalProperties": false
@@ -104,15 +114,24 @@
       "resultSchema": {
         "type": "object",
         "properties": {
-          "fps_median": { "type": "number" },
-          "frame_ms_p95": { "type": "number" },
-          "one_percent_low": { "type": "number" }
+          "warmupFrames": { "type": "integer" },
+          "sampleFrames": { "type": "integer" },
+          "sampleCount": { "type": "integer" },
+          "actualSampleCount": { "type": "integer" },
+          "overranWindow": { "type": "boolean" },
+          "windowMs": { "type": "integer" },
+          "fpsMedian": { "type": "number" },
+          "frameMsP95": { "type": "number" },
+          "onePercentLow": { "type": "number" },
+          "units": { "type": "object" },
+          "samplesPath": { "type": "string" },
+          "note": { "type": "string" }
         },
-        "required": ["fps_median"],
+        "required": ["warmupFrames", "sampleFrames", "sampleCount", "actualSampleCount", "overranWindow", "windowMs", "units"],
         "additionalProperties": true
       },
-      "preconditions": [{ "kind": "singleplayer" }],
-      "sideEffects": ["none"],
+      "preconditions": [],
+      "sideEffects": ["telemetry.recording"],
       "executorId": "example-client",
       "divergence": { "vanilla": "n/a", "fakePlayer": "n/a" },
       "since": "1.0"

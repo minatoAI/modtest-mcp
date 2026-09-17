@@ -32,10 +32,26 @@ public final class Executor {
         private final Map<String, Boolean> flags;
         private final Map<String, JsonObject> priorResults;
         private final ClientModel client;
+        private final Guard.MutationGuard mutationGuard;
 
         public ExecContext(Bridge.BridgeConfig config, Guard.SessionState session,
                            Guard.ActivationState activation, Bridge.Clock clock,
                            Map<String, Boolean> flags, ClientModel client) {
+            this(config, session, activation, clock, flags, client, null);
+        }
+
+        /**
+         * As above, plus the guard that non-input write ops ({@code inv.click}, {@code inv.toss},
+         * {@code use.item}) must pass through.
+         *
+         * <p>A {@code null} guard is <b>not</b> "no guard": {@link #mutationGuard()} substitutes a
+         * fail-closed one, so an executor that was never wired refuses those ops (with a message
+         * saying the guard is missing) instead of performing an unaudited write.
+         */
+        public ExecContext(Bridge.BridgeConfig config, Guard.SessionState session,
+                           Guard.ActivationState activation, Bridge.Clock clock,
+                           Map<String, Boolean> flags, ClientModel client,
+                           Guard.MutationGuard mutationGuard) {
             this.config = config;
             this.session = session;
             this.activation = activation;
@@ -43,6 +59,7 @@ public final class Executor {
             this.flags = flags == null ? Map.of() : flags;
             this.priorResults = new LinkedHashMap<>();
             this.client = client;
+            this.mutationGuard = mutationGuard;
         }
 
         public Bridge.BridgeConfig config() {
@@ -65,6 +82,20 @@ public final class Executor {
             return client;
         }
 
+        /**
+         * The guard for non-input write ops. Never {@code null}: an unwired context reports a
+         * fail-closed guard whose refusal names the missing wiring.
+         */
+        public Guard.MutationGuard mutationGuard() {
+            return mutationGuard != null ? mutationGuard
+                    : Guard.MutationGuard.failClosed("ExecContext was built without a MutationGuard");
+        }
+
+        /** True when a real guard was wired; tests use it to assert the unwired path refuses. */
+        public boolean mutationGuardWired() {
+            return mutationGuard != null;
+        }
+
         public boolean flag(String name) {
             return flags.getOrDefault(name, false);
         }
@@ -80,7 +111,7 @@ public final class Executor {
         public ExecContext withFlag(String name, boolean value) {
             Map<String, Boolean> copy = new LinkedHashMap<>(flags);
             copy.put(name, value);
-            return new ExecContext(config, session, activation, clock, copy, client);
+            return new ExecContext(config, session, activation, clock, copy, client, mutationGuard);
         }
     }
 
@@ -105,6 +136,14 @@ public final class Executor {
         }
 
         public Protocol.OpSpec lookup(String name) {
+            return specs.get(name);
+        }
+
+        /**
+         * The spec of a registered op, for handlers that must hand it to the guard (the guard decides
+         * on {@code sideEffects}). {@code null} when the op is not registered.
+         */
+        public Protocol.OpSpec specFor(String name) {
             return specs.get(name);
         }
 
@@ -390,6 +429,19 @@ public final class Executor {
                 return log(log, op, Protocol.Receipt.OpResult.ok(op.id(), op.op(), result, dur));
             } catch (Protocol.ProtocolException e) {
                 long dur = ctx.clock().nowMs() - start;
+                // Backstop with no teeth in the happy path, loud when it matters: the five ops
+                // implemented in task-70 must never again come back as "unsupported" merely because
+                // the game-side adapter was not wired up yet. Such a receipt is technically a
+                // failure (ok:false), but it reads like a protocol gap. Name the defect explicitly.
+                if (e.code() == Protocol.ErrorCode.E_UNSUPPORTED && VanillaOps.WIRED_IN_CORE.contains(op.op())) {
+                    String line = "NOT-WIRED-DEFECT op=" + op.op()
+                            + ": the core implementation exists (task-70), but the client adapter threw "
+                            + "E_UNSUPPORTED for it: " + e.getMessage();
+                    if (log != null) {
+                        log.accept(line);
+                    }
+                    System.getLogger("modtest-mcp").log(System.Logger.Level.WARNING, line);
+                }
                 return log(log, op, Protocol.Receipt.OpResult.failed(op.id(), op.op(), e.toError(), dur));
             } catch (RuntimeException e) {
                 long dur = ctx.clock().nowMs() - start;

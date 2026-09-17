@@ -29,8 +29,24 @@ class TrapTest {
         Bridge.BridgeConfig config = new Bridge.BridgeConfig(Path.of("."), 500L, "trap", "0.1.0", true,
                 Bridge.BusyPolicy.ANSWER_BUSY, 64);
         Executor.ExecContext ctx = new Executor.ExecContext(config, Guard.SessionState.singleplayer(),
-                Guard.ActivationState.off(), Bridge.Clock.system(), Map.of("allow-mutate", true), client);
+                Guard.ActivationState.off(), Bridge.Clock.system(), Map.of("allow-mutate", true), client,
+                trapGuard());
         return new Executor.TicketExecutor(config, catalog).execute(t, Executor.quietLog(), ctx);
+    }
+
+    /**
+     * A wired, armed write-op guard, so these tests exercise the <i>trap</i> they are named after and
+     * not the fail-closed path of a context without a guard (which has its own tests).
+     */
+    private static Guard.MutationGuard trapGuard() {
+        return new Guard.MutationGuard(
+                new Guard.InputInjectionPolicy(Guard.HostWhitelist.of("127.0.0.1"),
+                        Guard.BuildVariant.GUARDED, "trap", () -> "minecraft:overworld"),
+                Guard.SessionState.singleplayer(),
+                new Guard.ActivationState(true,
+                        new Guard.ActivationToken("trap-token", Long.MAX_VALUE)),
+                Bridge.Clock.system(), line -> {
+        }, "ALLOWED-MUTATION");
     }
 
     @Test
@@ -64,7 +80,7 @@ class TrapTest {
         client.slots.set(0, "minecraft:diamond_helmet");
         run("{\"op\":\"inv.select\",\"params\":{\"slot\":0}}", client);
         Protocol.Receipt r = run("{\"op\":\"inv.click\",\"params\":{\"slot\":36,\"button\":0,"
-                + "\"mode\":\"quick\"}}", client);
+                + "\"mode\":\"quick_move\"}}", client);
 
         assertFalse(r.ok());
         assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
@@ -119,7 +135,11 @@ class TrapTest {
         FakeClient client = new FakeClient();
         Protocol.Receipt r = run("{\"op\":\"inv.toss\",\"params\":{\"slot\":1,\"count\":1}}", client);
         assertFalse(r.ok());
-        assertEquals("E_EXEC", r.ops().get(0).error().code());
+        // "the slot is empty" is a state the op assumes, so the refusal is E_PRECONDITION — not the
+        // E_EXEC the pre-task-70 adapter threw, and never a silent success with delta 0.
+        assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
+        assertTrue(r.ops().get(0).error().message().contains("empty"), r.ops().get(0).error().message());
+        assertEquals(0, client.tossCalls, "a refused toss must not reach the client");
     }
 
     @Test

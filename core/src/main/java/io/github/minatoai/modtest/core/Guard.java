@@ -295,7 +295,7 @@ public final class Guard {
         }
 
         private static Protocol.ProtocolException badParam(String key, String why) {
-            return (Protocol.ProtocolException) new Protocol.ProtocolException(
+            return new Protocol.ProtocolException(
                     Protocol.ErrorCode.E_BAD_PARAMS, why + ": " + key).with("path", "params." + key);
         }
     }
@@ -314,7 +314,7 @@ public final class Guard {
      */
     public static void requireAllowed(Decision decision, String opName) {
         if (!decision.allowed()) {
-            throw (Protocol.ProtocolException) new Protocol.ProtocolException(
+            throw new Protocol.ProtocolException(
                     Protocol.ErrorCode.E_PRECONDITION,
                     opName + " refused by the guard (allowed=false, queued=false, noop=false): "
                             + decision.reason());
@@ -331,18 +331,168 @@ public final class Guard {
                             String tokenFingerprint, String op, String command, String reason) {
         /** One line, deliberately greppable and deliberately not containing the token value. */
         public String format() {
-            return "ALLOWED-INPUT executor=" + executorId + " host=" + (host == null ? "singleplayer" : host)
+            return format("ALLOWED-INPUT");
+        }
+
+        /**
+         * The same line with an explicit prefix, so every write-op class is greppable on its own
+         * ({@code ALLOWED-INPUT}, {@code ALLOWED-MUTATION}, …) while the fields stay identical.
+         */
+        public String format(String prefix) {
+            return prefix + " executor=" + executorId + " host=" + (host == null ? "singleplayer" : host)
                     + " dimension=" + dimension + " at=" + atMs + " token=" + tokenFingerprint
                     + " op=" + op + " cmd=[" + command + "] reason=" + reason;
         }
     }
 
-    /** Where allowances go. Implementations should write them somewhere durable. */
+    /**
+     * Where allowances go: one <b>already formatted</b> line per allowance. The writer that made the
+     * decision owns the prefix, so a sink cannot re-label it ({@code ALLOWED-INPUT} for input,
+     * {@code ALLOWED-MUTATION} for an inventory/use write).
+     */
     public interface AuditSink {
-        void allowance(Allowance allowance);
+        void line(String line);
+
+        /** A sink that wants the structured record too can override this. */
+        default void allowance(Allowance allowance) {
+            line(allowance.format());
+        }
 
         static AuditSink to(java.util.function.Consumer<String> sink) {
-            return allowance -> sink.accept(allowance.format());
+            return sink::accept;
+        }
+    }
+    /**
+     * The one encoding point for the <b>guard of a non-input write op</b> ({@code inv.click},
+     * {@code inv.toss}, {@code use.item}): decide, audit every allowance exactly once, throw on a
+     * refusal — and leave <b>no trace at all</b> for a refusal.
+     *
+     * <p>Why this exists next to {@link GuardedInputWriter}: that writer is built to carry an
+     * {@link InputCommand}, so it treats an op without {@code PLAYER_INPUT} as "nothing to inject"
+     * and never reaches the policy. Inventory/use ops therefore need their own path, but they must
+     * not get their own <i>rules</i>: the tier order, the token rule, the host allow-list and the
+     * audit format all come from {@link InputInjectionPolicy} and {@link Allowance} unchanged.
+     *
+     * <p><b>Deny-by-default:</b> {@link #failClosed} is what an unwired executor gets. It allows
+     * nothing and names the missing wiring, so a build that forgot to construct the guard refuses
+     * these ops instead of executing them unaudited.
+     */
+    public static final class MutationGuard {
+        private final InputInjectionPolicy policy;
+        private final SessionState session;
+        private final ActivationState activation;
+        private final Bridge.Clock clock;
+        private final AuditSink audit;
+        private final java.util.List<Allowance> allowances = new ArrayList<>();
+        private final java.util.List<String> lines = new ArrayList<>();
+        private final String auditPrefix;
+        private final String unwiredReason;
+
+        /**
+         * The only constructor: the audit sink is mandatory, for the same reason it is on
+         * {@link GuardedInputWriter} — an allowance that goes unlogged is a safety defect, so it
+         * must not be possible to construct this class without somewhere to write it.
+         */
+        public MutationGuard(InputInjectionPolicy policy, SessionState session, ActivationState activation,
+                             Bridge.Clock clock, AuditSink audit) {
+            this(policy, session, activation, clock, audit, "ALLOWED-MUTATION", null);
+        }
+
+        /** As above, with an explicit audit line prefix (one greppable family per write-op class). */
+        public MutationGuard(InputInjectionPolicy policy, SessionState session, ActivationState activation,
+                             Bridge.Clock clock, AuditSink audit, String auditPrefix) {
+            this(policy, session, activation, clock, audit, auditPrefix, null);
+        }
+
+        private MutationGuard(InputInjectionPolicy policy, SessionState session, ActivationState activation,
+                              Bridge.Clock clock, AuditSink audit, String auditPrefix, String unwiredReason) {
+            if (audit == null) {
+                throw new IllegalArgumentException(
+                        "an audit sink is mandatory: an allowance must never go unlogged");
+            }
+            this.policy = policy;
+            this.session = session;
+            this.activation = activation;
+            this.clock = clock;
+            this.audit = audit;
+            this.auditPrefix = auditPrefix == null ? "ALLOWED-MUTATION" : auditPrefix;
+            this.unwiredReason = unwiredReason;
+        }
+
+        /**
+         * The state an executor gets when it never constructed a {@link MutationGuard}: nothing is
+         * permitted, and the refusal names the missing connection. Never silently "allow" — an
+         * unwired adapter would otherwise be the one build that skips the guard unnoticed.
+         */
+        public static MutationGuard failClosed(String why) {
+            return new MutationGuard(
+                    new InputInjectionPolicy(HostWhitelist.empty(), BuildVariant.GUARDED, "unwired",
+                            () -> "unknown"),
+                    SessionState.of(false, true, false, true, false, "unwired"),
+                    ActivationState.off(), () -> 0L, Guard.MutationGuard::discardLine, "ALLOWED-MUTATION",
+                    "the write-op guard is not wired for this executor: " + why);
+        }
+
+        /**
+         * The sink of the fail-closed placeholder. It can never be reached: the placeholder refuses
+         * before any allowance is built, and a test asserts that it stays empty.
+         */
+        static void discardLine(String line) {
+            throw new IllegalStateException("the fail-closed guard must never allow anything");
+        }
+
+        /**
+         * Decides, audits on the allowed path, and throws {@code E_PRECONDITION} on a refusal.
+         *
+         * @param what short human description of the pending write, recorded in the audit line
+         * @return the allowed (possibly no-op) decision; a refusal never returns
+         */
+        public Decision requireAllowed(Protocol.OpSpec op, String opName, String what) {
+            Decision decision = submit(op, opName, what);
+            Guard.requireAllowed(decision, opName);
+            return decision;
+        }
+
+        /** The policy decision plus, on the allowed path only, exactly one audit line. */
+        public Decision submit(Protocol.OpSpec op, String opName, String what) {
+            if (unwiredReason != null) {
+                return Decision.deny(unwiredReason);
+            }
+            Decision decision = policy.decide(op, session, activation, clock);
+            if (!decision.allowed()) {
+                // A refusal is not an allowance: recording it would bury a real allowance in noise.
+                return decision;
+            }
+            if (decision.noop()) {
+                // Allowed, but nothing is going to be written (paused / handshake / not in a world).
+                // There is no write to be accountable for, so there is no allowance to record.
+                return decision;
+            }
+            ActivationToken token = activation == null ? null : activation.token();
+            Allowance allowance = new Allowance(policy.owner(), session == null ? null : session.serverAddress(),
+                    "unknown", clock.nowMs(), token == null ? "none" : token.fingerprint(),
+                    op == null ? opName : op.name(), what == null ? "none" : what, decision.reason());
+            allowances.add(allowance);
+            String line = allowance.format(auditPrefix);
+            lines.add(line);
+            // Exactly one call: the line carries the guard's own prefix, and the structured record is
+            // kept in this guard. Calling allowance() as well would label the same allowance with the
+            // input prefix and emit the "one allowance" as two lines.
+            audit.line(line);
+            return decision;
+        }
+
+        public java.util.List<Allowance> allowances() {
+            return java.util.List.copyOf(allowances);
+        }
+
+        /** The audit lines this guard emitted, for the tests that assert "exactly one". */
+        public java.util.List<String> lines() {
+            return java.util.List.copyOf(lines);
+        }
+
+        public InputInjectionPolicy policy() {
+            return policy;
         }
     }
 
@@ -384,12 +534,64 @@ public final class Guard {
             return whitelist;
         }
 
+        /** Who this executor is, as recorded in every audit line ("who acted"). */
+        public String owner() {
+            return executorId;
+        }
+
         public BuildVariant variant() {
             return variant;
         }
 
+        /**
+         * What tier 1 means: an op that <b>does not change the player</b>.
+         *
+         * <p>The rule used to be "anything without {@code PLAYER_INPUT} is read-only", which was true
+         * while {@code input.set} was the only op that reached this decision. It stopped being true
+         * the moment {@code inv.click} / {@code inv.toss} / {@code use.item} were implemented: they
+         * mutate the player without touching an input axis, so a bare {@code !contains(PLAYER_INPUT)}
+         * test would have waved them straight past the injection gate — the exact three-tier policy
+         * §7.2 requires them to pass.
+         *
+         * <p>This is an <b>allow-list of the read-only effects, with everything else denied</b>, not
+         * the mirror image. The first task-70 revision listed the <i>mutating</i> effects and allowed
+         * anything absent from that list, which failed <i>open</i>: a side-effect value added to the
+         * vocabulary later would not have been in the list and would have been waved through tier 1,
+         * ungated, with nothing failing. Naming the read-only effects instead makes an unclassified
+         * value fail closed, which is the posture the rest of this policy already uses (deny by
+         * default). {@code render.pipeline} stays read-only: it is local rendering and cannot reach
+         * another machine's world.
+         */
+        static final java.util.Set<Protocol.SideEffect> READ_ONLY_EFFECTS = java.util.Set.of(
+                Protocol.SideEffect.NONE, Protocol.SideEffect.TELEMETRY_RECORDING,
+                Protocol.SideEffect.RENDER_PIPELINE);
+
+        /**
+         * True when the op can change this player or their world, and must be gated as a write.
+         *
+         * <p>Decided by {@link #READ_ONLY_EFFECTS}: a value this class has never seen is treated as a
+         * write. {@code SideEffectClassificationTest} pins the allow-list by name and walks every value
+         * of the vocabulary, so extending the enum without classifying the new value cannot pass
+         * unnoticed.
+         */
+        public static boolean mutatesThePlayer(Protocol.OpSpec op) {
+            if (op == null || op.sideEffects() == null) {
+                return false;
+            }
+            for (Protocol.SideEffect s : op.sideEffects()) {
+                if (!READ_ONLY_EFFECTS.contains(s)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         public Decision decide(Protocol.OpSpec op, SessionState session, ActivationState activation,
                                Bridge.Clock clock) {
+            if (session == null) {
+                return Decision.deny("refused: the session state is unavailable, so ownership cannot be "
+                        + "established; refusing instead of assuming it is allowed");
+            }
             if (session.handshakeInProgress()) {
                 return Decision.noop("handshake in progress");
             }
@@ -399,10 +601,9 @@ public final class Guard {
             if (session.paused()) {
                 return Decision.noop("client paused");
             }
-            // Tier 1: read-only ops are never gated by the injection policy.
-            if (op != null && op.sideEffects() != null
-                    && !op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
-                return Decision.allow("read-only op (no PLAYER_INPUT side effect)");
+            // Tier 1: ops that change nothing are never gated by the injection policy.
+            if (!mutatesThePlayer(op)) {
+                return Decision.allow("read-only op (no player-mutating side effect)");
             }
             if (variant == BuildVariant.UNGUARDED) {
                 return Decision.allow("unguarded build: policy bypassed (self-compiled variant)");
@@ -529,8 +730,10 @@ public final class Guard {
         public Decision submit(InputCommand command, Protocol.OpSpec op, SessionState session,
                                ActivationState activation, Bridge.Clock clock) {
             attempts++;
-            // This writer only ever carries input. A read-only op is allowed by the policy but has
-            // nothing to write, so it must not reach the client.
+            // This writer only ever carries input. An op that does not write player input is allowed
+            // by the policy but has nothing to inject, so it must not reach the client. "Read-only"
+            // is decided by the mutating vocabulary, not by "is it input" — an inventory op is a
+            // write, but it is not this writer's write.
             if (op != null && op.sideEffects() != null
                     && !op.sideEffects().contains(Protocol.SideEffect.PLAYER_INPUT)) {
                 noops++;

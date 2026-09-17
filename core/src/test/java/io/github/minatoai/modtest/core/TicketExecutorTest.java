@@ -29,6 +29,28 @@ class TicketExecutorTest {
         return new Executor.ExecContext(config, session, Guard.ActivationState.off(), clock, flags, client);
     }
 
+    /**
+     * The same context with a wired, armed write-op guard.
+     *
+     * <p>Every write op now passes the guard, so a test that wants to exercise the op itself (rather
+     * than the fail-closed path of an unwired context) must supply one. The unwired {@link #ctx} above
+     * stays as it is, because {@code aWriteOpWithoutAWiredGuardIsRefusedRatherThanRunUnaudited} asserts
+     * exactly that refusal.
+     */
+    private Executor.ExecContext guardedCtx(FakeClient client, boolean allowMutate, Guard.SessionState session,
+                                            Bridge.Clock clock, Map<String, Boolean> flags) {
+        Bridge.BridgeConfig config = new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test", "0.1.0",
+                allowMutate, Bridge.BusyPolicy.ANSWER_BUSY, 64, Guard.HostWhitelist.of("127.0.0.1"));
+        Guard.ActivationState armed = new Guard.ActivationState(true,
+                new Guard.ActivationToken("tok", System.currentTimeMillis() + 60_000L));
+        return new Executor.ExecContext(config, session, armed, clock, flags, client,
+                new Guard.MutationGuard(
+                        new Guard.InputInjectionPolicy(Guard.HostWhitelist.of("127.0.0.1"),
+                                Guard.BuildVariant.GUARDED, "exec-test", () -> "minecraft:overworld"),
+                        session, armed, clock, Guard.AuditSink.to(line -> {
+                })));
+    }
+
     private Bridge.BridgeConfig config(boolean allowMutate) {
         return new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test", "0.1.0", allowMutate,
                 Bridge.BusyPolicy.ANSWER_BUSY, 64);
@@ -44,7 +66,9 @@ class TicketExecutorTest {
 
         assertEquals(List.of("first", "second"), r.ops().stream().map(Protocol.Receipt.OpResult::id).toList());
         assertTrue(r.ok());
-        assertEquals(144.5, r.ops().get(1).result().get("fps_median").getAsDouble(), 1e-9);
+        assertEquals(144.5, r.ops().get(1).result().get("fpsMedian").getAsDouble(), 1e-9);
+        assertTrue(r.ops().get(1).result().has("sampleCount"),
+                "a frame-time number without its window is not interpretable: " + r.ops().get(1).result());
     }
 
     @Test
@@ -55,7 +79,7 @@ class TicketExecutorTest {
                 + "\"params\":{\"x\":1,\"y\":64,\"z\":1,\"block\":\"minecraft:stone\"},\"on_error\":\"abort\"},"
                 + "{\"id\":\"b\",\"op\":\"bench.read\"}");
         Protocol.Receipt r = new Executor.TicketExecutor(config(true), catalog)
-                .execute(t, Executor.quietLog(), ctx(client, true, Guard.SessionState.singleplayer(),
+                .execute(t, Executor.quietLog(), guardedCtx(client, true, Guard.SessionState.singleplayer(),
                         Bridge.Clock.system(), Map.of("allow-mutate", true)));
 
         assertFalse(r.ok());
@@ -115,8 +139,16 @@ class TicketExecutorTest {
                 + "\"block\":\"minecraft:stone\"}}");
         Bridge.BridgeConfig cfg = new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test", "0.1.0", true,
                 Bridge.BusyPolicy.ANSWER_BUSY, 64, Guard.HostWhitelist.of("127.0.0.1"));
-        Executor.ExecContext ctx = new Executor.ExecContext(cfg, Guard.SessionState.remote("127.0.0.1:25575"),
-                Guard.ActivationState.off(), Bridge.Clock.system(), Map.of("allow-mutate", true), client);
+        Guard.SessionState session = Guard.SessionState.remote("127.0.0.1:25575");
+        Guard.ActivationState armed = new Guard.ActivationState(true,
+                new Guard.ActivationToken("tok", System.currentTimeMillis() + 60_000L));
+        Executor.ExecContext ctx = new Executor.ExecContext(cfg, session, armed,
+                Bridge.Clock.system(), Map.of("allow-mutate", true), client,
+                new Guard.MutationGuard(
+                        new Guard.InputInjectionPolicy(Guard.HostWhitelist.of("127.0.0.1"),
+                                Guard.BuildVariant.GUARDED, "exec-test", () -> "minecraft:overworld"),
+                        session, armed, Bridge.Clock.system(), Guard.AuditSink.to(line -> {
+                })));
         Protocol.Receipt r = new Executor.TicketExecutor(cfg, catalog).execute(t, Executor.quietLog(), ctx);
 
         assertTrue(r.ok(), "a declared dev-server host must be usable: " + r.ops());
@@ -157,12 +189,38 @@ class TicketExecutorTest {
         FakeClient client = new FakeClient();
         client.useThrows = true;
         Protocol.Ticket t = ticket("{\"op\":\"use.item\"}");
+        // use.item now passes through the write-op guard, so the context needs one: with the guard
+        // present, the failure under test is the adapter's runtime exception, not a refusal.
+        Bridge.BridgeConfig cfg = config(true);
+        List<String> audit = new java.util.ArrayList<>();
+        Executor.ExecContext ctx = new Executor.ExecContext(cfg, Guard.SessionState.singleplayer(),
+                Guard.ActivationState.off(), Bridge.Clock.system(), Map.of("allow-mutate", true), client,
+                new Guard.MutationGuard(
+                        new Guard.InputInjectionPolicy(Guard.HostWhitelist.of("127.0.0.1"),
+                                Guard.BuildVariant.GUARDED, "exec-test", () -> "minecraft:overworld"),
+                        Guard.SessionState.singleplayer(),
+                        new Guard.ActivationState(true,
+                                new Guard.ActivationToken("t", System.currentTimeMillis() + 60_000L)),
+                        Bridge.Clock.system(), Guard.AuditSink.to(audit::add)));
+        Protocol.Receipt r = new Executor.TicketExecutor(cfg, catalog)
+                .execute(t, Executor.quietLog(), ctx);
+
+        assertEquals("E_EXEC", r.ops().get(0).error().code());
+        assertTrue(r.ops().get(0).error().message().contains("IllegalStateException"));
+        assertEquals(1, audit.size(), "the guard allowed the write, so it is audited before it throws");
+    }
+
+    @Test
+    void aWriteOpWithoutAWiredGuardIsRefusedRatherThanRunUnaudited() {
+        FakeClient client = new FakeClient();
+        Protocol.Ticket t = ticket("{\"op\":\"use.item\"}");
         Protocol.Receipt r = new Executor.TicketExecutor(config(true), catalog)
                 .execute(t, Executor.quietLog(), ctx(client, true, Guard.SessionState.singleplayer(),
                         Bridge.Clock.system(), Map.of("allow-mutate", true)));
 
-        assertEquals("E_EXEC", r.ops().get(0).error().code());
-        assertTrue(r.ops().get(0).error().message().contains("IllegalStateException"));
+        assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
+        assertTrue(r.ops().get(0).error().message().contains("not wired"), r.ops().get(0).error().message());
+        assertEquals(0, client.useCalls, "an unaudited write must not happen at all");
     }
 
     @Test

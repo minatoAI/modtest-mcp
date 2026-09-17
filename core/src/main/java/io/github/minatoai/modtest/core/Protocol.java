@@ -38,13 +38,37 @@ public final class Protocol {
             return this != NONE && this != TELEMETRY_RECORDING;
         }
 
+        /**
+         * Parses either spelling of the vocabulary: the canonical wire form (the enum name, e.g.
+         * {@code TELEMETRY_RECORDING}) or the dotted lowercase documentation form
+         * (e.g. {@code telemetry.recording}). Separators are ignored and the match is
+         * case-insensitive, so {@code telemetry_recording} and {@code Telemetry.Recording} work too.
+         *
+         * <p>Before this, only the enum name was accepted: the values {@code PROTOCOL.md §6.4} told
+         * implementers to send could not be parsed by the protocol's own parser, so a value copied out
+         * of the specification was rejected with {@code E_BAD_PARAMS}. Accepting both spellings removes
+         * the trap; {@link #wireName()} is what {@link OpSpec#toJson()} emits.
+         */
         public static SideEffect parse(String raw) {
-            for (SideEffect s : values()) {
-                if (s.name().equalsIgnoreCase(raw)) {
-                    return s;
+            if (raw != null) {
+                String normalized = raw.trim().replace("_", "").replace(".", "");
+                for (SideEffect s : values()) {
+                    if (s.name().replace("_", "").equalsIgnoreCase(normalized)) {
+                        return s;
+                    }
                 }
             }
             throw new ProtocolException(ErrorCode.E_BAD_PARAMS, "unknown sideEffect: " + raw);
+        }
+
+        /** The canonical wire form an executor emits: the enum name (e.g. {@code TELEMETRY_RECORDING}). */
+        public String wireName() {
+            return name();
+        }
+
+        /** The dotted lowercase form this specification documents (e.g. {@code telemetry.recording}). */
+        public String docName() {
+            return name().toLowerCase(java.util.Locale.ROOT).replace('_', '.');
         }
     }
 

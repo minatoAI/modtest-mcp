@@ -147,7 +147,7 @@ fields are how test rigs drift.
 | `E_UNKNOWN_OP` | op not in the executor's catalog |
 | `E_BAD_PARAMS` | `params` failed `paramsSchema` (or op-level unknown key) |
 | `E_PRECONDITION` | a declared precondition is not satisfied (incl. remote-server refusal) |
-| `E_TIMEOUT` | per-op or per-ticket budget exceeded |
+| `E_TIMEOUT` | per-op or per-ticket budget exceeded — also the code for "a frame / a sampling window was waited for and did not arrive" (§6.2c). A timeout is a failure and is never reported `ok:true`. |
 | `E_BUSY` | executor is already processing another ticket |
 | `E_EXEC` | the op ran and failed (world/state/vanilla error) |
 | `E_ASSERT` | an `expect` assertion failed |
@@ -389,6 +389,156 @@ authoritative too**: client-side `moveTo` values are overwritten by the next aut
 types is client-side **rotation**; position may land in `skipped` in either case, and the receipt
 must say so.
 
+### 6.2c Implemented op set: `inv.click`, `inv.toss`, `use.item`, `shot.capture`, `bench.read`
+
+These five were declared in the catalog but answered `E_UNSUPPORTED` in the reference client. As of
+`vanilla-client` 1.0 they are **implemented**, and this section is normative for all of them. Three
+conventions apply to every op below:
+
+* **Requested ≠ observed.** A field that restates what the ticket asked for and a field that carries
+  what the client measured are **different fields**, always (`requestedCount` vs `observedDelta`,
+  `before` vs `after`, `sampleFrames` vs `sampleCount`). No receipt may present a request as a
+  result. `ok:true` continues to mean "this op executed" (§6.2a) and never "the request took effect".
+* **Three states.** Ops that can partially apply report `applied` / `notClientVerifiable` / `skipped`
+  exactly as §6.2b defines them, and each receipt carries a machine-readable top-level `verdict`.
+  A server-owned effect the client cannot witness is **`notClientVerifiable`**, never `skipped`
+  (that would report a working feature as broken) and never `applied` (that would claim it).
+  A guard **no-op** (paused / handshake / not in a world) is reported as `verdict:"skipped"` with
+  `skipped.dispatch.reason` naming the policy reason: the op executed and is `ok:true`, but **nothing
+  reached the client and no audit line was written**, because no write happened. Every write op
+  (`inv.select`, `inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place`, `input.set`) follows
+  this rule — a no-op that still writes would be a write nobody authorised and nobody logged.
+* **`E_TIMEOUT` is the code for "the client never got there in time"** — a frame that did not arrive,
+  a sampling window that did not complete. A timeout is a **failure**: `ok:false`, `error.code:
+  "E_TIMEOUT"`, message naming what was waited for. A timeout **MUST NOT** be answered `ok:true`, and
+  **MUST NOT** be answered with an empty/blank result standing in for a real one.
+
+**World interaction is out of scope.** Using or placing blocks against the world (`useItemOn`, block
+placement/interaction through this path) is **not** part of this batch: those ops keep answering
+`E_UNSUPPORTED`. `use.item` covers only the hand-held *use* action.
+
+#### `inv.click` — click a slot in the open container
+
+| | |
+|---|---|
+| Params | `slot` (integer, **required**, player-inventory index; armor is 36..39, offhand 40) · `button` (integer, default `0`) · `mode` (string, default `"pickup"`; one of `pickup`, `quick_move`, `swap`, `clone`, `throw`, `quick_craft`, `pickup_all`) |
+| Side effects | `player.inventory` |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+Result: `windowId`, `slot`, `button`, `mode`, `before:{id,count}`, `after:{id,count}`,
+`cursorBefore`, `cursorAfter` (each `{id,count,observed}`; `observed:false` means this client does
+not expose the carried stack — the core reports that it did not observe it rather than guessing),
+the three verdict objects and `note`.
+
+* `verdict:"applied"` — the client's own menu shows the expected change.
+* `verdict:"notClientVerifiable"` — the session has a server authority. The click was dispatched;
+  whether it changed anything is not observable from the client.
+* `verdict:"skipped"` — the client's menu shows no change, with `reason`.
+
+Errors: `E_BAD_PARAMS` (missing/non-numeric `slot`, `slot` outside the window, `mode` outside the
+list), `E_PRECONDITION` (no container open for a container slot, or an armor slot — armor slots are
+refused **unconditionally**, whatever `mode` or item is involved), `E_TIMEOUT` (the per-op budget),
+`E_PRECONDITION` (guard refusal), `E_UNSUPPORTED` (this adapter does not implement the click).
+
+#### `inv.toss` — drop items from a slot
+
+| | |
+|---|---|
+| Params | `slot` (integer, **required**) · `count` (integer, default `1`, range `1..64`) |
+| Side effects | `player.inventory` |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+Result: `requestedCount`, `observedDelta` (how many items the client actually saw leave the slot),
+`before`, `after`, `partial`, three verdict objects, `note`.
+
+* `observedDelta == requestedCount` ⇒ `applied`; `0 < observedDelta < requestedCount` ⇒ `applied`
+  with `partial:true` (**a partial toss is normal, not an error**); `observedDelta == 0` ⇒ `skipped`
+  with `reason`. For a server session the verdict is `notClientVerifiable` instead.
+* Server-side behaviour uses the vanilla drop path (the same request as pressing the drop key),
+  **not** a local `player.drop(...)`, so the client and the authority cannot drift apart.
+
+Errors: `E_BAD_PARAMS` (`slot` missing/out of range, `count` outside `1..64`), `E_PRECONDITION`
+(empty slot, guard refusal), `E_TIMEOUT`, `E_UNSUPPORTED`.
+
+#### `use.item` — use the hand-held item
+
+| | |
+|---|---|
+| Params | `hand` (string, default `"main"`; `main` or `off`) |
+| Side effects | `player.state`, `player.inventory` (a use changes the "using" state and may consume the item) |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+Result: `dispatched`, `hand`, `heldBefore`, `heldAfter`, `usingBefore`, `usingAfter`,
+`cooldownTicks`, three verdict objects, `note`.
+
+**This receipt claims that the action was dispatched, and nothing more.** `applied.dispatch` says
+the use was handed to the client; the **effect** of the item is decided by the authority and is
+reported under `notClientVerifiable.effect`. The `note` says so in words. If the guard reports a
+no-op (paused / handshake / not in a world) the op executed, `dispatched:false`,
+`verdict:"notDispatched"`, and nothing reaches the client. The item's *world* interaction
+(`useItemOn`) is **not** part of this op — see the scope note above.
+
+Errors: `E_BAD_PARAMS` (`hand` outside `main|off`), `E_PRECONDITION` (already using an item, empty
+hand, the held item is on cooldown — the message carries `cooldownTicks=<n>`, and only a **positive**
+value the client actually reports refuses, so an adapter that does not expose cooldowns is never
+blocked by a check it cannot answer —, guard refusal), `E_TIMEOUT`, `E_UNSUPPORTED`.
+
+#### `shot.capture` — capture one rendered frame and report its bytes
+
+| | |
+|---|---|
+| Params | `name` (string, optional; the default is `shot-<opId>-<clockMs>-<sequence>`, so two captures — even two in the same millisecond — cannot collide) |
+| Side effects | `telemetry.recording` (tier 1 — **never gated by the injection policy**) |
+| Preconditions | none |
+
+Result: `bytes` (length), `format`, `width`, `height`, `sha256`, `tick`, `path`, and the fixed
+sentence
+
+> `bytes were captured; image content is NOT interpreted`
+
+**The receipt contains byte facts only.** It **MUST NOT** contain any judgement about the picture —
+no "the scene looks right", no "the HUD is visible", no pass/fail on appearance. A consumer that
+needs that has to look at the image itself; the op's contract ends at "these bytes exist, and here
+is their digest".
+
+Errors: `E_BAD_PARAMS` (`name` present but not a string), `E_PRECONDITION` (no frame is available:
+minimised, paused, or not in a world), **`E_TIMEOUT`** (a frame was waited for and none was delivered
+within the budget — *"waited for a rendered frame"*), `E_UNSUPPORTED` (this adapter does not
+implement frame capture). **A timeout MUST NOT be reported as `ok:true` with an empty image.**
+
+#### `bench.read` — sample this client's frame durations
+
+| | |
+|---|---|
+| Params | `warmup_frames` (integer, default `60`) · `sample_frames` (integer, default `300`, range `1..600`) |
+| Side effects | `telemetry.recording` (tier 1) |
+| Preconditions | none |
+
+Bounds: `sample_frames ≤ 600`, `warmup_frames + sample_frames ≤ 900` (a bounded number of frames —
+roughly 15 s — so one op cannot occupy the client indefinitely). Violations are `E_BAD_PARAMS`.
+
+Result — **all of these are required for the numbers to be interpretable**:
+`warmupFrames`, `sampleFrames` (requested), `sampleCount` (actually measured, also emitted as
+`actualSampleCount`), `overranWindow` (true when the adapter measured **more** frames than the
+requested window), `windowMs`, `fpsMedian`, `frameMsP95`, `onePercentLow`, `units:{fps,ms}`,
+`samplesPath` (a per-frame CSV under the bridge directory, so the numbers can be re-checked), `note`.
+An adapter that measured **more** than the requested window is reported as measured — the requested and
+the measured counts stay separate and `overranWindow` names the anomaly in a `note` clause — rather than
+silently clamped or folded into a generic failure code.
+
+Stated limits (the `note` carries them; they are part of the contract):
+
+* these are **client-side frame durations only** — median fps, p95 frame time, 1 % low;
+* **no GPU/vendor counters** are read (no GPU time, no driver statistics);
+* the numbers are **not directly comparable across machines or scenes**, and a shorter window than
+  requested is reported as such rather than silently presented as the full sample.
+
+Errors: `E_BAD_PARAMS` (out-of-range/bounded parameters), `E_PRECONDITION` (no frames were sampled
+at all: minimised, paused, or not in a world — and `sampleCount == 0` may never be reported as a
+successful measurement), **`E_TIMEOUT`** (sampling did not complete within the budget),
+`E_UNSUPPORTED`. **Numbers are never invented**: if the client did not measure it, the receipt does
+not contain it.
+
 ### 6.3 Preconditions
 
 | Kind | Payload | Satisfied when |
@@ -402,19 +552,35 @@ must say so.
 
 ### 6.4 Side effects (the safety vocabulary)
 
-| Value | Meaning | Mutating? |
-|---|---|---|
-| `none` | pure read | no |
-| `telemetry.recording` | writes recording files under the bridge dir | no (does not touch the game) |
-| `player.input` | writes player input (movement/keys) | **yes** |
-| `player.inventory` | moves items | **yes** |
-| `player.state` | pose/health/gamemode/etc. | **yes** |
-| `world.blocks` | places/breaks blocks | **yes** |
-| `world.entities` | spawns/removes/kills entities | **yes** |
-| `server.command` | runs a server command | **yes** |
-| `render.pipeline` | changes renderer/shader state | implementation-defined |
+Every value has two spellings, and **both are accepted on input**:
 
-An executor MUST treat any value other than `none` / `telemetry.recording` as **mutating**.
+* the **canonical wire form** is the enum name in UPPERCASE. **This is what an executor emits** in the
+  published catalog and what a ticket should carry;
+* the **documented form** is dotted lowercase, used in the prose and tables of this document for
+  readability.
+
+`SideEffect.parse` accepts either spelling, case-insensitively and ignoring `.` / `_`, so a value copied
+out of this document round-trips instead of being rejected as a bad parameter.
+
+| Canonical wire form | Documented form | Meaning | Mutating? |
+|---|---|---|---|
+| `NONE` | `none` | pure read | no |
+| `TELEMETRY_RECORDING` | `telemetry.recording` | writes recording files under the bridge dir | no (does not touch the game) |
+| `PLAYER_INPUT` | `player.input` | writes player input (movement/keys) | **yes** |
+| `PLAYER_INVENTORY` | `player.inventory` | moves items | **yes** |
+| `PLAYER_STATE` | `player.state` | pose/health/gamemode/etc. | **yes** |
+| `WORLD_BLOCKS` | `world.blocks` | places/breaks blocks | **yes** |
+| `WORLD_ENTITIES` | `world.entities` | spawns/removes/kills entities | **yes** |
+| `SERVER_COMMAND` | `server.command` | runs a server command | **yes** |
+| `RENDER_PIPELINE` | `render.pipeline` | changes renderer/shader state | local-only, see below |
+
+An executor MUST treat any value other than `NONE` / `TELEMETRY_RECORDING` (documented `none` /
+`telemetry.recording`) as **mutating**.
+
+`RENDER_PIPELINE` is the documented nuance. It is not a read, so it still needs the executor's mutating
+opt-in, but it changes **local rendering only** — it cannot reach another machine's world — so the §7.2
+injection gate puts it on the tier-1 (never blocked) side. The tier-1 set is an explicit allow-list, and
+every value of the vocabulary is classified by it.
 
 ---
 
@@ -436,9 +602,17 @@ An executor MUST treat any value other than `none` / `telemetry.recording` as **
 The rule is **default deny, plus an explicit allow-list of hosts you own**. A compliant executor
 **MUST** implement three tiers, in this order:
 
-1. **Read-only ops are always allowed.** An op whose `sideEffects` are only `none` /
-   `telemetry.recording` is never blocked by this policy, on any host: reading is not the risk.
-2. **Writing player input is off by default.** It requires (a) the executor to have been started
+1. **Read-only ops are always allowed.** An op whose `sideEffects` contain only `NONE` /
+   `TELEMETRY_RECORDING` / `RENDER_PIPELINE` (documented `none` / `telemetry.recording` /
+   `render.pipeline`) is never blocked by this policy, on any host: reading is not the risk, and a
+   render-pipeline change is local to this client. That read-only set is an explicit **allow-list with
+   everything else denied** — a value not in it is a write, so a vocabulary value added later fails
+   **closed** (gated) instead of inheriting tier 1 by default.
+   "Read-only" is decided by the side-effect vocabulary, **not** by "is it player input": an op that
+   declares `player.inventory` / `player.state` / `world.blocks` / `world.entities` /
+   `server.command` is a write even when it touches no input axis (`inv.click`, `inv.toss`,
+   `use.item` are the reference cases) and **MUST** pass tiers 2 and 3 like any other write.
+2. **Writing to the player is off by default.** It requires (a) the executor to have been started
    with an explicit development opt-in and (b) an **activation token supplied out-of-band by the
    operator, with an expiry**. A ticket can never activate anything, and an expired token stops
    working immediately.
@@ -450,12 +624,28 @@ The rule is **default deny, plus an explicit allow-list of hosts you own**. A co
 
 **Loud audit.** Every tier-3 allowance **MUST** be recorded — who acted, which host, at what time,
 which token, which op — in a durable log. Never log the token *value*: record a fingerprint
-(e.g. the first bytes of its SHA-256) instead.
+(e.g. the first bytes of its SHA-256) instead. Every write op — `input.set`, `inv.select`,
+`inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place` — goes through this one gate, so an
+allowance always produces **exactly one** audit line and a **refusal produces no line at all** (a
+refusal is not an allowance, and recording it would bury the real ones). A no-op (paused / handshake /
+not in a world) writes nothing, so it is not an allowance either.
 
 Mutating ops in general (`sideEffects` beyond `none`/`telemetry.recording`) **MUST** additionally
 require the executor's explicit `allow-mutate` opt-in, and fail with `E_PRECONDITION` without it.
 Ops that may run on a declared host SHOULD declare the `permitted-session` precondition (§6.3);
 `singleplayer` remains the strictly-local variant.
+
+**Real-machine acceptance criteria — every write op, three paths.** The gate is verified by three
+receipts, never by reading the source. The guarded ops are `input.set`, `inv.select`, `inv.click`,
+`inv.toss`, `use.item`, `pose.set` and `world.place`:
+
+| Path | Receipt | Audit log | Client |
+|---|---|---|---|
+| **allowed** | `ok:true`, and the op's declared effect really happened (`state.query` before/after, or the op's own `applied` / `observedDelta` / `verdict`) | **exactly one** `ALLOWED-MUTATION` line: who, which host, when, which op, and the **8-character token fingerprint** | the write reaches the client **exactly once** |
+| **refused** | `ok:false`, `error.code:"E_PRECONDITION"`, message naming the policy reason | **no line at all** (a refusal is not an allowance) | **nothing** reaches the client |
+| **no-op** (paused / handshake / not in a world) | `ok:true` (`ok` means the op executed), `verdict:"skipped"`, `skipped.dispatch.reason` starting `guard no-op:` | **no line at all** | **nothing** reaches the client |
+
+Across all three paths the audit line **MUST NOT** contain the token *value* — only its fingerprint.
 
 **Rationale.** The question that matters is **"is this a server you own?"**, not **"is it
 remote?"**. A blanket remote refusal is at once too strict — it breaks the supported local
@@ -541,6 +731,12 @@ An implementation claiming `modtest-bridge/1.0` conformance MUST:
 - [ ] keep `receipt.ops` aligned (same order/length/ids) with `ticket.ops`
 - [ ] mark unrun ops `skipped`
 - [ ] enforce §7.2 (remote-server refusal + read-only default)
+- [ ] keep the write ops (`input.set`, `inv.click`, `inv.toss`, `use.item`) behind the one guard:
+      one audit line per allowance, none for a refusal, never the token value
+- [ ] answer `E_TIMEOUT` (never `ok:true`) when a frame or a sampling window does not arrive, and
+      never invent numbers for `bench.read` (§6.2c)
+- [ ] keep world interaction (`useItemOn`, block placement/interaction) answering `E_UNSUPPORTED`
+      until it is designed and declared — it is deliberately out of scope in this batch
 - [ ] include `protocol` in both directions and answer `E_PROTOCOL` on mismatch
 - [ ] (recommended) publish `catalog.json` and validate `params`/`result` against it
 

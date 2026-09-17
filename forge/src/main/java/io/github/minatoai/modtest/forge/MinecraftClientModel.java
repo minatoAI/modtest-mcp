@@ -4,7 +4,9 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.platform.NativeImage;
 import io.github.minatoai.modtest.core.BlockIds;
 import io.github.minatoai.modtest.core.ClientModel;
+import io.github.minatoai.modtest.core.InputHold;
 import io.github.minatoai.modtest.core.Protocol;
+import io.github.minatoai.modtest.core.StopRequest;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
@@ -59,14 +61,59 @@ public final class MinecraftClientModel implements ClientModel {
     private final Minecraft mc;
     /** Where {@code shot.capture} writes its PNG, or {@code null} to keep the bytes in memory only. */
     private final Path recordingDir;
+    /** The hold that owns the injected tick budget; {@code null} when built without one (then no stop). */
+    private final InputHold hold;
+    /**
+     * A safe-point stop waiting for the player to be safe.
+     *
+     * <p>Static on purpose: a model is built per ticket, while an armed stop has to survive until the
+     * client-tick loop applies it. See {@link StopRequest} for why the wait is driven by ticks instead of
+     * a blocking sleep in here (the relay runs on the client thread).
+     */
+    private static volatile StopRequest armedStop;
 
     public MinecraftClientModel(Minecraft mc) {
-        this(mc, null);
+        this(mc, null, null);
     }
 
     public MinecraftClientModel(Minecraft mc, Path recordingDir) {
+        this(mc, recordingDir, null);
+    }
+
+    public MinecraftClientModel(Minecraft mc, Path recordingDir, InputHold hold) {
         this.mc = mc;
         this.recordingDir = recordingDir;
+        this.hold = hold;
+    }
+
+    /** The safe-point stop the client-tick loop must apply, or {@code null} when none is armed. */
+    public static StopRequest armedStop() {
+        return armedStop;
+    }
+
+    /** Forgets an armed stop (applied, superseded, or the world went away). */
+    public static void clearArmedStop() {
+        armedStop = null;
+    }
+
+    /**
+     * Records that a newer input command took the player, so a waiting safe stop no longer applies: the
+     * tick loop must not cancel the new command on the old request's behalf.
+     */
+    public static void supersedeArmedStop() {
+        StopRequest req = armedStop;
+        if (req != null) {
+            req.supersede();
+        }
+    }
+
+    /** {@code true}/{@code false} when the player's footing is observable, {@code null} when it is not. */
+    private Boolean safeNow() {
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return null;
+        }
+        return p.onGround() && !p.isInWall();
     }
 
     private LocalPlayer player() {
@@ -388,11 +435,96 @@ public final class MinecraftClientModel implements ClientModel {
      */
     @Override
     public String blockIdAt(int x, int y, int z) {
-        var state = player().level().getBlockState(new BlockPos(x, y, z));
+        Level level = mc.level;
+        if (level == null || mc.player == null) {
+            return null;   // no world: nothing is observable, and that is not air
+        }
+        BlockPos pos = new BlockPos(x, y, z);
+        // A/§6.2f: an unloaded chunk or a y outside the build height reads back as air through the vanilla
+        // chunk API. Reporting that as "" (air) would be a fabricated fact, so it is "unknown" instead.
+        // `isLoaded(pos)` — the whole `hasChunkAt` family is deprecated in this mapping, and `isLoaded` is
+        // the supported way to ask "is the chunk at this position loaded client-side".
+        if (!level.isLoaded(pos) || level.isOutsideBuildHeight(pos)) {
+            return null;
+        }
+        BlockState state = level.getBlockState(pos);
         if (state.isAir()) {
             return "";
         }
         return net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(state.getBlock()).toString();
+    }
+
+    /**
+     * Whether a placement into this cell would be replaceable, or {@code null} when this client cannot say.
+     *
+     * <p>Same three-state discipline as {@link #blockIdAt}: not loaded / outside the build height is
+     * <b>unknown</b>, never {@code false} — an unread cell is not a fact about the world. This is what lets
+     * the "a non-air but replaceable cell is placeable like a player's" behaviour be checked with the
+     * harness's own ops instead of a KubeJS probe.
+     */
+    @Override
+    public Boolean blockReplaceableAt(int x, int y, int z) {
+        Level level = mc.level;
+        if (level == null || mc.player == null) {
+            return null;
+        }
+        BlockPos pos = new BlockPos(x, y, z);
+        if (!level.isLoaded(pos) || level.isOutsideBuildHeight(pos)) {
+            return null;
+        }
+        return level.getBlockState(pos).canBeReplaced();
+    }
+
+    /**
+     * Cheap movement bit: the player's own delta movement, i.e. the outcome of the last tick.
+     *
+     * <p>No block or entity query happens here (that is what makes it cheap). It answers "is the client
+     * displacing the player right now", not "was movement requested" — see the contract in
+     * {@link ClientModel#playerMoving()}.
+     */
+    @Override
+    public Boolean playerMoving() {
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) {
+            return null;
+        }
+        return p.getDeltaMovement().horizontalDistanceSqr() > 1.0e-6;
+    }
+
+    @Override
+    public StopResult stopInput(String mode, int maxTicks) {
+        if (hold == null) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_UNSUPPORTED,
+                    "this client model was built without the input hold, so it cannot stop injected input");
+        }
+        boolean immediate = "immediate".equals(mode);
+        // A previous safe stop that a newer command took over: report that instead of stopping the new one.
+        StopRequest waiting = armedStop;
+        if (waiting != null && waiting.superseded()) {
+            clearArmedStop();
+            return new StopResult(hold.remaining() > 0, false, null, waiting.ticksUsed(), true, false);
+        }
+        boolean wasActive = hold.remaining() > 0;
+        String ownerBefore = hold.ticketId();
+        Boolean safe = safeNow();
+        if (immediate || Boolean.TRUE.equals(safe)) {
+            hold.stop("input.stop:" + (immediate ? "immediate" : "safe"));
+            return new StopResult(wasActive, true, safe, 0, false, false);
+        }
+        if (Boolean.FALSE.equals(safe)) {
+            // Not safe yet: arm it and let the client-tick loop cancel at the first safe point (bounded).
+            // Nothing is claimed as stopped here — the receipt must not report a stop that has not happened.
+            StopRequest request = new StopRequest(StopRequest.Tier.SAFE, maxTicks, "input.stop:safe");
+            boolean raced = hold.ticketId() != null && !hold.ticketId().equals(ownerBefore);
+            if (raced) {
+                return new StopResult(wasActive, false, safe, 0, true, false);
+            }
+            armedStop = request;
+            return new StopResult(wasActive, false, safe, 0, false, true);
+        }
+        // The client cannot judge the footing (null): do not guess a safe point, stop now and say so.
+        hold.stop("input.stop:safe-unknown-footing");
+        return new StopResult(wasActive, true, null, 0, false, false);
     }
 
     /**

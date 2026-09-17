@@ -14,9 +14,12 @@
         "properties": {
           "what": {
             "type": "array",
-            "items": { "enum": ["pose", "health", "armor", "held", "offhand", "light", "all"] },
+            "items": { "enum": ["pose", "health", "armor", "held", "offhand", "light", "block", "moving", "all"] },
             "minItems": 1
-          }
+          },
+          "x": { "type": "integer" },
+          "y": { "type": "integer" },
+          "z": { "type": "integer" }
         },
         "required": ["what"],
         "additionalProperties": false
@@ -25,7 +28,13 @@
         "type": "object",
         "properties": {
           "pose": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "z": { "type": "number" }, "yaw": { "type": "number" }, "pitch": { "type": "number" } } },
-          "light": { "type": "object", "additionalProperties": true }
+          "light": { "type": "object", "additionalProperties": true },
+          "blockKnown": { "type": "boolean" },
+          "block": { "type": ["string", "null"] },
+          "blockIsAir": { "type": ["boolean", "null"] },
+          "blockReplaceable": { "type": ["boolean", "null"] },
+          "movingKnown": { "type": "boolean" },
+          "moving": { "type": ["boolean", "null"] }
         },
         "additionalProperties": true
       },

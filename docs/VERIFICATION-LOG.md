@@ -323,6 +323,57 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 
 ---
 
+## R23 · 2026-09-18 — task-78 (A block query / B version lines / C two-tier stop): built, all red-proofs measured
+
+- **Goal:** (A) expose a block reading with explicit **unknown** semantics plus a cheap `isMoving`;
+  (B) align every version line on `1.0.0-alpha.4` / `1.0.0a4`; (C) two-tier cancellation with
+  non-failure termination codes, and a stop that **really stops** (the P7 lesson).
+- **Core, measured:** `:core:cleanTest :core:build --rerun-tasks` (JDK 17) ⇒ **212 tests, 0 failures,
+  0 errors, 0 skipped** (was 191; `CancelAndBlockQueryTest` adds 21). The four guardrails are green:
+  `verifySelfContainedJar` (**77 :core classes, top-level 77, nested 0**), `verifyMixinRefmap`
+  (member ref still resolves to SRG `m_214106_`; final artifact carries `modtest.refmap.json` +
+  `modtest.harness.mixins.json`), `verifyGsonApiSurface` (77 classes), and
+  `noDeclarativeKubeJsDependencyExistsInTheBuild`.
+- **"Old code goes red" — six negative tests, each temporarily reverted, then restored byte-exactly
+  (sha256 verified after every case):** ① unknown-≠-air in `state.query` (fabricating air for an unread
+  cell) ⇒ red; ② the Forge `isLoaded`/build-height guard removed ⇒ red; ③ `InputHold.stop` no longer
+  cancels ⇒ red (that is the P7 renewal defect); ④ an unknown footing treated as safe ⇒ red;
+  ⑤ `pyproject.toml` put back to `1.0.0a3` ⇒ version test red; ⑥ `E_NO_PATH` mentioned in a non-Protocol
+  source file ⇒ reserved-pin test red. N1's red was inspected in full: it is an
+  **`AssertionFailedError`** (`"block":"minecraft:air"` for an unread cell), not a compile failure.
+- **Two real defects the new tests caught in this batch's own code** (fixed before the final run):
+  (1) `input.stop` originally dispatched **without going through the single guard point**, i.e. an
+  unaudited write — caught by `anImmediateStopCancelsAndIsReportedAsApplied` (0 audit lines, expected 1),
+  now routed through `MutationGuard.requireAllowed` like every other write op; (2) `LevelReader.hasChunkAt`
+  is deprecated in this mapping, so the guard uses the supported `Level.isLoaded(pos)` (build output now
+  warning-free for these sites).
+- **Artifact identities (local, not published — this build), measured after `:forge:build -PwithForge`
+  and `-PwithForge -Punguarded`:**
+  - guarded `modtest-harness-forge-1.0.0-alpha.4.jar` — **170,625 B, 94 entries, 362,557 B uncompressed,
+    sha256 `c288bcf18d0703835688295d77f4b6ae43108b26502dc7caa07ac9fc777af915`**, manifest
+    `Modtest-Guard-Variant: guarded` (316 B), `m_*=71 / f_*=20` SRG refs, `mods.toml` version
+    `1.0.0-alpha.4`;
+  - unguarded `…-1.0.0-alpha.4-unguarded.jar` — **170,672 B, 94 entries, sha256
+    `5dddc70871045768a3070b7536365e2f7793d191a42763903544ff9830ca6224`**, manifest 369 B;
+  - guarded→unguarded gap **47 B, entirely `META-INF/MANIFEST.MF`** (316 vs 369 B) — the established
+    fingerprint that the jar is in its final state holds;
+  - **entry delta vs R22's state: 90 → 94, four added, none removed** — `StopRequest.class`,
+    `StopRequest$Tier.class`, `ClientModel$StopResult.class`, `VanillaOps$StopOps.class`;
+  - **reobf identity:** `build/libs/…-unguarded.jar` sha256 **equals** `build/reobfJar/output.jar` sha256
+    (`5dddc708…`) byte-for-byte, so `build/libs` really holds the reobfuscated write;
+  - **the file names changed with the version line** (`…-1.0.0-alpha.1.jar` → `…-1.0.0-alpha.4.jar`), and
+    two **stale alpha.1 jars were sitting in `build/libs` next to them** (build outputs accumulate) — they
+    were removed so no tester can pick up the old file by name.
+- **`verifyProductJar` (root task, a gate on *product* jars):** on the clean product reference ⇒
+  `PRODUCT-JAR-CLEAN`, exit 0; on our harness jar ⇒ `PRODUCT-JAR-CONTAINS-HARNESS`, exit 1 — the gate
+  refusing a harness jar as a product is its designed behaviour, not a regression.
+- **Not verified here:** nothing of A/B/C has been exercised on a real client. `blockReplaceableAt`'s
+  three-state honesty on an unloaded chunk, `isMoving` against real motion, the two stop tiers'
+  observable difference and the absence of per-tick renewal on a live client, and criterion ③ via our own
+  op are all **pending qa-tester's real-machine round** (the release waits on it).
+
+---
+
 ## Corrections we made to our own earlier claims
 
 This section exists because the log is only trustworthy if it records the moments we changed our
@@ -399,6 +450,24 @@ minds.
    measurement that **discriminates** good from bad (here: SRG references, 0 versus 40/10), not a
    plausible-looking proxy. This is the same family as the "measuring a different path than the one that
    runs in production" mistakes earlier in this log.
+11. **A pre-existing read folded "unknown" into a known value: `blockIdAt` reported an unloaded chunk as
+   `air`** (found in task-78 while borrowing mineflayer's `blockAt`, whose design is to return `null` for a
+   block it cannot see). The P10 read-back implementation read
+   `player().level().getBlockState(pos)` and answered `""` (air) whenever `isAir()` was true — but vanilla's
+   chunk API **answers air for an unloaded chunk**, and `getBlockState` outside the world's build height is
+   air as well. So "this client cannot see that cell" was silently reported as the **fact** "that cell is
+   air": the same false-negative family as P9/P12 and the removed `cellOccupied` placement gate
+   ("cannot determine" collapsed into a confident answer), except this one had shipped since P10 and would
+   have produced a fabricated `state.query` answer the moment the channel was exposed.
+   **Fix (`MinecraftClientModel`, and a three-state contract in `ClientModel`):** guard the read with
+   `level.hasChunkAt(pos)` and `level.isOutsideBuildHeight(pos)`, and answer `null` (cannot witness) instead
+   of `""`; expose the reading as explicit states — `blockKnown` / `block` / `blockIsAir` /
+   `blockReplaceable`, with JSON `null` for the last three when the cell cannot be read, and `"minecraft:air"`
+   spelled out when it *is* known to be air — plus a companion `blockReplaceableAt` (`canBeReplaced()`)
+   behind the same guard. A query with no coordinates fails loudly (`E_BAD_PARAMS`) rather than answering
+   about another cell. **Lesson: guard at the observation boundary whenever vanilla defaults to a benign
+   value; "I cannot see it" needs its own representable state, and it must be impossible to read it as the
+   benign value.**
 
 ---
 

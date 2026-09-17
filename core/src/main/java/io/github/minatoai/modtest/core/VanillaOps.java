@@ -33,7 +33,7 @@ public final class VanillaOps {
      * {@code E_UNSUPPORTED} stubs.
      */
     public static final java.util.Set<String> WIRED_IN_CORE =
-            java.util.Set.of("inv.click", "inv.toss", "use.item", "shot.capture", "bench.read");
+            java.util.Set.of("inv.click", "inv.toss", "use.item", "shot.capture", "bench.read", "input.stop");
 
     /**
      * Whether this client's container view may still be stale, i.e. whether a read of it can be turned into
@@ -209,6 +209,77 @@ public final class VanillaOps {
         return d;
     }
 
+    /** Default and maximum bound for a {@code safe} stop, in client ticks. */
+    static final int DEFAULT_STOP_TICKS = 20;
+    static final int MAX_STOP_TICKS = 100;
+
+    /** Writes a nullable string: JSON {@code null} means "unknown", never {@code ""} (which is air). */
+    private static void putNullable(JsonObject o, String key, String value) {
+        if (value == null) {
+            o.add(key, null);
+        } else {
+            o.addProperty(key, value);
+        }
+    }
+
+    /** Writes a nullable boolean: JSON {@code null} means "unknown", never {@code false} (a fact). */
+    private static void putNullable(JsonObject o, String key, Boolean value) {
+        if (value == null) {
+            o.add(key, null);
+        } else {
+            o.addProperty(key, value);
+        }
+    }
+
+    /** {@code state.query} params: {@code what} is required, {@code x}/{@code y}/{@code z} are optional. */
+    private static JsonObject stateQuerySchema() {
+        JsonObject what = Json.object();
+        what.addProperty("type", "array");
+        what.add("items", Json.object());
+        JsonObject properties = Json.object();
+        properties.add("what", what);
+        for (String axis : List.of("x", "y", "z")) {
+            JsonObject p = Json.object();
+            p.addProperty("type", "integer");
+            properties.add(axis, p);
+        }
+        JsonObject s = Json.object();
+        s.addProperty("type", "object");
+        s.add("properties", properties);
+        JsonArray required = Json.array();
+        required.add("what");
+        s.add("required", required);
+        s.addProperty("additionalProperties", false);
+        return s;
+    }
+
+    /** {@code input.stop} params: the tier is required, so no caller stops by accident. */
+    private static JsonObject stopParamsSchema() {
+        JsonObject mode = Json.object();
+        mode.addProperty("type", "string");
+        JsonArray allowed = Json.array();
+        for (String m : List.of("safe", "immediate")) {
+            allowed.add(m);
+        }
+        mode.add("enum", allowed);
+        JsonObject ticks = Json.object();
+        ticks.addProperty("type", "integer");
+        JsonObject reason = Json.object();
+        reason.addProperty("type", "string");
+        JsonObject properties = Json.object();
+        properties.add("mode", mode);
+        properties.add("ticks", ticks);
+        properties.add("reason", reason);
+        JsonObject s = Json.object();
+        s.addProperty("type", "object");
+        s.add("properties", properties);
+        JsonArray required = Json.array();
+        required.add("mode");
+        s.add("required", required);
+        s.addProperty("additionalProperties", false);
+        return s;
+    }
+
     /** A closed object schema whose listed keys are all required (the pre-task-70 shape). */
     private static JsonObject schema(String... keys) {
         JsonObject props = Json.object();
@@ -369,9 +440,21 @@ public final class VanillaOps {
 
     /** Registers the vanilla op set. */
     public static Executor.OpCatalog install(Executor.OpCatalog catalog) {
-        add(catalog, spec("state.query", "Read player/world state", schema("what"), null,
+        // A/B: `what` is required, `x`/`y`/`z` are optional because only the `block` item needs them.
+        add(catalog, spec("state.query", "Read player/world state", stateQuerySchema(), null,
                         List.of(), List.of(Protocol.SideEffect.NONE)),
                 new StateOps());
+        // C: the two-tier cancellation of injected movement. `mode` is required on purpose: there is no
+        // default stop, because "immediate" and "safe" are different promises to the caller.
+        add(catalog, spec("input.stop", "Stop injected movement (safe point or immediately)",
+                        stopParamsSchema(),
+                        resultSchema(objectOf(
+                                prop("mode", "string"), prop("stopRequested", "boolean"),
+                                prop("stopped", "boolean"), prop("atSafePoint", "boolean"),
+                                prop("ticksUsed", "integer"), prop("note", "string")), "mode", "stopped"),
+                        List.of(Protocol.Precondition.of("permitted-session"),
+                                Protocol.Precondition.of("flag", "name", "allow-mutate")),
+                        List.of(Protocol.SideEffect.PLAYER_INPUT)), new StopOps());
         add(catalog, spec("pose.set", "Teleport/rotate with settle", schema("x", "y", "z", "yaw", "pitch"), null,
                         List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
                         List.of(Protocol.SideEffect.PLAYER_STATE)), new PoseOps());
@@ -487,6 +570,144 @@ public final class VanillaOps {
                 // An inventory read is an observation with a sync window (P9): say so, so a caller can
                 // tell "the slot really is empty" from "the menu had not caught up yet" and re-read.
                 out.addProperty("containerSyncPending", c.containerSyncPending());
+            }
+            // ---- A: the block reading, in three unmistakable states --------------------------------
+            // Not part of `all`: it needs coordinates, and a query without them must fail loudly
+            // (`E_BAD_PARAMS`) rather than silently answer about some other cell.
+            if (want.contains("block")) {
+                JsonObject p = op.params() == null ? Json.object() : op.params();
+                int bx = requireInt(p, "x", "state.query");
+                int by = requireInt(p, "y", "state.query");
+                int bz = requireInt(p, "z", "state.query");
+                String id = c.blockIdAt(bx, by, bz);
+                Boolean replaceable = c.blockReplaceableAt(bx, by, bz);
+                out.addProperty("blockX", bx);
+                out.addProperty("blockY", by);
+                out.addProperty("blockZ", bz);
+                out.addProperty("blockDimension", c.dimension());
+                // `blockKnown:false` + JSON null is the ONLY way to say "I cannot see that cell". It is
+                // deliberately not "" (which would read as air) and not `false` (which would read as a
+                // fact about the world) — see PROTOCOL §6.2f.
+                out.addProperty("blockKnown", id != null);
+                putNullable(out, "block", id == null ? null : (id.isEmpty() ? "minecraft:air" : id));
+                putNullable(out, "blockIsAir", id == null ? null : Boolean.valueOf(id.isEmpty()));
+                putNullable(out, "blockReplaceable", replaceable);
+            }
+            // A cheap movement bit (A): no re-query, no blocks, just what the adapter already knows.
+            if (want.contains("all") || want.contains("moving")) {
+                Boolean moving = c.playerMoving();
+                out.addProperty("movingKnown", moving != null);
+                putNullable(out, "moving", moving);
+            }
+            return out;
+        }
+    }
+
+    /**
+     * {@code input.stop} — cancel injected movement in one of two tiers.
+     *
+     * <p>The distinction is the promise: <b>immediate</b> cancels now (the player may be left mid-air or
+     * inside a wall), <b>safe</b> keeps the movement going until the player stands on ground outside a
+     * wall, bounded by {@code ticks}, then cancels. Both tiers end with the injection cancelled — a stop
+     * that keeps being renewed is the P7 defect, so this is a <b>cancellation</b> (see
+     * {@link InputHold#stop}), never a new hold.
+     *
+     * <p>Honesty: the adapter says what it observed ({@code stopped}, {@code atSafePoint} — nullable,
+     * never guessed). Two outcomes are <b>non-failure terminations</b> rather than errors:
+     * {@code E_STOPPED} when there was nothing moving to stop, and {@code E_SUPERSEDED} when another input
+     * command took the player while a safe-point stop was waiting. Neither is retryable in the naive way.
+     */
+    public static final class StopOps implements Executor.OpHandler {
+        @Override
+        public JsonObject handle(Protocol.Ticket.Op op, Executor.ExecContext ctx) {
+            ClientModel c = ctx.client();
+            JsonObject p = op.params() == null ? Json.object() : op.params();
+            String rawMode = Json.str(p, "mode", "");
+            boolean immediate;
+            if ("immediate".equals(rawMode)) {
+                immediate = true;
+            } else if ("safe".equals(rawMode)) {
+                immediate = false;
+            } else {
+                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
+                        "input.stop: param 'mode' is required and must be \"safe\" or \"immediate\""
+                                + (rawMode.isBlank() ? "" : ", got \"" + rawMode + "\""))
+                        .with("params", "mode");
+            }
+            int maxTicks = immediate ? 0 : Json.intOr(p, "ticks", DEFAULT_STOP_TICKS);
+            if (maxTicks < 0 || maxTicks > MAX_STOP_TICKS) {
+                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
+                        "input.stop: 'ticks' must be between 0 and " + MAX_STOP_TICKS + ", got " + maxTicks)
+                        .with("params", "ticks");
+            }
+            String reason = Json.str(p, "reason", "input.stop:" + rawMode);
+            // input.stop changes the player's input, so it goes through the same single guard point as every
+            // other write op: an allowance is audited exactly once, a refusal leaves no trace, and a no-op
+            // writes nothing. Without this the stop would have been an unaudited write — caught by
+            // anImmediateStopCancelsAndIsReportedAsApplied.
+            Protocol.OpSpec spec = spec(ctx, "input.stop");
+            Guard.Decision decision = ctx.mutationGuard().requireAllowed(spec, "input.stop",
+                    "stop mode=" + rawMode);
+            JsonObject guarded = Json.object();
+            if (decision.noop()) {
+                return guardNoOp(guarded, "input.stop mode=" + rawMode, decision);
+            }
+            ClientModel.StopResult r = c.stopInput(immediate ? "immediate" : "safe", maxTicks);
+            if (r.superseded()) {
+                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_SUPERSEDED,
+                        "the stop was superseded: a newer input command took the player while the safe-point "
+                                + "stop was waiting, so this stop no longer applies")
+                        .with("mode", immediate ? "immediate" : "safe");
+            }
+            if (!r.wasActive()) {
+                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_STOPPED,
+                        "nothing was being injected: the movement had already stopped (a non-failure "
+                                + "termination, not a defect)")
+                        .with("mode", immediate ? "immediate" : "safe");
+            }
+            JsonObject out = Json.object();
+            String mode = immediate ? "immediate" : "safe";
+            out.addProperty("mode", mode);
+            out.addProperty("stopRequested", true);
+            out.addProperty("stopped", r.stopped());
+            putNullable(out, "atSafePoint", r.atSafePoint());
+            out.addProperty("ticksUsed", r.ticksUsed());
+            out.addProperty("armed", r.armed());
+            JsonObject dispatch = Json.object();
+            dispatch.addProperty("mode", mode);
+            dispatch.addProperty("reason", reason);
+            dispatch.addProperty("ticksUsed", r.ticksUsed());
+            if (r.atSafePoint() != null) {
+                dispatch.addProperty("atSafePoint", r.atSafePoint());
+            }
+            if (r.armed()) {
+                // Armed, not done: the client is not at a safe point yet, so cancellation happens in the
+                // tick loop (bounded). Saying `applied` here would be exactly the over-claim this project
+                // keeps catching, so the receipt says what is true: requested, not yet stopped.
+                out.addProperty("verdict", "notClientVerifiable");
+                JsonObject armed = Json.object();
+                armed.addProperty("reason", "armed: the player is not at a safe point yet, so the stop is "
+                        + "applied by the tick loop at the first safe point (bounded by the request)");
+                armed.add("dispatch", dispatch);
+                out.add("notClientVerifiable", armed);
+                out.addProperty("note", "stop ARMED, not stopped: this receipt does not claim the player has "
+                        + "stopped. Read `state.query{what:[\"moving\"]}` (or the pose over time) to observe "
+                        + "the outcome");
+            } else if (r.stopped()) {
+                // The injected-input state is the client's own: cancelling it is something this client
+                // can observe, unlike a server-owned world effect (which never reports `applied`).
+                out.addProperty("verdict", "applied");
+                out.add("applied", dispatch);
+                out.addProperty("note", "the injection is cancelled: exactly the difference between a stop "
+                        + "that holds and the P7 renewal defect");
+            } else {
+                out.addProperty("verdict", "notClientVerifiable");
+                JsonObject unverifiable = Json.object();
+                unverifiable.addProperty("reason", "the adapter did not confirm the injection was cancelled");
+                unverifiable.add("dispatch", dispatch);
+                out.add("notClientVerifiable", unverifiable);
+                out.addProperty("note", "the stop was requested but this client cannot confirm it took "
+                        + "effect; do not report this as stopped");
             }
             return out;
         }

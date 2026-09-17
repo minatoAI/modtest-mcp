@@ -137,6 +137,45 @@ public interface ClientModel {
     }
 
     /**
+     * What an adapter observed when it was asked to stop the injected input.
+     *
+     * @param wasActive      whether anything was still being injected when the stop arrived. {@code false}
+     *                       means the movement had already stopped, which is a <b>non-failure
+     *                       termination</b> ({@code E_STOPPED}) rather than a success to be claimed twice.
+     * @param stopped        whether the injection is cancelled after this call. Only the adapter can know.
+     * @param atSafePoint    whether the player stands on ground outside a wall: {@code true}/{@code false}
+     *                       when observed, {@code null} when this client cannot judge it. Never guessed.
+     * @param ticksUsed      client ticks spent before stopping (0 for an immediate stop).
+     * @param superseded     whether another input command arrived while a safe-point stop was waiting, i.e.
+     *                       this stop no longer applies ({@code E_SUPERSEDED}).
+     * @param armed          whether a safe-point stop was <b>armed</b> instead of performed: the client was
+     *                       not at a safe point yet, so cancellation happens in the tick loop at the first
+     *                       safe point (bounded). An armed stop has not stopped anything yet and a receipt
+     *                       must not claim it did.
+     */
+    record StopResult(boolean wasActive, boolean stopped, Boolean atSafePoint, int ticksUsed,
+                      boolean superseded, boolean armed) {
+    }
+
+    /**
+     * Stop the injected movement input, in one of the two cancellation tiers.
+     *
+     * <p>{@code mode} is {@code "immediate"} (cancel now) or {@code "safe"} (keep going until the player is
+     * at a safe point — on ground, not inside a wall — then cancel), bounded by {@code maxTicks}. The
+     * adapter performs the physical stop; core only reports what it observed.
+     *
+     * <p><b>The stop must really stop.</b> A stop that keeps being renewed is the P7 defect (a
+     * one-second request that travelled 7.96 blocks). Cancelling the hold is therefore a
+     * <b>clear, not a new hold</b>: nothing may re-arm it, and a later write must not extend it. The
+     * default refuses, so an adapter that cannot stop is a loud defect ({@code NOT-WIRED-DEFECT}) rather
+     * than a silent "stopped" that keeps moving.
+     */
+    default StopResult stopInput(String mode, int maxTicks) {
+        throw new Protocol.ProtocolException(Protocol.ErrorCode.E_UNSUPPORTED,
+                "this adapter cannot stop injected input (input.stop)");
+    }
+
+    /**
      * Whether the held item is currently on cooldown.
      *
      * <p>Separate from {@link #cooldownTicks()} because an adapter may know "on cooldown" without
@@ -159,13 +198,52 @@ public interface ClientModel {
     boolean cellOccupied(int x, int y, int z);
 
     /**
-     * The block id at a position, {@code ""} for air, or {@code null} when this adapter cannot report it.
+     * The block id at a position, {@code ""} for air, or {@code null} when this client <b>cannot say</b>.
+     *
+     * <p><b>Three states, and {@code null} is never air.</b> {@code null} means the adapter could not read
+     * the cell at all — the chunk is not loaded client-side, the position is outside the world's build
+     * height, or this adapter has no block query. A caller MUST report that as "unknown" and never fold it
+     * into "air": an unloaded chunk reads back as air through the vanilla chunk API, which is exactly the
+     * false negative this contract exists to prevent (borrowed from mineflayer's {@code blockAt}, which
+     * returns {@code null} for a block it cannot see).
      *
      * <p>{@code world.place} uses this to read back what the client's own world now shows, instead of
      * asserting {@code placed:true} from the request (P10: an unconditional self-report is not evidence).
-     * {@code null} means "cannot witness", which must be reported as such and never as a measurement.
      */
     default String blockIdAt(int x, int y, int z) {
+        return null;
+    }
+
+    /**
+     * Whether a placement into this cell would be <b>replaceable</b> (tall grass, a snow layer, air), or
+     * {@code null} when this client cannot say.
+     *
+     * <p>{@code null} carries the same meaning as in {@link #blockIdAt}: not loaded, outside the build
+     * height, or no query available — <b>never</b> "not replaceable". It must not be reported as
+     * {@code false}, because {@code false} is a fact about the world and an unread cell is not.
+     *
+     * <p>This is what lets the "a non-air but replaceable cell is placeable like a player's" behaviour be
+     * verified with the harness's own ops: read the cell, see that it is known, non-air and replaceable,
+     * then place into it and read it back — no KubeJS probe needed.
+     */
+    default Boolean blockReplaceableAt(int x, int y, int z) {
+        return null;
+    }
+
+    /**
+     * A cheap "is the player moving right now" bit: {@code true}/{@code false} when this client can tell,
+     * {@code null} when it cannot.
+     *
+     * <p>Basis (adapter-defined, but it must be <b>cheap</b>): whether the client is currently displacing
+     * the player — the Forge adapter reads the player's delta movement, i.e. the outcome of the last tick,
+     * not a fresh block/entity query. {@code null} means "no player (or no world) to ask about".
+     *
+     * <p>The semantics are deliberately about <b>observed displacement</b>, not about a request: after an
+     * {@code input.set} the player may not have moved yet, so {@code moving:false} right after a request is
+     * not evidence that the request failed. Callers that need to know whether a request took effect must
+     * read the pose/position over time (or use the op's own receipt), not this bit.
+     */
+    default Boolean playerMoving() {
         return null;
     }
 

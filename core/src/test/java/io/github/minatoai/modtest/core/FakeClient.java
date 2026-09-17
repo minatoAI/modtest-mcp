@@ -279,10 +279,61 @@ class FakeClient implements ClientModel {
      * reportable observation ({@code ""}), not "cannot witness" ({@code null}). Tests that model an
      * adapter with no block query override this to return {@code null}.
      */
+    /**
+     * Cells the fake <b>cannot read</b> (as {@code "x,y,z"}): {@code blockIdAt} answers {@code null} for
+     * them, the way a real client answers for an unloaded chunk or a position outside the build height
+     * (A/§6.2f). Modelling this explicitly is the point: "unknown" must not be confused with "air".
+     */
+    final Set<String> unknownBlocks = new HashSet<>();
+    /** Replaceability answers for known cells, as {@code "x,y,z" -> canBeReplaced}. */
+    final java.util.Map<String, Boolean> replaceable = new java.util.HashMap<>();
+    /** The cheap movement bit: {@code true}/{@code false} when set, {@code null} = cannot tell. */
+    Boolean moving;
+    /** What {@code stopInput} reports: null means the fake refuses (E_UNSUPPORTED, the fail-closed path). */
+    ClientModel.StopResult stopResult;
+    int stopInputCalls;
+    String stopMode;
+    int stopMaxTicks;
+
+    /**
+     * The fake world does report block ids: a cell it never saw a placement for is air, which is a
+     * reportable observation ({@code ""}), not "cannot witness" ({@code null}). Cells listed in
+     * {@link #unknownBlocks} answer {@code null} instead, modelling an unreadable cell.
+     */
     @Override
     public String blockIdAt(int cx, int cy, int cz) {
-        String b = blocks.get(cx + "," + cy + "," + cz);
+        String key = cx + "," + cy + "," + cz;
+        if (unknownBlocks.contains(key)) {
+            return null;
+        }
+        String b = blocks.get(key);
         return b == null ? "" : b;
+    }
+
+    @Override
+    public Boolean blockReplaceableAt(int cx, int cy, int cz) {
+        String key = cx + "," + cy + "," + cz;
+        if (unknownBlocks.contains(key)) {
+            return null;
+        }
+        return replaceable.get(key);
+    }
+
+    @Override
+    public Boolean playerMoving() {
+        return moving;
+    }
+
+    @Override
+    public ClientModel.StopResult stopInput(String mode, int maxTicks) {
+        stopInputCalls++;
+        stopMode = mode;
+        stopMaxTicks = maxTicks;
+        if (stopResult == null) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_UNSUPPORTED,
+                    "the fake was not given a stop result");
+        }
+        return stopResult;
     }
 
     @Override

@@ -121,7 +121,8 @@ public final class ModtestHarnessMod {
                 Bridge.Clock.system(), line -> LOG.info("[modtest-mcp] {}", line),
                 () -> new Executor.ExecContext(config, new MinecraftSessionState(mc), activation,
                         Bridge.Clock.system(), Map.of("allow-mutate", config.allowMutate()),
-                        new MinecraftClientModel(mc, config.dir().resolve("recordings")), mutationGuard));
+                        new MinecraftClientModel(mc, config.dir().resolve("recordings"), HOLD),
+                        mutationGuard));
         MinecraftForge.EVENT_BUS.register(this);
         LOG.warn("[modtest-mcp] {} — this is a DEVELOPMENT harness, not a gameplay mod",
                 io.github.minatoai.modtest.core.BuildInfo.describe());
@@ -172,6 +173,10 @@ public final class ModtestHarnessMod {
             // Install this ticket's hold — REPLACING any previous one, so a new ticket can never
             // extend a running hold. Exactly `ticks` writes follow, then it clears itself.
             HOLD.install(op.id(), command, ticks);
+            // C: a new command takes the player, so a safe stop that was still waiting for a safe point
+            // no longer applies — the tick loop must not cancel this new command on the old request's
+            // behalf (and the next input.stop reports that its predecessor was superseded).
+            MinecraftClientModel.supersedeArmedStop();
         }
         JsonObject out = new JsonObject();
         out.addProperty("queued", true);
@@ -245,7 +250,7 @@ public final class ModtestHarnessMod {
     }
 
     public static ClientModel clientModel() {
-        return new MinecraftClientModel(Minecraft.getInstance(), config == null ? null : config.dir());
+        return new MinecraftClientModel(Minecraft.getInstance(), config == null ? null : config.dir(), HOLD);
     }
 
     /**
@@ -267,6 +272,19 @@ public final class ModtestHarnessMod {
         // Count real client ticks first: the container synchronisation window is measured in ticks the
         // client actually ran, so it always converges (P12) — a wall-clock window did not.
         MinecraftClientModel.noteClientTick();
+        // C: apply an armed safe-point stop here, one tick at a time. It is deliberately NOT a blocking
+        // wait inside the op: this handler runs on the client thread, so sleeping would freeze the very
+        // ticks that move the player toward a safe point.
+        io.github.minatoai.modtest.core.StopRequest stop = MinecraftClientModel.armedStop();
+        if (stop != null) {
+            Minecraft tickMc = Minecraft.getInstance();
+            if (stop.superseded() || tickMc.player == null || tickMc.level == null) {
+                MinecraftClientModel.clearArmedStop();
+            } else if (stop.tick(tickMc.player.onGround() && !tickMc.player.isInWall())) {
+                HOLD.stop(stop.reason());
+                MinecraftClientModel.clearArmedStop();
+            }
+        }
         if (relay == null) {
             return;
         }

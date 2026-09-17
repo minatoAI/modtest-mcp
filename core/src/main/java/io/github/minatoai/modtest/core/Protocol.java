@@ -26,7 +26,31 @@ public final class Protocol {
     /** Stable error codes, §4.1 of the specification. */
     public enum ErrorCode {
         E_PROTOCOL, E_BAD_TICKET, E_BAD_OP_ID, E_UNKNOWN_OP, E_BAD_PARAMS,
-        E_PRECONDITION, E_TIMEOUT, E_BUSY, E_EXEC, E_ASSERT, E_UNSUPPORTED
+        E_PRECONDITION, E_TIMEOUT, E_BUSY, E_EXEC, E_ASSERT, E_UNSUPPORTED,
+        // ---- non-failure terminations (the mineflayer superseded/stopped/no-path/stuck family) ----
+        // The task did not complete, and that is NOT a defect: it was replaced, stopped, or could not be
+        // carried out at all. Callers MUST switch on the code (or use nonFailureTermination()) rather than
+        // treating every ok:false as a harness failure. Additive only: no existing code changed meaning,
+        // and no new error *field* was introduced for the distinction.
+        E_SUPERSEDED, E_STOPPED, E_NO_PATH, E_STUCK;
+
+        /**
+         * Whether this code means "the task ended without completing, and that is not a failure".
+         *
+         * <ul>
+         *   <li>{@code E_SUPERSEDED} — a newer request replaced this one, e.g. another input command
+         *       arrived while an {@code input.stop} was waiting for a safe point. Retrying is usually
+         *       wrong: the newer request owns the player now.</li>
+         *   <li>{@code E_STOPPED} — the movement asked about had already been stopped (or never started),
+         *       so there was nothing to stop. Not an error, and not a success to claim twice.</li>
+         *   <li>{@code E_NO_PATH} — no route to the target exists. <b>Reserved</b>: declared now for the
+         *       movement planner ({@code walk.within}), but nothing produces it yet.</li>
+         *   <li>{@code E_STUCK} — movement stopped making progress. <b>Reserved</b>, as above.</li>
+         * </ul>
+         */
+        public boolean nonFailureTermination() {
+            return this == E_SUPERSEDED || this == E_STOPPED || this == E_NO_PATH || this == E_STUCK;
+        }
     }
 
     /** §6.4 side-effect vocabulary. Anything but NONE/TELEMETRY_RECORDING is mutating. */

@@ -5,7 +5,7 @@ issueTrackerURL = "https://github.com/minatoAI/modtest-mcp/issues"
 
 [[mods]]
 modId = "modtestharness"
-version = "0.1.0"
+version = "1.0.0-alpha.4"
 displayName = "modtest-mcp harness (DEV ONLY)"
 authors = "modtest-mcp contributors"
 description = '''

@@ -128,7 +128,8 @@ class TicketValidatorTest {
     void catalogJsonIsMachineParsable() {
         JsonObject cat = catalog.catalogJson();
         assertEquals(Protocol.ID, cat.get("protocol").getAsString());
-        assertEquals(10, cat.getAsJsonArray("ops").size(), "ten vanilla ops registered");
+        assertEquals(11, cat.getAsJsonArray("ops").size(),
+                "eleven vanilla ops registered (the tenth was world.place's real path; the eleventh is input.stop)");
         JsonObject first = cat.getAsJsonArray("ops").get(0).getAsJsonObject();
         assertTrue(first.has("paramsSchema") && first.has("resultSchema")
                 && first.has("preconditions") && first.has("sideEffects"));
@@ -143,7 +144,10 @@ class TicketValidatorTest {
                 "recording inside the bridge dir does not touch the game");
         assertEquals(9, Protocol.SideEffect.values().length);
         assertEquals(9, Executor.ExpectEngine.OPERATORS.size(), "nine comparison operators");
-        assertEquals(11, Protocol.ErrorCode.values().length, "eleven stable error codes");
+        // 11 codes + the four non-failure terminations added in this batch (E_SUPERSEDED, E_STOPPED,
+        // E_NO_PATH, E_STUCK). Existing meanings unchanged; E_NO_PATH/E_STUCK are reserved (no producer).
+        assertEquals(15, Protocol.ErrorCode.values().length,
+                "eleven stable error codes plus four non-failure terminations");
         assertTrue(List.of("eq", "ne", "gt", "gte", "lt", "lte", "exists", "matches", "in")
                 .containsAll(Executor.ExpectEngine.OPERATORS));
     }

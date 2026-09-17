@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modtest-mcp"
-version = "1.0.0a1"
+version = "1.0.0a4"
 description = "MCP server for a local Minecraft mod-test file bridge (modtest-bridge/1.0): structured tickets in, structured telemetry out."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -13,9 +13,9 @@
 > The Java side is built from one source tree in two variants — a **guarded** default and a
 > self-compiled **unguarded** one; see [§8](#8-guarded-and-unguarded-builds--read-this-before-building-from-source).
 > **Versions:** tag `v1.0.0` marks the **first preview drop** (there is no stable release yet —
-> current version line is `1.0.0a1` / `1.0.0-alpha.1`). The **protocol version**
-> (`modtest-bridge/1.0`) and the **product version** are independent: the protocol can stay at 1.0
-> while the tool is still a preview.
+> current version line is `1.0.0a4` / `1.0.0-alpha.4`; one release, written in each notation). The
+> **protocol version** (`modtest-bridge/1.0`) and the **product version** are independent: the protocol can
+> stay at 1.0 while the tool is still a preview.
 
 `mcp-name: io.github.minatoAI/modtest-mcp`
 
@@ -160,7 +160,7 @@ is the injection guard described in [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §7.2
 **Both variants identify themselves**, so a build can never be passed off as the other one:
 
 * the jar manifest carries `Modtest-Guard-Variant: guarded` or `unguarded`;
-* the version line reports it — `modtest-harness-core 1.0.0-alpha.1 guard=GUARDED`;
+* the version line reports it — `modtest-harness-core 1.0.0-alpha.4 guard=GUARDED`;
 * an **unguarded** build logs a warning at startup: *"UNGUARDED BUILD: the injection policy is
   disabled…"*;
 * an artifact with no stamp at all is treated as **guarded** (fail closed).
@@ -186,10 +186,12 @@ clear about what you are switching off:
 
 | | |
 |---|---|
-| product version | `1.0.0a1` (Python/MCP server) / `1.0.0-alpha.1` (Gradle) |
+| product version | `1.0.0a4` (Python/MCP server) / `1.0.0-alpha.4` (Gradle) — **one release, two notations**; the same line is in `gradle.properties`, `pyproject.toml`, the MCP server's `__version__` and `mods.toml`, and a test fails if they disagree |
+| artifact file names | `modtest-harness-forge-1.0.0-alpha.4.jar` / `…-1.0.0-alpha.4-unguarded.jar`. **They changed in this cut** (the version lines were aligned), so a jar's file name now matches its release |
 | protocol version | `modtest-bridge/1.0` (independent of the product version) |
 | packaged `:core` classes | **73** (enforced by the `verifySelfContainedJar` guardrail) |
 | also inside each jar | `pack.mcmeta` (pack_format 15) and `modtest.refmap.json` (Mixin AP output) |
+| executor contract identity | the executor id plus `executorVersion` in the catalog/receipt (`0.1.0` in the Forge adapter). **Deliberately independent of the product version line**: it names the executor/contract that produced a receipt, it is wire-visible metadata, and re-stamping it for cosmetic alignment would change already verified identities while the protocol stayed the same. Not a leftover — do not "tidy" it into `1.0.0-alpha.4`. |
 
 **There are two artifact identities. They differ, on purpose, and neither one is wrong.**
 
@@ -202,36 +204,49 @@ fact and it stays on the record:
 | guarded jar (release asset) | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
 | unguarded jar (same cut, not published) | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
 
-**(b) What the current source revision builds.** `3016c53`-era sources (P11 + P12 + the task-77 build-graph
-fix; the P11/P12 *main* sources are byte-identical to `d2559ba`, whose later commits touch only `README.md`
-and `docs/VERIFICATION-LOG.md`, plus the guardrail wiring in `forge/build.gradle`) build:
+**(b) What the current source revision builds.** The task-78 revision (the P11/P12/task-77 fixes **plus** the
+block-query + two-tier-stop batch and the aligned version lines) builds:
 
 | | |
 |---|---|
-| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **160,157 B**, **90 entries**, sha256 `CCF801A4CAC432C0A4D0D12B42174D14B879A97FA8670FCDD666565D267481AE`, manifest `Modtest-Guard-Variant: guarded`, `modtest.refmap.json` + `modtest.harness.mixins.json` present, **40 `m_*_` / 10 `f_*_` SRG references** (i.e. reobfuscated), **73** `:core` classes |
-| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `CA4599A87587BA4FE53CDA407B5B9089A4D4CFDC06465BA7F3AB129FA701A686`, manifest `Modtest-Guard-Variant: unguarded` |
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.4.jar` — **170,625 B**, **94 entries**, **362,557 B uncompressed**, sha256 `c288bcf18d0703835688295d77f4b6ae43108b26502dc7caa07ac9fc777af915`, manifest `Modtest-Guard-Variant: guarded` (316 B), `modtest.refmap.json` + `modtest.harness.mixins.json` present, **71 `m_*_` / 20 `f_*_` SRG references** (i.e. reobfuscated), **77** `:core` classes, `mods.toml` version `1.0.0-alpha.4` |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.4-unguarded.jar` — **170,672 B**, **94 entries**, sha256 `5dddc70871045768a3070b7536365e2f7793d191a42763903544ff9830ca6224`, manifest `Modtest-Guard-Variant: unguarded` (369 B) |
 
-**Entry-for-entry identity with the published build.** Both current jars match the bytes shipped as
-`v1.0.0-alpha.3` **entry by entry** — same 90 entry names, same uncompressed sizes, same CRC32s — so the
-content is identical and only the zip timestamps (hence the sha256) differ.
+**This build is a different thing from the published asset, on purpose** (and the file names now say so —
+they changed from `…-1.0.0-alpha.1.jar` when the version lines were aligned). Compared with (a) it has:
+**+4 entries** — `StopRequest.class`, `StopRequest$Tier.class`, `ClientModel$StopResult.class`,
+`VanillaOps$StopOps.class` — the new op `input.stop`, a new `state.query` block/moving reading, and the
+aligned version strings. **Nothing was removed.** The guarded jar is **+14,068 B** (156,554 → 170,625),
+which is the expected direction for a batch that adds an op, an interface method set and four classes; the
+`84 productEntries / 85 harnessEntries` split and `77/77` packaged `:core` classes are asserted by the
+guardrails on every build, so a wrong-shaped jar cannot be handed on. **Stale jars are not deleted by
+Gradle** — after this build two old `…-1.0.0-alpha.1.jar` files were still sitting in `forge/build/libs`;
+they were removed by hand, because "the newest file in `build/libs`" is not a safe way to choose an
+artifact when the version line has changed.
 
-The two variants differ by **47 B**, and that difference is **entirely `META-INF/MANIFEST.MF`** (316 B vs
-369 B uncompressed): every other entry, and its size, is identical. (The published pair differs by the same
-47 B: 156,601 − 156,554.) A larger gap than that is not a labelling difference — it means one of the two
-jars is not in its final state.
+**Entry-level comparison is still how you check a rebuild** (not sha256): same entry names, uncompressed
+sizes and CRC32s means same content. Within **this** build the two variants differ by exactly **47 B**, and
+that difference is **entirely `META-INF/MANIFEST.MF`** (316 B vs 369 B uncompressed): every other entry, and
+its size, is identical. (The published pair from (a) differs by the same 47 B: 156,601 − 156,554.) A larger
+gap than that is not a labelling difference — it means one of the two jars is not in its final state.
+`build/libs` is written twice, so the shippable bytes are the **reobfuscated** ones: in this build
+`build/libs/…-unguarded.jar` and `build/reobfJar/output.jar` are **byte-identical**
+(`5dddc708…`), and both guardrail tasks assert that identity against `reobfJar`'s own output.
 
 **Why the two identities differ — so a source build's sha is not a contradiction.** Two independent reasons:
-1. **The code changed.** P11/P12 add the interaction-path placement, the bounded sync window and the
-   agent-facing text, so the current canonical jars are *bigger* — each grew by **+1,386 B** against their
-   alpha.2 counterparts (158,771 → 160,157 guarded, 158,818 → 160,204 unguarded), i.e. **+3,603 B** for the
-   guarded jar against the published asset. Same entry count (90), different content.
+1. **The code changed** (P11/P12, then this batch), so the current jars are bigger: **+14,068 B** guarded
+   against the published alpha.3 asset, and **+1,386 B** against alpha.2 before that
+   (158,771 → 160,157 → 170,625). Different content and a different entry count, by design.
 2. **Jar bytes are not reproducible.** Zip entry timestamps make a rebuild of the *same* input produce a
    different sha256; even rebuilding `8720db0` would not reproduce `9FD682D9…`.
 
 So compare by **entry count, entry CRC32s and content**, never by hashing a local build against the released
-asset. **The next release will carry the new artifacts, and this section will then name the new sha as the
-published identity** (the internal Gradle version string stays `1.0.0-alpha.1`; the version lines were
-deliberately not bumped).
+asset. **The next release will carry the artifacts measured above, and this section will then name
+`c288bc…` (guarded) as the published identity — but only after the real-machine acceptance round passes.**
+Until then those bytes are a **local, unpublished build**. The already-published `v1.0.0-alpha.3` asset keeps
+the internal version string
+`1.0.0-alpha.1` and the file name `…-1.0.0-alpha.1.jar` (a published fact); the current revision aligns all
+version lines to `1.0.0-alpha.4` / `1.0.0a4`, so its jars are named `…-1.0.0-alpha.4.jar`.
 
 **`build/libs` is written twice — verify and ship only the reobfuscated write (task-77, fixed and asserted).**
 `:forge:jar` writes the jar with **official/mapped names and no SRG references**; `reobfJar` then *replaces*
@@ -392,6 +407,23 @@ the client instead of taken on trust.
   state-writing ops were audited and are not divergent: `input.set` writes the very input state the
   keyboard feeds the game, `inv.click`/`inv.toss` use the vanilla container-click path, `use.item` uses
   the vanilla use path.
+* **"Unknown" is a first-class answer, and it is never "air" (A).** `state.query{what:["block"],x,y,z}`
+  reports `blockKnown:false` with JSON `null`s when the client cannot see the cell — an unloaded chunk, a
+  `y` outside the build height, or an adapter with no block query. Vanilla's chunk API answers *air* for an
+  unloaded chunk, so folding unknown into air would be a fabricated fact. The same channel answers
+  `blockReplaceable` (`canBeReplaced()`), so "may I place here?" is verifiable with our own ops instead of a
+  KubeJS probe; `what:["moving"]` adds a cheap movement bit whose basis is the player's own delta movement
+  (displacement, **not** a request: `moving:false` right after `input.set` is not evidence of failure).
+* **A stop is a cancellation, never a renewal (C, the P7 lesson).** `input.stop{mode:"immediate"|"safe"}`
+  cancels injected movement now or at the first safe point (on ground, outside a wall), bounded by `ticks`.
+  After a stop the hold cannot write again and no tick budget survives; the receipt reports `armed:true` +
+  `stopped:false` + `verdict:"notClientVerifiable"` when it could only arm the stop — it never claims a
+  player has stopped who has not.
+* **Four codes are "non-failure terminations", not errors (C).** `E_SUPERSEDED`, `E_STOPPED`, `E_NO_PATH`
+  and `E_STUCK` mean *the task did not complete and that is not a defect*. The first two are produced today
+  (`input.stop`); `E_NO_PATH`/`E_STUCK` are **declared but reserved** for the movement planner
+  (`walk.within`) and nothing produces them yet. Existing codes keep their exact meaning, and no error
+  field was added for the distinction.
 * **A "cannot determine" answer is bounded, never permanent.** The container sync window is counted in
   **client ticks** (20) and also closes as soon as the server's own answer arrives, so the plain
   refusals (`empty-hand`, `slot-empty`, …) are always reachable. The first version used wall-clock

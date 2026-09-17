@@ -34,6 +34,7 @@ public final class InputHold {
 
     private final AtomicReference<Hold> current = new AtomicReference<>();
     private final Map<String, Integer> attributed = new ConcurrentHashMap<>();
+    private final AtomicReference<String> lastStopReason = new AtomicReference<>();
 
     /** Install a new hold, replacing (never extending) whatever was there. */
     public void install(String ticketId, Guard.InputCommand command, int ticks) {
@@ -47,6 +48,9 @@ public final class InputHold {
             throw new IllegalArgumentException("a hold must last at least one tick, got " + ticks);
         }
         current.set(new Hold(ticketId, command, ticks));
+        // A fresh hold is not a stopped one: forget the previous cancellation, so `stopReason()` describes
+        // the CURRENT hold rather than whatever happened before it.
+        lastStopReason.set(null);
     }
 
     /**
@@ -72,6 +76,30 @@ public final class InputHold {
     /** Explicitly drop the hold: on expiry, on refusal, on a no-op, and on a new install. */
     public void clear() {
         current.set(null);
+    }
+
+    /**
+     * Cancel the hold <b>because it was stopped</b> — the {@code input.stop} path, as opposed to expiry,
+     * refusal or replacement.
+     *
+     * <p>It is a cancellation, never a new hold: after this call {@link #nextWrite()} returns {@code null}
+     * for every later tick, so nothing re-arms the movement. That is the P7 guarantee ("a stop request must
+     * really stop") expressed as a property of the one object that owns the tick budget, rather than as a
+     * hope about the writer callback.
+     *
+     * @param reason short human-readable cause, recorded so a later reader can tell a stop from an expiry
+     */
+    public void stop(String reason) {
+        lastStopReason.set(reason == null || reason.isBlank() ? "stopped" : reason);
+        current.set(null);
+    }
+
+    /**
+     * Why the current hold was stopped, or {@code null} when it was not stopped (it expired, was refused,
+     * or was replaced by {@link #install}).
+     */
+    public String stopReason() {
+        return lastStopReason.get();
     }
 
     /** Ticks still owed (0 when nothing is held). */

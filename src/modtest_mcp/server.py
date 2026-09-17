@@ -20,7 +20,7 @@ import sys
 import time
 from typing import Any, Callable
 
-__version__ = "1.0.0a1"
+__version__ = "1.0.0a4"
 
 PROTOCOL_ID = "modtest-bridge/1.0"
 SERVER_NAME = "modtest-mcp"
@@ -32,7 +32,12 @@ OP_FIELDS = {"id", "op", "params", "expect", "timeout_ms", "on_error"}
 ERROR_CODES = (
     "E_PROTOCOL", "E_BAD_TICKET", "E_BAD_OP_ID", "E_UNKNOWN_OP", "E_BAD_PARAMS",
     "E_PRECONDITION", "E_TIMEOUT", "E_BUSY", "E_EXEC", "E_ASSERT", "E_UNSUPPORTED",
+    # Non-failure terminations: the task ended without completing and that is NOT a defect — it was
+    # superseded, already stopped, unroutable or stuck. NON_FAILURE_TERMINATIONS mirrors the core enum's
+    # nonFailureTermination(); callers should not treat these as harness failures.
+    "E_SUPERSEDED", "E_STOPPED", "E_NO_PATH", "E_STUCK",
 )
+NON_FAILURE_TERMINATIONS = frozenset({"E_SUPERSEDED", "E_STOPPED", "E_NO_PATH", "E_STUCK"})
 
 
 def _err(code: str, message: str, **detail: Any) -> dict:
@@ -203,7 +208,12 @@ TOOLS: dict[str, dict] = {
                  "(about 4.5 blocks; 5 in creative). Stay within reach instead of reaching across the "
                  "map: move the player first (input.set/pose.set) or place an adjacent cell, otherwise "
                  "the op is refused with E_PRECONDITION reason=out-of-reach, and a wrong/missing item "
-                 "in hand is refused with reason=held-item-mismatch / empty-hand."),
+                 "in hand is refused with reason=held-item-mismatch / empty-hand. "
+                 "state.query can read a block cell (what=['block'],x,y,z -> blockKnown/block/"
+                 "blockReplaceable, where unknown is null and NEVER air) and a cheap moving bit; "
+                 "input.stop{mode:'safe'|'immediate'} cancels injected movement, and it reports "
+                 "armed:true (not stopped) when it could only wait for a safe point. E_SUPERSEDED/"
+                 "E_STOPPED/E_NO_PATH/E_STUCK are non-failure terminations, not defects."),
         "schema": {"type": "object",
                    "properties": {"ticket": {"type": "string"},
                                   "payload": {"type": "object"}},

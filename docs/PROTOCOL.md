@@ -152,6 +152,17 @@ fields are how test rigs drift.
 | `E_EXEC` | the op ran and failed (world/state/vanilla error) |
 | `E_ASSERT` | an `expect` assertion failed |
 | `E_UNSUPPORTED` | op exists but is not available in this build/mode |
+| `E_SUPERSEDED` | **non-failure termination** — a newer request replaced this one (e.g. another input command arrived while a safe-point stop was waiting). Retrying is usually wrong: the newer request owns the player now. |
+| `E_STOPPED` | **non-failure termination** — the movement asked about had already stopped (or never started), so there was nothing to stop. Not an error, and not a success to claim twice. |
+| `E_NO_PATH` | **non-failure termination** — no route to the target exists. **Reserved**: declared for the movement planner (`walk.within`); nothing produces it yet, and a test pins that so a stray user goes red. |
+| `E_STUCK` | **non-failure termination** — movement stopped making progress. **Reserved**, as above (pinned by the same test). |
+
+**A fourth class of outcome: non-failure termination.** The four codes above mean *the task did not
+complete, and that is not a defect*. They are additive — every pre-existing code keeps its exact meaning —
+and the classification is machine-readable without adding a field to the error object: §4.1 still carries
+only `code`, `message`, `path`. Implementations expose the set (`Protocol.ErrorCode.nonFailureTermination()`
+in the reference core, `NON_FAILURE_TERMINATIONS` in the MCP server), and **callers MUST switch on the code**
+rather than treating every `ok:false` as a harness failure.
 
 Codes are **stable strings**; new codes may be added in a minor version, existing ones never
 change meaning.
@@ -185,6 +196,13 @@ This makes diffs between ticket and receipt mechanical.
 * The MCP server writes the ticket's `protocol` from `--protocol-version` (default `1.0`) and
   advertises it in `initialize` → `capabilities.experimental.modtestBridge.protocol`.
 * The executor's supported set is advertised in `catalog.json` → `protocols`.
+* **Two identities, deliberately separate.** The **product version** (`1.0.0-alpha.4` / `1.0.0a4`) names the
+  release and its artifacts. The **executor contract identity** — the executor id plus `executorVersion`
+  carried in the catalog/receipt (e.g. `0.1.0` in the reference adapter) — identifies the executor and the
+  contract that produced a receipt, and is **intentionally independent of the product version line**: it is
+  wire-visible receipt metadata, so bumping it for cosmetic alignment would change already verified
+  identities while the protocol itself stayed the same. It is not a leftover and must not be "tidied" into
+  the product version.
 
 ---
 
@@ -743,6 +761,68 @@ An executor MUST treat any value other than `NONE` / `TELEMETRY_RECORDING` (docu
 opt-in, but it changes **local rendering only** — it cannot reach another machine's world — so the §7.2
 injection gate puts it on the tier-1 (never blocked) side. The tier-1 set is an explicit allow-list, and
 every value of the vocabulary is classified by it.
+
+---
+
+### 6.2f `state.query` additions: a block reading and a cheap movement bit
+
+`what:["block"]` requires `x`, `y`, `z` (integers). It is deliberately **not** part of `all`: a query with
+no coordinates fails with `E_BAD_PARAMS` instead of silently answering about some other cell.
+
+| field | meaning |
+|---|---|
+| `blockKnown` | `false` ⇒ this client **cannot see** that cell. `block` and `blockIsAir` are then JSON `null`. |
+| `block` | the block id; `"minecraft:air"` for a known-air cell; **JSON `null` when unknown** |
+| `blockIsAir` | `true`/`false` when known, `null` when unknown |
+| `blockReplaceable` | `true`/`false` when known (`canBeReplaced()`), **`null` when unknown** |
+| `blockDimension` | the dimension the reading came from, so a cross-dimension reading is detectable |
+
+**Unknown is never air** (the design is borrowed from mineflayer's `blockAt`, which returns `null` for a
+block it cannot see): an unloaded chunk, a `y` outside the world's build height, or an adapter with no block
+query all produce `blockKnown:false` **and nulls** — never `""`, and never `false`. The reason is concrete:
+vanilla's chunk API answers *air* for an unloaded chunk, so folding unknown into air would be a fabricated
+fact, and a caller would place into a cell it never actually looked at. A **read** is not bounded by reach
+(`world.place` is; §6.2d) — the limit on a read is what the client can observe, nothing else.
+
+`what:["moving"]` reports `movingKnown` + `moving` (`true`/`false`/`null`). Basis (adapter-defined, and it
+must be cheap): whether the client is currently **displacing** the player — the Forge adapter reads the
+player's delta movement, i.e. the outcome of the last tick, with no block or entity query. `null` means
+"no player or world to ask about". It reports **displacement, not a request**: `moving:false` immediately
+after an `input.set` is *not* evidence that the request failed.
+
+**What this enables:** `blockReplaceable` answers "may I place here?" from the client itself, so the "a
+non-air but *replaceable* cell (tall grass, a snow layer) is placeable like a player's" behaviour can be
+verified with the harness's own ops — read the cell, see that it is known, non-air and replaceable, place
+into it, read it back — instead of needing a KubeJS probe.
+
+### 6.2g `input.stop` — cancel injected movement in two tiers
+
+| | |
+|---|---|
+| Params | `mode` (**required**, `"safe"` \| `"immediate"`) · `ticks` (optional bound for `safe`: default `20`, max `100`) · `reason` (optional) |
+| Side effects | `player.input` |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+Result: `mode`, `stopRequested`, `stopped`, `atSafePoint` (`true`/`false`/`null`), `ticksUsed`, `armed`,
+`verdict`, `note`.
+
+* **`immediate`** cancels now, accepting that the player may be left mid-air or inside a wall.
+* **`safe`** keeps the injection alive until the player stands **on ground outside a wall**, then cancels.
+  It is **bounded** by `ticks`: when the bound runs out the stop still happens, and `atSafePoint:false`
+  says it did not get the safe point it wanted. It is never a blocking wait — the client's tick loop
+  applies it one tick at a time, so the very ticks that change the footing are not frozen.
+* **A stop is a cancellation, never a new hold (P7).** After a stop the hold cannot write again and no
+  tick budget survives it; a later `input.set` installs a *new* hold rather than renewing the stopped one.
+  "A one-second request that travelled 7.96 blocks" must be impossible.
+* **`armed` is not `applied`.** When the client is not at a safe point yet, the op *arms* the stop and
+  returns `armed:true`, `stopped:false`, `verdict:"notClientVerifiable"` — it does **not** claim the player
+  has stopped. Observe the outcome with `state.query{what:["moving"]}` or the pose over time.
+* Two outcomes are **non-failure terminations** (§4.1): `E_STOPPED` when nothing was moving to stop, and
+  `E_SUPERSEDED` when a newer input command took the player while the stop was waiting — the tick loop must
+  then **not** cancel the command that now owns the player.
+* `verdict:"applied"` is used only when the adapter reports the injection was actually cancelled: the
+  injected-input state is the client's own, unlike a server-owned world effect, which never reports
+  `applied` (§6.2d).
 
 ---
 

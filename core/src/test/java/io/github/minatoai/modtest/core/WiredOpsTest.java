@@ -804,8 +804,16 @@ class WiredOpsTest {
         // No new wire vocabulary was invented for this batch.
         assertEquals(9, Protocol.SideEffect.values().length,
                 "the side-effect vocabulary must not grow: " + List.of(Protocol.SideEffect.values()));
-        assertEquals(11, Protocol.ErrorCode.values().length,
-                "no new error code may be introduced: " + List.of(Protocol.ErrorCode.values()));
+        // Updated in task-78: eleven codes plus the four ADDITIVE non-failure terminations
+        // (E_SUPERSEDED/E_STOPPED/E_NO_PATH/E_STUCK). This freeze still holds — the pre-existing eleven
+        // keep their exact meaning, no error field was added, and every new code is classified by
+        // ErrorCode.nonFailureTermination() — so it is widened deliberately, not removed.
+        assertEquals(15, Protocol.ErrorCode.values().length,
+                "codes may only grow by the documented non-failure terminations: "
+                        + List.of(Protocol.ErrorCode.values()));
+        assertEquals(4, List.of(Protocol.ErrorCode.values()).stream()
+                .filter(Protocol.ErrorCode::nonFailureTermination).count(),
+                "exactly four codes are non-failure terminations");
     }
 
     // ================================================================ the anti-regression check

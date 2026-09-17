@@ -224,6 +224,9 @@ re-verified on a real client**: missing audit sink wiring, the Gson API mismatch
 the input-hold leak (`PENDING.set` re-arming on every write — now a single `InputHold` per ticket,
 "one `ticks:N` request ⇒ exactly N writes").
 
+A public, round-by-round log of these runs — including the claims we had to take back — is in
+[`docs/VERIFICATION-LOG.md`](docs/VERIFICATION-LOG.md).
+
 ### 9.3 `pose.set` reports three states — one word must never carry two meanings
 
 `pose.set`'s receipt puts each requested field in **exactly one** of:

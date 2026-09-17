@@ -334,12 +334,18 @@ request.** The transient value a client sets exists only locally and for an inst
 publishes the real pose on a later tick. A receipt that reported five applied fields while the
 position never moved (real-machine, round D/E) was produced exactly that way. Rules:
 
-* wait **≥ 1 client tick** before reading back; a remote session gets a longer bounded budget for the
-  server round trip;
-* a field may be reported as `applied` **only** when the pose settled *and* the settled value matches
-  the request (within a small epsilon);
+* take **two independent readings one tick apart** and report a field as `applied` **only** when both
+  readings agree *and* match the request (within a small epsilon); a single reading is not evidence,
+  because the authority's update can land after the settle window (measured: ~0.5 s after
+  `pose.set`). Fields whose two readings differ go to `skipped` with `reason: "not confirmed stable"`
+  and carry `firstReading` alongside `requested`/`actual`; the receipt also carries
+  `confirmed: <bool>` for the verdict as a whole;
+* wait **≥ 1 client tick** before the first reading; a remote session gets a longer bounded budget for
+  the server round trip;
 * if the pose did not settle in the budget, **nothing** may be reported as applied: every requested
   field goes to `skipped` with `reason: "not settled"`;
+* **position defaults to `skipped`** whenever an authority owns it — including single-player, whose
+  integrated server is authoritative — so only client-side rotation is typically confirmed;
 * `authority` and `note` are derived from the same verdict as `applied`/`skipped`, so they cannot
   contradict it.
 

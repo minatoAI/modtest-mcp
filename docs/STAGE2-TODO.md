@@ -5,8 +5,25 @@ and the mod-agnostic analysis tools. Stage 2 ships the **executor** that makes a
 answerable to that protocol, split into modules so that "generic core" and "mod-specific plugin"
 stay separable.
 
-Nothing here is implemented yet. This file is the work list, with the acceptance criteria that make
-each item checkable.
+**Status: implemented and real-machine verified.** The executor, the guard and both build variants
+exist in this tree (`core/` + `forge/`), all `core` unit tests are green, and the end-to-end loop was
+verified on a real 1.20.1 client in single-player and on a LAN session. The tables below are kept as
+the acceptance record: each row states the criterion that made the item checkable, and the rows were
+closed against those criteria rather than against "it compiles".
+
+The **terminal state — artifact identity, the honest verification list, the `pose.set` three-state
+semantics and the known limitations — is documented in
+[`README.md` §9](../README.md#9-current-state-verification-status-and-known-limitations)**. Read
+that before drawing conclusions from this backlog, and note in particular:
+
+* **no byte-reproducible jar claim** (zip timestamps) — integrity rests on entry counts, the four
+  guardrails and content;
+* `pose.set` reports **`applied` / `notClientVerifiable` / `skipped`** — one word must never carry
+  two meanings; single-player position is reverted (< 0.57 s) while a remote LAN position applied and
+  persisted (16.4 s, no revert);
+* the five ops that still answer `E_UNSUPPORTED` are a **scope decision, not a defect**;
+* official-launcher parity, pixel-level reading, `localhost` ↔ `127.0.0.1` matching and
+  `wait.frames` remain **unverified / limited** (see README §9.4).
 
 ---
 

@@ -1,11 +1,13 @@
 # modtest-mcp — a development harness for Minecraft mod authors (MCP)
 
-> **Status: EARLY PREVIEW — agent side only.**
-> This repository currently ships the **agent side** of the bridge (the MCP server, the
-> `modtest-bridge/1.0` specification and the analysis tools) plus the protocol itself. There is
-> **no game-side executor yet**: cloning this repository will *not* let you drive a Minecraft
-> client — the executor that answers tickets lands in **Stage 2** (see
-> [`docs/STAGE2-TODO.md`](docs/STAGE2-TODO.md)), which is in progress.
+> **Status: EARLY PREVIEW — executor present, real-machine verified, not for production use.**
+> This repository ships the **agent side** (the MCP server, the `modtest-bridge/1.0` specification
+> and the analysis tools) **and** the game-side executor: `core/` (pure JVM, unit-tested) plus the
+> Forge 1.20.1 adapter in `forge/` — see [`docs/STAGE2-TODO.md`](docs/STAGE2-TODO.md). It drives a
+> **local development client** in a single-player test world or on a server you own. Real-machine
+> coverage is listed honestly in
+> [§9](#9-current-state-verification-status-and-known-limitations) — including what is **not**
+> verified. This is still an early preview and the wire format may still change before 1.0.
 > The wire format is published for review and **may still change before 1.0**; expect breaking
 > changes between preview releases, and pin a commit if you build against it.
 > The Java side is built from one source tree in two variants — a **guarded** default and a
@@ -175,4 +177,108 @@ clear about what you are switching off:
 > for local development and take no responsibility for its use. All released artifacts of this
 > project are the **guarded** variant; the unguarded variant is source-only and is not offered as a
 > download.
+
+---
+
+## 9. Current state, verification status and known limitations
+
+### 9.1 Versions and artifact identity
+
+| | |
+|---|---|
+| product version | `1.0.0a1` (Python/MCP server) / `1.0.0-alpha.1` (Gradle) |
+| protocol version | `modtest-bridge/1.0` (independent of the product version) |
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — 122,843 B, **84 entries**, sha256 `CD47C676D360260FF4087E812848A94BDC48F1FCB6310775991744BDC052DE6A`, manifest `Modtest-Guard-Variant: guarded` |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 122,890 B, **84 entries**, sha256 `73C28368A6DB97CBBD55F7CB06FB2C9D45A3857245022B48E8737AD09E495421`, manifest `Modtest-Guard-Variant: unguarded` |
+| packaged `:core` classes | **67** (enforced by the `verifySelfContainedJar` guardrail) |
+| also inside each jar | `pack.mcmeta` (pack_format 15) and `modtest.refmap.json` (Mixin AP output) |
+
+**We do not claim byte-reproducible jars.** Building the same input twice produces different
+sha256 values (zip entry timestamps), so a sha identifies *one* build's output only. Integrity rests
+on the **entry count**, the **four guardrails** (`verifyMixinRefmap`, `verifySelfContainedJar`,
+`:core:verifyGsonApiSurface`, and the `pack.mcmeta` assertion) and the **content**, not on the hash.
+
+### 9.2 Real-machine verification (honest list)
+
+Verified on a real client (1.20.1, Forge, JDK 17), guarded and unguarded:
+
+1. **Input is actually taken up** — an injected forward command moves the player (closed loop:
+   before/after `state.query` plus the server log).
+2. **Refusal by default, and each allowance path works**: injection is off unless the dev flag *and*
+   an unexpired token are present; single-player is allowed; an **undeclared** remote host is
+   refused; a host declared in `MODTEST_ALLOWED_HOSTS` is allowed and audited.
+3. **The five unimplemented ops keep refusing** (`inv.click`, `inv.toss`, `use.item`,
+   `shot.capture`, `bench.read`) with `E_UNSUPPORTED` — a deliberate scope decision, not a defect.
+4. **Both variants build** (4a) and the **Mixin really applies** (4b: `@At` injection resolved in
+   the production (SRG) domain, zero mixin errors).
+5. **End-to-end ticket loop closes** (ticket → receipt → archive).
+6. **Unguarded variant: 4/4** of the above, with its own manifest stamp.
+
+The defect chain found on real machines is **closed, each one first proven, then fixed, then
+re-verified on a real client**: missing audit sink wiring, the Gson API mismatch
+(`JsonObject.isEmpty()` vs runtime gson 2.10), the self-contained-jar failure, the missing refmap
+`@At` target, the missing `pack.mcmeta`, the unreachable host allow-list
+(`serverAddress()` never provided), the dishonest `pose.set` verdict (now three states, §9.3), and
+the input-hold leak (`PENDING.set` re-arming on every write — now a single `InputHold` per ticket,
+"one `ticks:N` request ⇒ exactly N writes").
+
+### 9.3 `pose.set` reports three states — one word must never carry two meanings
+
+`pose.set`'s receipt puts each requested field in **exactly one** of:
+
+* **`applied`** — the client owns the field and the settled value matches the request (in practice:
+  **rotation**);
+* **`notClientVerifiable`** — an authority owns the field and the client **cannot witness** the
+  outcome. The request was delivered; whether the server applied it is not observable from here.
+  Each entry carries `requested`, `observedAtReadback` and a reason saying so;
+* **`skipped`** — it did **not** take effect, or could not be decided (`reason` is
+  `server-authoritative position`, `did not take effect`, or `not settled`).
+
+**Session asymmetry (measured):** in **single-player** the integrated server is authoritative too and
+the position is pulled back in **< 0.57 s** — so a position change really does not stick. On a
+**remote (LAN) session** the same request **applied and persisted: no revert within 16.4 s**, a
+freshly connected client read the new position before sending any request, and the server log shows
+the change. Reporting both as "skipped" would hide a working capability; reporting the remote one as
+"applied" would claim something the client cannot see. Hence the third state.
+
+`authority`, `note`, `poseSource` (`"client-readback"`) and `settled` are derived from the same
+verdict, so they cannot contradict it. **`ticks` on an `input.set` receipt is the requested hold
+length, not the number of writes performed** (the audit lines are the record of writes).
+
+### 9.4 Known limitations and things we have **not** verified
+
+* **Official-launcher byte-for-byte parity is not verified** — verification used a locally built
+  client; we have not compared the official launcher's files byte by byte.
+* **Pixel-level reading is not verified** — screenshot capture exists, but we make no claim that
+  images are interpreted reliably; treat image-based assertions as unproven.
+* **`localhost` and `127.0.0.1` do not match each other** in the host allow-list. This is a
+  **fail-closed usability trap, not a security hole**: declare the exact form you connect with.
+* **`wait.frames` is a synchronous no-op** in the current adapter — do not rely on it to advance the
+  client.
+* **No verification on public or third-party servers.** Everything above was verified on worlds and
+  servers owned by the operator, on loopback/LAN.
+* **The five `E_UNSUPPORTED` ops are a scope decision** (§9.2 item 3), not an unfinished accident.
+* (Updated status: the earlier `pose.set` false-green is **fixed** — §9.3; the fixture-threshold
+  branch that could mask resource leftovers was proven in both directions and is **not** an open
+  item.)
+
+### 9.5 Run constraints
+
+A test instance is bounded on purpose: **one instance at a time**, **≤ 6 min per instance** (the
+harness fixture defaults to 150 s), **≤ 25 min per round**, a **windowed 1280×800** client, and a
+**forced teardown to `java=0`** before the round is reported. The only relaxation used during LAN
+verification was allowing the `Minecraft` process name in the fixture's blocking-process check.
+
+### 9.6 What this means for use
+
+This is a **development harness for worlds and servers you own**. Two boundaries matter in practice:
+
+* `pose.set` on a **remote** session reports position as `notClientVerifiable` — the change usually
+  works, but the client cannot prove it. **Do not build assertions that depend on reading a
+  position back on a remote session.**
+* `pose.set` in **single-player** does **not** move the player: the integrated server reverts it.
+  Use input injection (which does work) or run the check on a remote session you control.
+
+Early preview: expect breaking changes before 1.0, pin a commit if you build against it, and read
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the normative rules.
 

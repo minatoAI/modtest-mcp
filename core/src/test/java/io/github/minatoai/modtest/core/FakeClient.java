@@ -21,12 +21,23 @@ class FakeClient implements ClientModel {
     float pitch;
     String dimension = "minecraft:overworld";
     String held = "minecraft:stone";
+    /** The off-hand item, so {@code use.item{hand:"off"}} and {@code state.query} can be checked. */
+    String offHand = "";
+    /**
+     * Whether this client's container view may still be catching up with the authority.
+     *
+     * <p>{@code false} by default: the fake's state <i>is</i> exact, so a test that wants the P9 race
+     * window sets this to {@code true} explicitly.
+     */
+    boolean containerSyncPending;
     boolean settled = true;
     boolean using;
     boolean useThrows;
     final List<String> slots = new ArrayList<>(List.of("minecraft:stone", "", "", "minecraft:torch"));
     final Set<String> occupied = new HashSet<>();
     final Set<String> placed = new HashSet<>();
+    /** Block ids the fake world reports, keyed {@code "x,y,z"}; an unrecorded cell is air. */
+    final java.util.Map<String, String> blocks = new java.util.HashMap<>();
     final List<String> screenshots = new ArrayList<>();
     int waitedFrames;
     int releaseCount;
@@ -102,6 +113,16 @@ class FakeClient implements ClientModel {
     @Override
     public String heldItemId() {
         return held;
+    }
+
+    @Override
+    public String offHandItemId() {
+        return offHand;
+    }
+
+    @Override
+    public boolean containerSyncPending() {
+        return containerSyncPending;
     }
 
     @Override
@@ -200,6 +221,18 @@ class FakeClient implements ClientModel {
     @Override
     public void placeBlock(int cx, int cy, int cz, String block) {
         placed.add(cx + "," + cy + "," + cz + "=" + block);
+        blocks.put(cx + "," + cy + "," + cz, block);
+    }
+
+    /**
+     * The fake world does report block ids: a cell it never saw a placement for is air, which is a
+     * reportable observation ({@code ""}), not "cannot witness" ({@code null}). Tests that model an
+     * adapter with no block query override this to return {@code null}.
+     */
+    @Override
+    public String blockIdAt(int cx, int cy, int cz) {
+        String b = blocks.get(cx + "," + cy + "," + cz);
+        return b == null ? "" : b;
     }
 
     @Override

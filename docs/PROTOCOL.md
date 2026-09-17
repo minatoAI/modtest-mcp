@@ -412,6 +412,25 @@ conventions apply to every op below:
   a sampling window that did not complete. A timeout is a **failure**: `ok:false`, `error.code:
   "E_TIMEOUT"`, message naming what was waited for. A timeout **MUST NOT** be answered `ok:true`, and
   **MUST NOT** be answered with an empty/blank result standing in for a real one.
+* **A verdict is a claim, and a claim needs a settled observation.** Two rules, both learned from
+  measured defects on a real client, apply to every receipt in this catalog:
+  1. **A negative conclusion requires settled state.** `verdict:"skipped"`, "slot N is empty",
+     "no container is open", "no item in the hand" all assert that something did **not** happen or is
+     **not** there. Container/inventory state is synchronised **asynchronously** (a join, a dimension
+     change, or a click/toss dispatched a moment ago), so one read that has not caught up yet is
+     indistinguishable from the real thing — and turning it into a fact makes an agent retry an action
+     that already worked. When an adapter reports that its container view may still be catching up
+     (`containerSyncPending`), core therefore answers **"cannot determine"**: `E_PRECONDITION` with a
+     message beginning `cannot determine …` and error detail `reason:"container-not-synced"`, instead
+     of asserting emptiness, and reports an **unchanged** read-back as **`notClientVerifiable`**,
+     never as `skipped`. Re-read (`state.query`, another op) to establish the outcome. A settled read
+     still produces the plain, factual refusals: `reason:"slot-empty"`, `reason:"no-container"`,
+     `reason:"empty-hand"`.
+  2. **A self-reported field MUST NOT exceed what the client can witness.** `world.place`'s `placed` is
+     the client's own read-back of its world (`blockObserved` carries the id it observed, `null` when
+     the adapter has no block query), never an unconditional `true`, and its verdict is
+     **`notClientVerifiable`** because the authority decides whether to keep the block. If a client
+     cannot observe a thing, the receipt says it cannot — it never reports a request as a measurement.
 
 **World interaction is out of scope.** Using or placing blocks against the world (`useItemOn`, block
 placement/interaction through this path) is **not** part of this batch: those ops keep answering
@@ -430,10 +449,15 @@ Result: `windowId`, `slot`, `button`, `mode`, `before:{id,count}`, `after:{id,co
 not expose the carried stack — the core reports that it did not observe it rather than guessing),
 the three verdict objects and `note`.
 
-* `verdict:"applied"` — the client's own menu shows the expected change.
-* `verdict:"notClientVerifiable"` — the session has a server authority. The click was dispatched;
-  whether it changed anything is not observable from the client.
-* `verdict:"skipped"` — the client's menu shows no change, with `reason`.
+* `verdict:"applied"` — the client's own menu shows the expected change (an observed difference, not
+  the request echoed back).
+* `verdict:"notClientVerifiable"` — either the session has a server authority (the click was
+  dispatched; whether it changed anything is not observable from the client), **or the client's menu
+  had not changed by the time it was read back**. The second case is deliberate: an unchanged early
+  read is **not** evidence that the click did nothing, and reporting it as `skipped` is the defect
+  P9 measured on a real client. The entry's `reason` says the read may simply be early.
+* `verdict:"skipped"` — **only** a guard no-op, where nothing was dispatched at all
+  (`skipped.dispatch.reason`): it is never derived from an unchanged read-back.
 
 Errors: `E_BAD_PARAMS` (missing/non-numeric `slot`, `slot` outside the window, `mode` outside the
 list), `E_PRECONDITION` (no container open for a container slot, or an armor slot — armor slots are
@@ -452,13 +476,16 @@ Result: `requestedCount`, `observedDelta` (how many items the client actually sa
 `before`, `after`, `partial`, three verdict objects, `note`.
 
 * `observedDelta == requestedCount` ⇒ `applied`; `0 < observedDelta < requestedCount` ⇒ `applied`
-  with `partial:true` (**a partial toss is normal, not an error**); `observedDelta == 0` ⇒ `skipped`
-  with `reason`. For a server session the verdict is `notClientVerifiable` instead.
+  with `partial:true` (**a partial toss is normal, not an error**); `observedDelta == 0` ⇒
+  **`notClientVerifiable`**, never `skipped`: a read-back that had not changed yet is not proof that
+  the toss did nothing (P9). For a server session the same verdict applies. `skipped` is reserved for
+  a guard no-op, exactly as for `inv.click`.
 * Server-side behaviour uses the vanilla drop path (the same request as pressing the drop key),
   **not** a local `player.drop(...)`, so the client and the authority cannot drift apart.
 
 Errors: `E_BAD_PARAMS` (`slot` missing/out of range, `count` outside `1..64`), `E_PRECONDITION`
-(empty slot, guard refusal), `E_TIMEOUT`, `E_UNSUPPORTED`.
+(empty slot — or `cannot determine` when the container has not caught up, guard refusal), `E_TIMEOUT`,
+`E_UNSUPPORTED`.
 
 #### `use.item` — use the hand-held item
 
@@ -471,6 +498,10 @@ Errors: `E_BAD_PARAMS` (`slot` missing/out of range, `count` outside `1..64`), `
 Result: `dispatched`, `hand`, `heldBefore`, `heldAfter`, `usingBefore`, `usingAfter`,
 `cooldownTicks`, three verdict objects, `note`.
 
+`heldBefore`/`heldAfter` report the item of the hand the ticket **asked for** (`hand:"off"` reports the
+off hand), so the receipt can be checked against `state.query{what:["offhand"]}` — which exists for
+exactly that reason.
+
 **This receipt claims that the action was dispatched, and nothing more.** `applied.dispatch` says
 the use was handed to the client; the **effect** of the item is decided by the authority and is
 reported under `notClientVerifiable.effect`. The `note` says so in words. If the guard reports a
@@ -479,9 +510,10 @@ no-op (paused / handshake / not in a world) the op executed, `dispatched:false`,
 (`useItemOn`) is **not** part of this op — see the scope note above.
 
 Errors: `E_BAD_PARAMS` (`hand` outside `main|off`), `E_PRECONDITION` (already using an item, empty
-hand, the held item is on cooldown — the message carries `cooldownTicks=<n>`, and only a **positive**
-value the client actually reports refuses, so an adapter that does not expose cooldowns is never
-blocked by a check it cannot answer —, guard refusal), `E_TIMEOUT`, `E_UNSUPPORTED`.
+hand — or `cannot determine` when the inventory has not caught up —, the held item is on cooldown —
+the message carries `cooldownTicks=<n>`, and only a **positive** value the client actually reports
+refuses, so an adapter that does not expose cooldowns is never blocked by a check it cannot answer —,
+guard refusal), `E_TIMEOUT`, `E_UNSUPPORTED`.
 
 #### `shot.capture` — capture one rendered frame and report its bytes
 
@@ -626,9 +658,14 @@ The rule is **default deny, plus an explicit allow-list of hosts you own**. A co
 which token, which op — in a durable log. Never log the token *value*: record a fingerprint
 (e.g. the first bytes of its SHA-256) instead. Every write op — `input.set`, `inv.select`,
 `inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place` — goes through this one gate, so an
-allowance always produces **exactly one** audit line and a **refusal produces no line at all** (a
-refusal is not an allowance, and recording it would bury the real ones). A no-op (paused / handshake /
-not in a world) writes nothing, so it is not an allowance either.
+allowance always produces **exactly one** audit line. **A refusal that happens *before* the allowance
+produces no line at all** (a refusal is not an allowance, and recording it would bury the real ones):
+that covers guard refusals (policy, activation, host, missing `allow-mutate`) and parameter validation.
+**An op precondition that fails *after* the guard allowed does have an allowance, and its line MUST
+exist**: an empty slot, a missing container, a cooldown or an occupied cell is discovered while the op
+is already running, so denying its line would hide a write the guard really permitted. In short: the
+test is not "did the op fail?" but "did the guard hand out an allowance?". A no-op
+(paused / handshake / not in a world) writes nothing, so it is not an allowance either.
 
 Mutating ops in general (`sideEffects` beyond `none`/`telemetry.recording`) **MUST** additionally
 require the executor's explicit `allow-mutate` opt-in, and fail with `E_PRECONDITION` without it.
@@ -641,11 +678,12 @@ receipts, never by reading the source. The guarded ops are `input.set`, `inv.sel
 
 | Path | Receipt | Audit log | Client |
 |---|---|---|---|
-| **allowed** | `ok:true`, and the op's declared effect really happened (`state.query` before/after, or the op's own `applied` / `observedDelta` / `verdict`) | **exactly one** `ALLOWED-MUTATION` line: who, which host, when, which op, and the **8-character token fingerprint** | the write reaches the client **exactly once** |
-| **refused** | `ok:false`, `error.code:"E_PRECONDITION"`, message naming the policy reason | **no line at all** (a refusal is not an allowance) | **nothing** reaches the client |
+| **allowed, effect observed** | `ok:true`, and the op's declared effect really happened (`state.query` before/after, an observed read-back difference, `observedDelta`) | **exactly one** `ALLOWED-MUTATION` line: who, which host, when, which op, and the **8-character token fingerprint** | the write reaches the client **exactly once** |
+| **allowed, then an op precondition fails** (empty slot, no container, cooldown, occupied cell, `cannot determine`) | `ok:false`, `error.code:"E_PRECONDITION"` | **exactly one** line — the allowance really was granted | the precondition is discovered **while running**, so nothing further is written |
+| **refused by the guard or by parameter validation** | `ok:false`, `error.code:"E_PRECONDITION"` (guard) / `E_BAD_PARAMS` (params) | **no line at all** (no allowance was granted) | **nothing** reaches the client |
 | **no-op** (paused / handshake / not in a world) | `ok:true` (`ok` means the op executed), `verdict:"skipped"`, `skipped.dispatch.reason` starting `guard no-op:` | **no line at all** | **nothing** reaches the client |
 
-Across all three paths the audit line **MUST NOT** contain the token *value* — only its fingerprint.
+Across all four paths the audit line **MUST NOT** contain the token *value* — only its fingerprint.
 
 **Rationale.** The question that matters is **"is this a server you own?"**, not **"is it
 remote?"**. A blanket remote refusal is at once too strict — it breaks the supported local

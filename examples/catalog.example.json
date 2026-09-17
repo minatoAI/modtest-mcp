@@ -14,7 +14,7 @@
         "properties": {
           "what": {
             "type": "array",
-            "items": { "enum": ["pose", "health", "armor", "held", "light", "all"] },
+            "items": { "enum": ["pose", "health", "armor", "held", "offhand", "light", "all"] },
             "minItems": 1
           }
         },

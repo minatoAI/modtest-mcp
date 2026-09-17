@@ -412,6 +412,11 @@ public final class VanillaOps {
             if (want.contains("all") || want.contains("held")) {
                 out.addProperty("held", c.heldItemId());
             }
+            // The off hand is part of "what is the player holding": without it, use.item{hand:"off"}
+            // has no observable evidence at all that it acted on the off hand rather than the main one.
+            if (want.contains("all") || want.contains("offhand")) {
+                out.addProperty("offhand", c.offHandItemId());
+            }
             if (want.contains("all") || want.contains("dimension")) {
                 out.addProperty("dimension", c.dimension());
             }
@@ -421,6 +426,9 @@ public final class VanillaOps {
                     inv.add(s);
                 }
                 out.add("inventory", inv);
+                // An inventory read is an observation with a sync window (P9): say so, so a caller can
+                // tell "the slot really is empty" from "the menu had not caught up yet" and re-read.
+                out.addProperty("containerSyncPending", c.containerSyncPending());
             }
             return out;
         }
@@ -770,8 +778,7 @@ public final class VanillaOps {
 
             Stack before = stackAt(c, slot, "inv.toss");
             if (before.count() == 0) {
-                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
-                        "slot " + slot + " is empty: nothing to toss");
+                refuseEmptySlot(c, slot, "toss");
             }
 
             try {
@@ -808,6 +815,29 @@ public final class VanillaOps {
         }
 
         /**
+         * Refuses an op whose precondition is "there is something in this slot".
+         *
+         * <p>P9: "slot N is empty" is a <b>factual negative</b>, and container contents are synchronised
+         * asynchronously — a join, a dimension change, or a click/toss dispatched a moment ago can make a
+         * slot read empty while the item is still there (qa-tester measured exactly that on a real client:
+         * the first {@code inv.toss} after joining reported "slot 0 is empty", and a read one second later
+         * showed the item). When the adapter reports that its container view may still be catching up, that
+         * read must not be turned into a fact: the refusal then says the state <b>cannot be determined</b>,
+         * and the machine-readable {@code reason} distinguishes the two cases.
+         */
+        private static void refuseEmptySlot(ClientModel c, int slot, String action) {
+            boolean unsynced = c.containerSyncPending();
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    unsynced
+                            ? "cannot determine whether slot " + slot + " is empty: the container has not "
+                                    + "caught up with the authority yet (a join, a dimension change or a "
+                                    + "recent click/toss may still be in flight), so '" + action + "' is not "
+                                    + "decided from this read — read the inventory again"
+                            : "slot " + slot + " is empty: nothing to " + action)
+                    .with("reason", unsynced ? "container-not-synced" : "slot-empty");
+        }
+
+        /**
          * The carried ("cursor") stack.
          *
          * <p>Honest about its limits: {@link ClientModel} exposes the <b>container</b> contents, not
@@ -834,9 +864,18 @@ public final class VanillaOps {
             if (window < 0) {
                 boolean playerInventory = slot <= 8 || (slot >= 36 && slot <= 39);
                 if (!playerInventory) {
+                    // Same rule as the empty-slot refusal: "no container is open" is a factual negative
+                    // about a synchronised view, so an adapter that reports its view may still be catching
+                    // up gets "cannot determine" instead of an assertion.
+                    boolean unsynced = c.containerSyncPending();
                     throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
-                            "no container is open (windowId=" + window + ") and slot " + slot
-                                    + " is not a player-inventory slot");
+                            unsynced
+                                    ? "cannot determine whether a container is open (windowId=" + window
+                                            + ") for slot " + slot + ": the container may not have synced "
+                                            + "yet, so this click is not decided from this read"
+                                    : "no container is open (windowId=" + window + ") and slot " + slot
+                                            + " is not a player-inventory slot")
+                            .with("reason", unsynced ? "container-not-synced" : "no-container");
                 }
                 return 0;
             }
@@ -846,9 +885,22 @@ public final class VanillaOps {
         /**
          * Writes the three-state verdict.
          *
-         * <p>{@code notClientVerifiable} is reserved for a session with a server authority: the menu
-         * is owned there, and this client cannot witness whether the edit landed. The local case gets
-         * a real answer, because the client's own menu <i>is</i> the truth.
+         * <p><b>The rule that matters (P9):</b> {@code skipped} asserts that the write did <b>not</b> take
+         * effect, so it may never be derived from "the read-back had not changed yet". A click that was
+         * dispatched and then read too early looks exactly like a click that did nothing; reporting the
+         * former as {@code skipped} makes an agent retry a click that already worked (a duplicate action —
+         * the mirror image of P5, where an unverified read was reported as {@code applied}).
+         *
+         * <p>So the observation decides exactly one thing: a <b>changed</b> read-back is evidence of
+         * application. An unchanged one is evidence of nothing and is reported as
+         * {@code notClientVerifiable}, with a reason saying the read may simply be early. The local
+         * session type no longer earns a stronger claim, because even an integrated server applies the
+         * click asynchronously — qa-tester measured exactly that on a real client (P9:
+         * {@code inv.click} reported {@code verdict:"skipped"} while the slot had actually changed).
+         *
+         * <p>A session with a server authority keeps its stronger rule: the menu is owned there, so the
+         * verdict stays {@code notClientVerifiable} even if the local menu happens to have changed —
+         * {@code applied} is reserved for a client-owned menu (§6.2b).
          */
         private static void verdict(JsonObject out, LocalObservation obs, ClientModel c,
                                     Executor.ExecContext ctx, String what) {
@@ -871,20 +923,32 @@ public final class VanillaOps {
                         + "the request but cannot witness whether it changed anything");
                 notVerifiable.add(obs.subject(), entry);
                 note = "the request was dispatched to the server, which owns the container menu; the "
-                        + "client cannot confirm the result — this receipt does not claim the change happened";
+                        + "client cannot confirm the result — this receipt does not claim the change "
+                        + "happened";
             } else if (obs.changed()) {
+                // Only an observed change on a client-owned menu earns `applied`: something really moved,
+                // so the receipt reports a measurement instead of echoing the request back.
                 verdict = "applied";
                 applied.addProperty(obs.subject(), obs.observedSummary());
-                note = "the client's own menu changed as requested; no server authority had to confirm it";
+                note = "the client's menu changed as requested: this is a read-back difference, not the "
+                        + "request repeated back";
             } else {
-                verdict = "skipped";
+                // Unchanged is not the same as "did not happen" (P9). Report what is actually known:
+                // this client cannot establish the outcome from this read.
+                verdict = "notClientVerifiable";
                 JsonObject entry = Json.object();
                 entry.addProperty("requested", what);
+                entry.addProperty("beforeCount", obs.before().count());
+                entry.addProperty("afterCount", obs.after().count());
                 entry.addProperty("observedAtReadback", obs.observedSummary());
-                entry.addProperty("reason", "no change was observed in the client's menu");
-                skipped.add(obs.subject(), entry);
-                note = "the click was dispatched but the client's menu shows no change: reported as "
-                        + "skipped (the request is NOT the result)";
+                entry.addProperty("reason", "the client's menu had not changed when it was read back, "
+                        + "which is NOT evidence that the write had no effect: container state is "
+                        + "synchronised asynchronously (even an integrated server applies it on a later "
+                        + "tick). Read again later instead of treating this as a no-op");
+                notVerifiable.add(obs.subject(), entry);
+                note = "the request was dispatched and the immediate read-back had not changed yet: this "
+                        + "receipt does NOT claim the write failed and MUST NOT be read as skipped — "
+                        + "read the menu again to establish the outcome";
             }
             out.addProperty("verdict", verdict);
             out.add("applied", applied);
@@ -966,10 +1030,18 @@ public final class VanillaOps {
                 throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
                         "param 'hand' must be 'main' or 'off', got '" + hand + "'").with("params", "hand");
             }
-            String heldBefore = c.heldItemId();
+            String heldBefore = heldIn(c, hand);
             if (heldBefore == null || heldBefore.isBlank()) {
+                // "no item in the <hand> hand" is a factual negative about synchronised state: when the
+                // adapter says its inventory may still be catching up, it cannot be determined here (P9).
+                boolean unsynced = c.containerSyncPending();
                 throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
-                        "no item in the " + hand + " hand");
+                        unsynced
+                                ? "cannot determine whether the " + hand + " hand holds an item: the "
+                                        + "inventory has not caught up with the authority yet, so this read "
+                                        + "is not evidence that the hand is empty"
+                                : "no item in the " + hand + " hand")
+                        .with("reason", unsynced ? "container-not-synced" : "empty-hand");
             }
             // A positive cooldown is a state the op assumes is over. Only what the client actually
             // reports refuses, so an adapter that does not expose cooldowns (the interface default) is
@@ -1006,7 +1078,7 @@ public final class VanillaOps {
             out.addProperty("dispatched", dispatched);
             out.addProperty("hand", hand);
             out.add("heldBefore", heldStackBefore.json());
-            out.add("heldAfter", Stack.parse(c.heldItemId()).json());
+            out.add("heldAfter", Stack.parse(heldIn(c, hand)).json());
             out.addProperty("usingBefore", Boolean.parseBoolean(usingBefore));
             out.addProperty("usingAfter", usingAfter);
             out.addProperty("cooldownTicks", Math.max(c.cooldownTicks(), 0));
@@ -1025,7 +1097,7 @@ public final class VanillaOps {
                 JsonObject entry = Json.object();
                 entry.addProperty("requested", "use hand=" + hand + " held=" + heldBefore);
                 entry.addProperty("observedAtReadback", "usingItem=" + usingAfter
-                        + " heldAfter=" + c.heldItemId());
+                        + " heldAfter=" + heldIn(c, hand));
                 entry.addProperty("reason", "the effect of using an item (consume, place, fire, …) is "
                         + "decided by the authority; the client cannot witness it");
                 notVerifiable.add("effect", entry);
@@ -1037,6 +1109,18 @@ public final class VanillaOps {
                     + "the client state around it; it does not claim that any effect occurred"
                     + (windowBefore >= 0 ? " (container window " + windowBefore + " was open)" : ""));
             return out;
+        }
+
+        /**
+         * The item in the hand the ticket asked for.
+         *
+         * <p>{@code hand:"off"} is only verifiable if {@code heldBefore}/{@code heldAfter} actually come
+         * from the off hand: reporting the main hand's item for an off-hand request would describe a
+         * different op, and (before this) the receipt could not be checked against
+         * {@code state.query{what:["offhand"]}}.
+         */
+        private static String heldIn(ClientModel c, String hand) {
+            return "off".equals(hand) ? c.offHandItemId() : c.heldItemId();
         }
     }
 
@@ -1065,8 +1149,33 @@ public final class VanillaOps {
                         "cell (" + x + "," + y + "," + z + ") is occupied");
             }
             c.placeBlock(x, y, z, block);
-            out.addProperty("placed", true);
-            out.addProperty("verdict", "applied");
+            // P10: `placed` used to be an unconditional `true` — a self-report derived from the request,
+            // which is exactly the class of claim this protocol forbids. It is now the client's own
+            // read-back of its world, and the verdict says who owns the outcome.
+            String observed = c.blockIdAt(x, y, z);
+            boolean witnessed = observed != null;
+            boolean occupiedAfter = c.cellOccupied(x, y, z);
+            boolean placed = witnessed ? !observed.isEmpty() : occupiedAfter;
+            out.addProperty("placed", placed);
+            out.addProperty("blockObserved", observed);
+            out.addProperty("verdict", "notClientVerifiable");
+            JsonObject effect = Json.object();
+            effect.addProperty("requested", "place " + block + " at " + x + "," + y + "," + z);
+            effect.addProperty("observedAtReadback", "cell occupied=" + occupiedAfter
+                    + (witnessed ? " block=" + (observed.isEmpty() ? "(air)" : observed)
+                    : " blockId=unavailable"));
+            effect.addProperty("reason", "the client applied the placement to its own view of the world "
+                    + "and whether the authority keeps it is not observable from here; a read-back that "
+                    + "has not changed yet is not evidence that the placement failed"
+                    + (witnessed ? "" : ", and this adapter cannot report the block id at all"));
+            JsonObject notVerifiable = Json.object();
+            notVerifiable.add("effect", effect);
+            out.add("notClientVerifiable", notVerifiable);
+            out.add("applied", Json.object());
+            out.add("skipped", Json.object());
+            out.addProperty("note", "placed/blockObserved are this client's own view of the block, not the "
+                    + "authority's: the receipt claims neither applied nor skipped"
+                    + (witnessed ? "" : " (this adapter exposes no block query, so blockObserved is null)"));
             return out;
         }
     }

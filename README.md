@@ -266,6 +266,17 @@ length, not the number of writes performed** (the audit lines are the record of 
   client.
 * **No verification on public or third-party servers.** Everything above was verified on worlds and
   servers owned by the operator, on loopback/LAN.
+* **A negative verdict needs a settled read.** `skipped`, `slot N is empty` and `no container is open`
+  are only reported when the adapter's container view is settled. Inside the synchronisation window
+  after a join, a dimension change, or a click/toss it just dispatched, the Forge adapter says so and
+  the receipt reports `notClientVerifiable` (unchanged write) or `E_PRECONDITION` with the message
+  `cannot determine …` and error detail `reason:"container-not-synced"` (state that cannot be judged)
+  instead of asserting emptiness. `world.place` likewise reports `placed` from its own read-back
+  (`blockObserved` carries the observed id) with verdict `notClientVerifiable` — the client's view of
+  the block is not the authority's decision.
+* **The off hand is observable now.** `state.query{what:["offhand"]}` reports the off-hand item and
+  `use.item{hand:"off"}` reports *that* hand's item in `heldBefore`/`heldAfter`; before this, an
+  off-hand use could not be checked from the client at all.
 * **The task-70 ops have not had their real-machine pass yet.** `inv.click`, `inv.toss`, `use.item`,
   `shot.capture` and `bench.read` are implemented in `:core` with a full unit-test matrix, and the
   Forge adapter now wires them — but every claim about what they do to a *real* client is still

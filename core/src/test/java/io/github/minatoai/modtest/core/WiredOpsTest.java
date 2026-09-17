@@ -147,7 +147,10 @@ class WiredOpsTest {
     }
 
     @Test
-    void aClickTheClientCannotObserveIsReportedAsSkippedNotAsApplied() {
+    void aClickWhoseReadBackHasNotCaughtUpIsNeverReportedAsSkipped() {
+        // P9. This test used to assert `skipped`, which is exactly the defect qa-tester measured on a
+        // real client: the click worked, the read-back was simply early, and the receipt said "did not
+        // happen" — an agent reading that retries the click and duplicates the action.
         FakeClient client = new FakeClient();
         client.windowId = 3;
         client.slots.set(0, "minecraft:torch");
@@ -156,12 +159,15 @@ class WiredOpsTest {
         JsonObject out = result(run(fail("inv.click", "{\"slot\":0,\"mode\":\"pickup\"}"), client));
 
         assertEquals(1, client.clickCalls);
-        assertEquals("skipped", out.get("verdict").getAsString());
-        assertTrue(out.getAsJsonObject("skipped").getAsJsonObject("slot 0").has("requested"),
-                "the skipped entry keeps the request separate from the reading: " + out);
-        assertTrue(out.getAsJsonObject("skipped").getAsJsonObject("slot 0")
-                .get("reason").getAsString().contains("no change"), out.toString());
+        assertNotEquals("skipped", out.get("verdict").getAsString(),
+                "an unchanged read-back is not evidence that the click did nothing: " + out);
+        assertEquals("notClientVerifiable", out.get("verdict").getAsString());
+        JsonObject nv = out.getAsJsonObject("notClientVerifiable").getAsJsonObject("slot 0");
+        assertTrue(nv.has("requested"), "the request stays separate from the reading: " + out);
+        assertTrue(nv.get("reason").getAsString().contains("NOT evidence"), out.toString());
         assertEquals(0, out.getAsJsonObject("applied").size(), "nothing may be claimed as applied");
+        assertEquals(0, out.getAsJsonObject("skipped").size(),
+                "nothing may be claimed as skipped either: " + out);
     }
 
     @Test
@@ -243,9 +249,11 @@ class WiredOpsTest {
         assertEquals(5, out.get("requestedCount").getAsInt(), "the request is recorded as requested");
         assertEquals(0, out.get("observedDelta").getAsInt(), "and the observation as observed");
         assertFalse(out.get("partial").getAsBoolean());
-        assertEquals("skipped", out.get("verdict").getAsString());
-        assertTrue(out.getAsJsonObject("skipped").getAsJsonObject("slot 0").has("observedAtReadback"),
-                out.toString());
+        // P9: an unchanged read-back is not proof the toss did nothing — it may just be early.
+        assertNotEquals("skipped", out.get("verdict").getAsString(), out.toString());
+        assertEquals("notClientVerifiable", out.get("verdict").getAsString());
+        assertTrue(out.getAsJsonObject("notClientVerifiable").getAsJsonObject("slot 0")
+                .has("observedAtReadback"), out.toString());
     }
 
     @Test
@@ -359,6 +367,7 @@ class WiredOpsTest {
         // `hand:"off"` must reach the adapter: accepting the parameter and then using the main hand
         // would make the receipt describe a different op than the ticket asked for.
         FakeClient offHand = new FakeClient();
+        offHand.offHand = "minecraft:shield";   // an empty hand cannot be used at all
         result(run(fail("use.item", "{\"hand\":\"off\"}"), offHand));
         assertEquals(List.of(true), offHand.useOffHand, "hand:off must be dispatched off-hand");
 
@@ -1045,5 +1054,231 @@ class WiredOpsTest {
                 new Guard.InputInjectionPolicy(Guard.HostWhitelist.empty(), Guard.BuildVariant.GUARDED,
                         "x", () -> "d"),
                 Guard.SessionState.singleplayer(), armed(), CLOCK, null));
+    }
+
+    // ================================================================ P9: one early read is not a fact
+
+    /** P9: the click is dispatched, but this client's menu shows the change only on a later read. */
+    private static final class DelayedSyncClient extends FakeClient {
+        private List<String> stale;
+
+        @Override
+        public void clickSlot(int slot, int button, String mode) {
+            clickCalls++;
+            stale = List.copyOf(slots);   // what the menu still shows immediately after the click
+            slots.set(slot, "");          // the authority's answer lands before the next read
+        }
+
+        @Override
+        public List<String> inventory() {
+            if (stale != null) {
+                List<String> s = stale;
+                stale = null;
+                return s;
+            }
+            return super.inventory();
+        }
+    }
+
+    /** P9, second shape: the container has not caught up, so "empty" cannot be determined. */
+    private static final class NotYetSyncedClient extends FakeClient {
+        NotYetSyncedClient() {
+        }
+
+        NotYetSyncedClient(int slotCount) {
+            super(slotCount);
+        }
+
+        @Override
+        public boolean containerSyncPending() {
+            return true;
+        }
+    }
+
+    /** P10: an adapter with no block query at all — what qa-tester measured on the bridge side. */
+    private static final class NoBlockQueryClient extends FakeClient {
+        @Override
+        public String blockIdAt(int x, int y, int z) {
+            return null;
+        }
+    }
+
+    @Test
+    void p9AReadBackThatHasNotCaughtUpIsNotSkippedAndALaterReadProvesTheEffect() {
+        DelayedSyncClient client = new DelayedSyncClient();
+        client.windowId = 0;
+        client.slots.set(0, "minecraft:stone");
+
+        JsonObject click = result(run(fail("inv.click", "{\"slot\":0,\"mode\":\"pickup\"}"), client));
+
+        assertNotEquals("skipped", click.get("verdict").getAsString(),
+                "the old code derived `skipped` from this early read: " + click);
+        assertEquals("notClientVerifiable", click.get("verdict").getAsString());
+        assertEquals(1, client.clickCalls, "the click really was dispatched");
+        // The proof that `skipped` was the wrong answer: the effect is visible one read later.
+        assertEquals("", client.inventory().get(0),
+                "a later read shows the slot emptied — the first read was simply early");
+    }
+
+    @Test
+    void p9AnEmptyReadWhileTheContainerIsStillSyncingIsNotReportedAsEmptiness() {
+        Protocol.Receipt r = run(fail("inv.toss", "{\"slot\":1,\"count\":1}"), new NotYetSyncedClient());
+
+        assertEquals("E_PRECONDITION", code(r));
+        String message = only(r).error().message();
+        assertTrue(message.contains("cannot determine"), message);
+        assertTrue(message.contains("caught up"), message);
+        // The factual phrasing of the settled refusal must not appear in the unsettled one.
+        assertFalse(message.contains("is empty: nothing to toss"),
+                "the core must not turn an unsettled read into a fact: " + message);
+        assertEquals("container-not-synced", only(r).error().detail().get("reason").getAsString());
+
+        // Control: once the adapter vouches for its view, the same absent lot IS a factual refusal.
+        Protocol.Receipt settled = run(fail("inv.toss", "{\"slot\":1,\"count\":1}"), new FakeClient());
+        assertEquals("E_PRECONDITION", code(settled));
+        assertTrue(only(settled).error().message().contains("is empty"),
+                only(settled).error().message());
+        assertEquals("slot-empty", only(settled).error().detail().get("reason").getAsString());
+    }
+
+    @Test
+    void p9AnUnsyncedContainerIsNotReportedAsAbsent() {
+        Protocol.Receipt r = run(fail("inv.click", "{\"slot\":20,\"mode\":\"pickup\"}"),
+                new NotYetSyncedClient(41));
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("cannot determine"), only(r).error().message());
+        assertEquals("container-not-synced", only(r).error().detail().get("reason").getAsString());
+    }
+
+    @Test
+    void p9AnUnsyncedInventoryIsNotReportedAsAnEmptyHand() {
+        NotYetSyncedClient client = new NotYetSyncedClient();
+        client.held = "";   // the read says "no item", but the inventory may not have caught up
+
+        Protocol.Receipt r = run(fail("use.item", null), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("cannot determine"), only(r).error().message());
+        assertEquals("container-not-synced", only(r).error().detail().get("reason").getAsString());
+        assertEquals(0, client.useCalls, "nothing may be used when the state cannot be determined");
+    }
+
+    // ================================================================ P10: self-report needs a witness
+
+    @Test
+    void p10APlacementTheClientCannotWitnessIsNotReportedAsApplied() {
+        NoBlockQueryClient client = new NoBlockQueryClient();
+        List<String> audit = new ArrayList<>();
+
+        JsonObject out = result(run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"),
+                ctx(client, Guard.SessionState.singleplayer(), audit, armed())));
+
+        assertEquals(1, client.placed.size(), "the placement was dispatched");
+        // The old code wrote `placed:true, verdict:"applied"` unconditionally — a self-report with no
+        // witness at all. Nothing here may claim the block is there.
+        assertEquals(false, out.get("placed").getAsBoolean(),
+                "placed must be the read-back, not the request: " + out);
+        assertTrue(out.get("blockObserved").isJsonNull(), out.toString());
+        assertNotEquals("applied", out.get("verdict").getAsString(), out.toString());
+        assertEquals("notClientVerifiable", out.get("verdict").getAsString());
+        assertEquals(0, out.getAsJsonObject("applied").size(), out.toString());
+        assertTrue(out.getAsJsonObject("notClientVerifiable").getAsJsonObject("effect")
+                .get("reason").getAsString().contains("not observable"), out.toString());
+        assertEquals(1, audit.size(), "the guard allowed it, so its allowance line exists");
+    }
+
+    @Test
+    void p10APlacementTheClientCanReadBackReportsTheBlockItObserved() {
+        FakeClient client = new FakeClient();
+
+        JsonObject out = result(run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), client));
+
+        assertEquals(true, out.get("placed").getAsBoolean(), out.toString());
+        assertEquals("minecraft:oak_planks", out.get("blockObserved").getAsString(), out.toString());
+        assertEquals("notClientVerifiable", out.get("verdict").getAsString(),
+                "the client's own view is not the authority's decision: " + out);
+        assertEquals(0, out.getAsJsonObject("applied").size(), out.toString());
+    }
+
+    // ================================================================ the corrected audit rule
+
+    @Test
+    void aPreconditionFailureAfterTheGuardAllowedStillLeavesItsAllowanceLine() {
+        // "A refusal leaves no trace" is about guard/parameter refusals. An op precondition that fails
+        // AFTER the guard allowed (an empty slot here) has a real allowance, and denying that line would
+        // hide an allowance the guard really granted.
+        FakeClient client = new FakeClient();
+        List<String> audit = new ArrayList<>();
+
+        Protocol.Receipt r = run(fail("inv.toss", "{\"slot\":1,\"count\":1}"),
+                ctx(client, Guard.SessionState.singleplayer(), audit, armed()));
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertEquals(0, client.tossCalls, "a refused toss must not reach the client");
+        assertEquals(1, audit.size(), "the guard DID allow this op: " + audit);
+        assertTrue(audit.get(0).startsWith("ALLOWED-MUTATION"), audit.get(0));
+
+        // The control: a guard refusal really does leave no trace.
+        List<String> refusedAudit = new ArrayList<>();
+        Protocol.Receipt refused = run(fail("inv.toss", "{\"slot\":0,\"count\":1}"),
+                ctx(client, Guard.SessionState.singleplayer(), refusedAudit, Guard.ActivationState.off()));
+        assertEquals("E_PRECONDITION", code(refused));
+        assertEquals(0, refusedAudit.size(), "a guard refusal must leave no trace: " + refusedAudit);
+    }
+
+    // ================================================================ off hand
+
+    @Test
+    void useItemReportsTheItemOfTheRequestedHand() {
+        FakeClient client = new FakeClient();
+        client.held = "minecraft:stone";
+        client.offHand = "minecraft:shield";
+
+        JsonObject off = result(run(fail("use.item", "{\"hand\":\"off\"}"), client));
+
+        assertEquals("off", off.get("hand").getAsString());
+        assertEquals("minecraft:shield", off.getAsJsonObject("heldBefore").get("id").getAsString(),
+                "hand:off must report the OFF hand's item, not the main hand's: " + off);
+        assertEquals("minecraft:shield", off.getAsJsonObject("heldAfter").get("id").getAsString());
+        assertEquals(List.of(Boolean.TRUE), client.useOffHand, "and it must dispatch from the off hand");
+    }
+
+    @Test
+    void useItemRefusesAnEmptyRequestedHandAndNamesThatHand() {
+        FakeClient client = new FakeClient();   // main hand has stone, the off hand is empty
+
+        Protocol.Receipt r = run(fail("use.item", "{\"hand\":\"off\"}"), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("off"), only(r).error().message());
+        assertEquals("empty-hand", only(r).error().detail().get("reason").getAsString());
+        assertEquals(0, client.useCalls);
+    }
+
+    @Test
+    void stateQueryExposesTheOffHandSoAnOffHandDispatchCanBeChecked() {
+        FakeClient client = new FakeClient();
+        client.offHand = "minecraft:shield";
+
+        JsonObject all = result(run("{\"op\":\"state.query\",\"params\":{\"what\":[\"all\"]}}", client));
+        assertEquals("minecraft:shield", all.get("offhand").getAsString(), all.toString());
+        assertEquals("minecraft:stone", all.get("held").getAsString(), all.toString());
+
+        JsonObject justOff = result(
+                run("{\"op\":\"state.query\",\"params\":{\"what\":[\"offhand\"]}}", client));
+        assertEquals("minecraft:shield", justOff.get("offhand").getAsString(), justOff.toString());
+    }
+
+    @Test
+    void stateQuerySaysWhenTheInventoryReadMayStillBeCatchingUp() {
+        NotYetSyncedClient client = new NotYetSyncedClient();
+
+        JsonObject out = result(run("{\"op\":\"state.query\",\"params\":{\"what\":[\"inventory\"]}}", client));
+
+        assertTrue(out.get("containerSyncPending").getAsBoolean(),
+                "an inventory read inside the sync window must say so: " + out);
     }
 }

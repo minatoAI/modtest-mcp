@@ -27,6 +27,20 @@ public interface ClientModel {
 
     String heldItemId();
 
+    /**
+     * The off-hand item id, or {@code ""} when that hand is empty.
+     *
+     * <p>{@code use.item} takes a {@code hand} parameter, so the item the receipt reports
+     * ({@code heldBefore}/{@code heldAfter}) has to come from the hand the ticket named. Reporting the
+     * main hand for an {@code hand:"off"} request would describe a different op. The default is
+     * {@code ""} (unknown reads as empty) so existing adapters keep compiling; an adapter that can see
+     * the off hand must override it, and {@code state.query} exposes it so an agent can actually verify
+     * an off-hand dispatch instead of trusting the request.
+     */
+    default String offHandItemId() {
+        return "";
+    }
+
     /** Teleport/rotate and run the settle loop; {@link #settled()} reports whether it converged. */
     void teleport(double x, double y, double z, float yaw, float pitch, int settleMs);
 
@@ -35,6 +49,25 @@ public interface ClientModel {
     // ---- inventory ------------------------------------------------------
     /** Slot contents by index; {@code ""} means empty. Armor slots are 36..39, offhand 40. */
     List<String> inventory();
+
+    /**
+     * Whether the container/inventory view this client reports may still be catching up with the
+     * authority — a join, a dimension change, or a click/toss this client dispatched moments ago.
+     *
+     * <p>Container contents are synchronised asynchronously, so a single early read of an unchanged or
+     * empty menu is <b>indistinguishable</b> from "nothing happened". Core therefore uses this signal to
+     * stop turning such a read into a factual negative: an apparently empty slot becomes
+     * {@code E_PRECONDITION} whose message says "cannot determine …" rather than "slot N is empty", and
+     * an unchanged read-back becomes {@code verdict:"notClientVerifiable"} rather than "skipped"
+     * (qa-tester measured both directions on a real client: P9).
+     *
+     * <p>The default is {@code false} — "my view is settled" — because a test double's state <i>is</i>
+     * exact and an adapter that does not model a race window must not become unable to refuse anything.
+     * An adapter that knows it cannot vouch for the window (see the Forge one) must override this.
+     */
+    default boolean containerSyncPending() {
+        return false;
+    }
 
     boolean usingItem();
 
@@ -90,6 +123,17 @@ public interface ClientModel {
     }
 
     boolean cellOccupied(int x, int y, int z);
+
+    /**
+     * The block id at a position, {@code ""} for air, or {@code null} when this adapter cannot report it.
+     *
+     * <p>{@code world.place} uses this to read back what the client's own world now shows, instead of
+     * asserting {@code placed:true} from the request (P10: an unconditional self-report is not evidence).
+     * {@code null} means "cannot witness", which must be reported as such and never as a measurement.
+     */
+    default String blockIdAt(int x, int y, int z) {
+        return null;
+    }
 
     void placeBlock(int x, int y, int z, String block);
 

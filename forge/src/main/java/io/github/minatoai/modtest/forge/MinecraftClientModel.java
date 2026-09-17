@@ -38,7 +38,11 @@ import java.util.Locale;
  *       authority drops its own copy (the client and the server then disagree);</li>
  *   <li><b>frame telemetry is fed by a per-frame hook</b> ({@link #recordFrame}) and read from a ring
  *       buffer, because the relay runs ON the client/render thread: waiting for future frames from
- *       inside an op would deadlock the very thread that produces them.</li>
+ *       inside an op would deadlock the very thread that produces them;</li>
+ *   <li><b>container reads carry a sync window</b> ({@link #containerSyncPending()}): right after a join,
+ *       a world change, or a click this client dispatched, the menu may not have caught up, so core
+ *       reports "cannot determine" instead of "the slot is empty" / "skipped" — qa-tester measured both
+ *       wrong answers on a real client (P9).</li>
  * </ul>
  */
 public final class MinecraftClientModel implements ClientModel {
@@ -61,6 +65,54 @@ public final class MinecraftClientModel implements ClientModel {
             throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION, "no client player");
         }
         return p;
+    }
+
+    // ---- container synchronisation window -------------------------------------------------------
+
+    /**
+     * How long after a join, a world change, or a click/toss this client may keep showing container
+     * contents that the authority has already changed (and vice versa).
+     *
+     * <p>This exists because of a measured defect (P9): the first {@code inv.toss} after joining
+     * reported "slot 0 is empty" while the item was still there a second later, and an {@code inv.click}
+     * reported {@code verdict:"skipped"} while the click had in fact worked. Both are the same mistake —
+     * treating one early read as a fact. This adapter therefore <b>cannot vouch</b> for its container
+     * view inside the window, and core turns that into "cannot determine" instead of "empty"/"skipped".
+     *
+     * <p>The window is a heuristic (the real condition is "the server's answer has not arrived yet",
+     * which vanilla exposes no flag for); it is set generously rather than tightly, because a false
+     * "cannot determine" costs one extra read while a false "empty" costs a wrong decision.
+     */
+    private static final long CONTAINER_SYNC_WINDOW_MS = 3_000L;
+
+    /** When the current level was first seen (join / dimension change), in {@code System.currentTimeMillis()}. */
+    private static long levelFirstSeenMs = -1L;
+    /** The level instance the timestamp above belongs to; identity comparison, so no equals() semantics. */
+    private static Object stampedLevel;
+    /** When this adapter last dispatched a container click/toss. */
+    private static long lastContainerTouchMs = -1L;
+
+    /** Records that a container-affecting action was just dispatched, opening the sync window. */
+    private static void noteContainerTouch() {
+        lastContainerTouchMs = System.currentTimeMillis();
+    }
+
+    @Override
+    public boolean containerSyncPending() {
+        long now = System.currentTimeMillis();
+        if (mc.player == null || mc.level == null) {
+            return true;   // nothing about the container is observable yet
+        }
+        if (stampedLevel != mc.level) {
+            // First observation of this level: a join or a dimension change. Treat the moment it is
+            // first *seen* as the start of the window, so the first ops after joining are covered even
+            // though the level object itself may be older.
+            stampedLevel = mc.level;
+            levelFirstSeenMs = now;
+        }
+        boolean freshLevel = levelFirstSeenMs < 0 || now - levelFirstSeenMs < CONTAINER_SYNC_WINDOW_MS;
+        boolean freshTouch = lastContainerTouchMs >= 0 && now - lastContainerTouchMs < CONTAINER_SYNC_WINDOW_MS;
+        return freshLevel || freshTouch;
     }
 
     @Override
@@ -98,6 +150,18 @@ public final class MinecraftClientModel implements ClientModel {
         ItemStack held = player().getMainHandItem();
         return held.isEmpty() ? "" : net.minecraftforge.registries.ForgeRegistries.ITEMS
                 .getKey(held.getItem()).toString();
+    }
+
+    /**
+     * The off-hand item, so {@code use.item{hand:"off"}} reports the hand it actually acted on and
+     * {@code state.query{what:["offhand"]}} can be used to verify the dispatch (qa-tester could not
+     * verify an off-hand use before this existed).
+     */
+    @Override
+    public String offHandItemId() {
+        ItemStack off = player().getOffhandItem();
+        return off.isEmpty() ? "" : net.minecraftforge.registries.ForgeRegistries.ITEMS
+                .getKey(off.getItem()).toString();
     }
 
     @Override
@@ -181,6 +245,7 @@ public final class MinecraftClientModel implements ClientModel {
     public void clickSlot(int slot, int button, String mode) {
         LocalPlayer p = player();
         mc.gameMode.handleInventoryMouseClick(clickWindow(p), slot, button, clickType(mode), p);
+        noteContainerTouch();
     }
 
     /** The closed ClickType vocabulary of {@code inv.click}, mapped one-to-one. */
@@ -208,11 +273,18 @@ public final class MinecraftClientModel implements ClientModel {
         LocalPlayer p = player();
         int inSlot = stackCount(p, slot);
         if (inSlot <= 0) {
+            // Same rule as core's empty-slot refusal: inside the sync window this read cannot tell
+            // "the slot is empty" from "the menu has not caught up".
+            boolean unsynced = containerSyncPending();
             throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
-                    "slot " + slot + " is empty");
+                    unsynced
+                            ? "cannot determine whether slot " + slot + " is empty: the container has not "
+                                    + "caught up with the authority yet"
+                            : "slot " + slot + " is empty");
         }
         int button = count >= inSlot ? 1 : 0;
         mc.gameMode.handleInventoryMouseClick(clickWindow(p), slot, button, ClickType.THROW, p);
+        noteContainerTouch();
     }
 
     private static int stackCount(LocalPlayer p, int slot) {
@@ -257,6 +329,23 @@ public final class MinecraftClientModel implements ClientModel {
     @Override
     public boolean cellOccupied(int x, int y, int z) {
         return !player().level().getBlockState(new BlockPos(x, y, z)).isAir();
+    }
+
+    /**
+     * The block id the client's own world currently shows at a position, or {@code ""} for air.
+     *
+     * <p>This is what makes {@code world.place}'s {@code placed} field a read-back instead of a
+     * self-report (P10). It is the <b>client's</b> view: Minecraft applies the placement locally at
+     * once ({@code ClientLevel.setBlockAndUpdate}) while the authority decides whether to keep it, so
+     * core reports the observation but keeps the verdict {@code notClientVerifiable}.
+     */
+    @Override
+    public String blockIdAt(int x, int y, int z) {
+        var state = player().level().getBlockState(new BlockPos(x, y, z));
+        if (state.isAir()) {
+            return "";
+        }
+        return net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(state.getBlock()).toString();
     }
 
     @Override

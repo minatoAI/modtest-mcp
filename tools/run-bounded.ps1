@@ -69,6 +69,10 @@ param(
     [switch]$VerifyWindow,
     [double]$CpuRecoveryTolerancePct = 20.0,
     [int]$MemoryRecoveryToleranceMB = 512,
+    # If another process grew by >= this much private memory, or burned >= this many CPU seconds,
+    # during our instance, a CPU/memory non-recovery is attributed to it (advisory, not a failure).
+    [int]$ForeignMemoryGrowthToleranceMB = 256,
+    [int]$ForeignCpuSecondsTolerance = 5,
     [int]$PollSeconds = 1,
     [switch]$Json,
     [switch]$DryRun,
@@ -336,6 +340,21 @@ function Invoke-BoundedInstance {
     }
 }
 
+# Per-process activity snapshot: private bytes (MB) and CPU seconds keyed by PID. Used to decide
+# whether a CPU/memory non-recovery is explained by somebody else's work (a teammate's build or the
+# user's own game) instead of a real leak of ours. Not a security boundary - only an attribution aid.
+function Get-ProcessActivitySnapshot {
+    $map = @{}
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+        $priv = -1.0
+        $cpu = -1.0
+        try { $priv = [double]$p.PrivateMemorySize64 / 1MB } catch { }
+        try { $cpu = [double]$p.TotalProcessorTime.TotalSeconds } catch { }
+        $map[[int]$p.Id] = [pscustomobject]@{ name = $p.ProcessName; privMB = $priv; cpuSec = $cpu }
+    }
+    return $map
+}
+
 function Test-PostRunAudit {
     param(
         [object]$Record,
@@ -351,7 +370,13 @@ function Test-PostRunAudit {
         # shared machine another teammate's build JVM can appear *during* our round and survive it;
         # without attribution it would be reported as our orphan and the audit would be a false red.
         # When empty (e.g. dry runs) no attribution filtering happens.
-        [string]$LaunchSignature = ''
+        [string]$LaunchSignature = '',
+        # Per-process activity before/after the instance (see Get-ProcessActivitySnapshot). A CPU or
+        # memory non-recovery is only an advisory note when somebody else's process clearly worked or
+        # grew during our round - which is the normal case on a shared machine (teammate's build, or
+        # the user's own game). orphans stays a hard gate regardless.
+        [hashtable]$ProcBaseline = @{},
+        [hashtable]$ProcAfter = @{}
     )
     $problems = New-Object System.Collections.Generic.List[string]
     $targetAlive = $false
@@ -387,12 +412,38 @@ function Test-PostRunAudit {
     # advisory note and must not fail the round on its own; with no foreign process it stays a hard
     # gate. The orphan gate itself is NEVER relaxed.
     $advisories = New-Object System.Collections.Generic.List[string]
-    $foreignPresent = (@($unattributed).Count -gt 0)
+    # How much other processes grew / burned during our instance (our own pid is already gone).
+    $foreignMemGrowthMB = 0.0
+    $foreignCpuSec = 0.0
+    if ($null -ne $ProcBaseline -and $null -ne $ProcAfter) {
+        foreach ($key in @($ProcAfter.Keys)) {
+            if ([int]$key -eq [int]$Record.pid) { continue }
+            $nowP = $ProcAfter[$key]
+            if ($null -eq $nowP) { continue }
+            if ($ProcBaseline.ContainsKey($key)) {
+                $wasP = $ProcBaseline[$key]
+                if ($wasP.privMB -ge 0 -and $nowP.privMB -ge 0) {
+                    $growth = $nowP.privMB - $wasP.privMB
+                    if ($growth -gt $foreignMemGrowthMB) { $foreignMemGrowthMB = $growth }
+                }
+                if ($wasP.cpuSec -ge 0 -and $nowP.cpuSec -ge 0) {
+                    $burn = $nowP.cpuSec - $wasP.cpuSec
+                    if ($burn -gt $foreignCpuSec) { $foreignCpuSec = $burn }
+                }
+            } elseif ($nowP.privMB -gt $foreignMemGrowthMB) {
+                # a process that appeared during the round: count its whole footprint as growth
+                $foreignMemGrowthMB = $nowP.privMB
+            }
+        }
+    }
+    $foreignPresent = (@($unattributed).Count -gt 0) -or
+        ($foreignMemGrowthMB -ge $ForeignMemoryGrowthToleranceMB) -or
+        ($foreignCpuSec -ge $ForeignCpuSecondsTolerance)
     if ($null -ne $BaselineSnapshot -and $null -ne $AfterSnapshot) {
         if ($BaselineSnapshot.cpuPct -ge 0 -and $AfterSnapshot.cpuPct -ge 0) {
             if ($AfterSnapshot.cpuPct -gt ($BaselineSnapshot.cpuPct + $CpuRecoveryTolerancePct)) {
                 if ($foreignPresent) {
-                    $advisories.Add(('advisory: system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%) -- not judged red because {3} unattributed process(es) were present' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct, @($unattributed).Count)) | Out-Null
+                    $advisories.Add(('advisory: system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%) -- not judged red: foreign activity observed (memGrowth={3} MB, cpu={4} s, unattributed={5})' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct, [math]::Round($foreignMemGrowthMB,1), [math]::Round($foreignCpuSec,1), @($unattributed).Count)) | Out-Null
                 } else {
                     $cpuRecovered = $false
                     $problems.Add(('system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%)' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct)) | Out-Null
@@ -402,7 +453,7 @@ function Test-PostRunAudit {
         if ($BaselineSnapshot.availableMB -ge 0 -and $AfterSnapshot.availableMB -ge 0) {
             if ($AfterSnapshot.availableMB -lt ($BaselineSnapshot.availableMB - $MemoryRecoveryToleranceMB)) {
                 if ($foreignPresent) {
-                    $advisories.Add(('advisory: available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB) -- not judged red because {3} unattributed process(es) were present' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB, @($unattributed).Count)) | Out-Null
+                    $advisories.Add(('advisory: available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB) -- not judged red: foreign activity observed (memGrowth={3} MB, cpu={4} s, unattributed={5})' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB, [math]::Round($foreignMemGrowthMB,1), [math]::Round($foreignCpuSec,1), @($unattributed).Count)) | Out-Null
                 } else {
                     $memoryRecovered = $false
                     $problems.Add(('available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB)' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB)) | Out-Null
@@ -415,6 +466,8 @@ function Test-PostRunAudit {
         targetGone = (-not $targetAlive); orphanCount = @($orphans).Count
         preexistingExcluded = @($preexisting).Count
         unattributedExcluded = @($unattributed).Count
+        foreignMemGrowthMB = [math]::Round($foreignMemGrowthMB, 1); foreignCpuSec = [math]::Round($foreignCpuSec, 1)
+        foreignPresent = $foreignPresent
         cpuRecovered = $cpuRecovered; memoryRecovered = $memoryRecovered
         targetCheck = ('Get-Process -Id {0} => {1}' -f $Record.pid, $(if ($targetAlive) { 'ALIVE' } else { 'not found (gone)' }))
         baseline = $BaselineSnapshot; after = $AfterSnapshot
@@ -503,6 +556,7 @@ $baselineSnapshotForAudit = $baselineSnapshot
 # allowed to run alongside a pre-existing JVM (LAN round + its dedicated server); those must not be
 # reported as our orphans afterwards.
 $baselineOrphanPids = @(Get-BlockingProcesses -Names $orphanNameList -TitlePattern $BlockingWindowTitlePattern | ForEach-Object { [int]$_.pid })
+$procBaselineForAudit = Get-ProcessActivitySnapshot
 
 # 3) refuse to start when a client process is already there -- refuse only, never kill
 $blocking = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern
@@ -551,11 +605,11 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Start-Sleep -Seconds $PollSeconds
     $afterSnapshot = Get-SystemSnapshot
     $audit = Test-PostRunAudit -Record $record -OrphanNames $orphanNameList -TitlePattern $BlockingWindowTitlePattern `
-        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids -LaunchSignature $launchSignature
+        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids -LaunchSignature $launchSignature -ProcBaseline $procBaselineForAudit -ProcAfter (Get-ProcessActivitySnapshot)
     $record | Add-Member -NotePropertyName audit -NotePropertyValue $audit -Force
     $instanceRecords.Add($record) | Out-Null
     Write-Output ('instance #{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB kill={6}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.killPerformed)
-    Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} unattributedExcluded={3} cpuRecovered={4} memRecovered={5} ok={6}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.unattributedExcluded, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
+    Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} unattributedExcluded={3} foreignMemGrowthMB={4} foreignCpuSec={5} cpuRecovered={6} memRecovered={7} ok={8}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.unattributedExcluded, $audit.foreignMemGrowthMB, $audit.foreignCpuSec, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
     foreach ($problem in @($audit.problems)) { Write-Output ('  problem: {0}' -f $problem) }
     foreach ($advisory in @($audit.advisories)) { Write-Output ('  note: {0}' -f $advisory) }
     if ($record.outcome -eq 'timeout-killed') { $verdict = 'FAIL:instance-timeout'; $finalExit = $EXIT_INSTANCE_TIMEOUT }

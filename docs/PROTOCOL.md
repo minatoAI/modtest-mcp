@@ -347,6 +347,15 @@ case — MUST report what actually happened: `applied:{field: value}` and
 `ok:true` keeps meaning "the op executed" (§6.2a) and never implies "every requested field took
 effect".
 
+**An unchanged read-back is not evidence of failure.** The same rule read from the other side (a
+real-machine round misread this as a failed placement; see `VERIFICATION-LOG` correction 12): for an op
+whose effect is world- or server-owned, a read-back that has not caught up yet is the **absence of
+evidence**, not evidence of absence. Such a receipt MUST say so — `placed:false` / `blockObserved:""`
+with a note that claims **neither** `applied` nor `skipped` (the reference wording is *"a read-back that
+has not changed yet is not evidence that the placement failed"*) — and a caller MUST NOT turn it into
+either "it worked" or "it failed". Use the read-back over time (or the op's own `verdict`) to decide;
+treating one unchanged read as failure is the same family as treating an unknown cell as air (§6.2f).
+
 **Position is never reported as `applied`.** Whenever a server authority exists — which includes a
 single-player world, whose **integrated server is authoritative too** — `x`/`y`/`z` are **always**
 reported under `skipped` with `reason: "server-authoritative position"`, and `applied` is reserved for

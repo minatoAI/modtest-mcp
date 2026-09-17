@@ -389,6 +389,36 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 
 ---
 
+## R24 · 2026-09-18 — task-78's real-machine acceptance round: what it settled, and two operator-side lessons
+
+- **`E_SUPERSEDED` reproduced deterministically, twice.** The recipe from R23's follow-up worked on a real
+  client: with the player **airborne** and a safe stop still `armed`, a newer `input.set` supersedes it and
+  the next `input.stop` answers `ok:false`, `code:"E_SUPERSEDED"`. So the code has a real producer, the
+  spec's trigger conditions are the measured ones, and **no code or test changed** for this — the release
+  artifacts are the same bytes R23 measured.
+- **Criterion ④ additions, measured:** the guard-allowed-then-op-failed path leaves its one line — this
+  round's `ALLOWED-MUTATION=4` includes **one line for each of the two tickets that ended `ok:false`** (the
+  allowance was granted before the failure was discovered).
+- **k3 — "`ok:true` + unchanged read-back" is existing honest design, not a defect.** A receipt from this
+  round reported `placed:false`, `blockObserved:""`, and a note claiming **neither** `applied` nor `skipped`,
+  with the wording *"a read-back that has not changed yet is not evidence that the placement failed"*. That
+  is exactly the P9/P10/P12 rule: **`ok:true` means the op executed**; a world effect is expressed by
+  `notClientVerifiable`/read-back, and **an unchanged read-back is not evidence of failure**. Reading it as a
+  failed placement was a reviewer misreading (see correction 12), not a product defect.
+- **Operational lesson (pwsh): name custom functions away from built-in aliases.** A helper named `R`
+  resolved to the built-in alias `R` (`Invoke-History`), so the call silently took the alias path and failed
+  with a parameter-binding error ("cannot find a parameter that accepts the argument …") instead of running
+  the helper. Rename it (the earlier `Compare` → `Test-SameEntries` fix in this log is the same mistake), or
+  invoke it module-qualified.
+- **Operational lesson (process): read the receipts already on disk first — it is free, and it changes
+  conclusions.** This round read all four receipts in one pass *before* spending an instance, and that alone
+  corrected the picture: an `empty-hand` refusal had **already** been reproduced earlier (no new run needed),
+  and the two `o6`/`q1` failures were **"selected slot with no supporting face"**, not the placement path.
+  Spending an instance is the expensive step; reading artefacts is not — so exhaust the cheap evidence first,
+  then decide what genuinely needs a live client.
+
+---
+
 ## Corrections we made to our own earlier claims
 
 This section exists because the log is only trustworthy if it records the moments we changed our
@@ -483,6 +513,17 @@ minds.
    about another cell. **Lesson: guard at the observation boundary whenever vanilla defaults to a benign
    value; "I cannot see it" needs its own representable state, and it must be impossible to read it as the
    benign value.**
+12. **We read "`ok:true` with an unchanged read-back" as a failed placement.** During the task-78
+   real-machine round a `world.place` receipt came back `ok:true`, but `placed:false` with
+   `blockObserved:""` and a note that claimed **neither** `applied` nor `skipped` — and it was reported as a
+   failure. It was not: the op's own wording is *"a read-back that has not changed yet is not evidence that
+   the placement failed"*, and that is the rule this project has held since P9/P10/P12 — **`ok:true` means
+   the op executed**; for a world effect the receipt says `notClientVerifiable` (or shows the read-back it
+   observed) and **never** claims the effect happened. A read that has not caught up yet is the *absence of
+   evidence*, not evidence of absence, and both `applied` and `skipped` would have been claims about the
+   world that the client could not support. Nothing in the product changed; the correction is to the reading
+   (and the operational version of it: read the receipts already on disk before spending an instance —
+   R24).
 
 ---
 

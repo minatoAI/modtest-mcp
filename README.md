@@ -200,7 +200,9 @@ on the **entry count**, the **four guardrails** (`verifyMixinRefmap`, `verifySel
 
 ### 9.2 Real-machine verification (honest list)
 
-Verified on a real client (1.20.1, Forge, JDK 17), guarded and unguarded:
+Verified on a real 1.20.1 client (Forge, JDK 17) **by the harness test runs**; the per-round
+evidence is in `docs/agent-harness/task55-index.md` and the `task55-round*-report.md` reports. Both
+variants were exercised:
 
 1. **Input is actually taken up** — an injected forward command moves the player (closed loop:
    before/after `state.query` plus the server log).
@@ -234,7 +236,8 @@ the input-hold leak (`PENDING.set` re-arming on every write — now a single `In
 * **`skipped`** — it did **not** take effect, or could not be decided (`reason` is
   `server-authoritative position`, `did not take effect`, or `not settled`).
 
-**Session asymmetry (measured):** in **single-player** the integrated server is authoritative too and
+**Session asymmetry (measured on a real client — see the evidence pointer in §9.2):** in
+**single-player** the integrated server is authoritative too and
 the position is pulled back in **< 0.57 s** — so a position change really does not stick. On a
 **remote (LAN) session** the same request **applied and persisted: no revert within 16.4 s**, a
 freshly connected client read the new position before sending any request, and the server log shows

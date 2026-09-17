@@ -420,12 +420,33 @@ conventions apply to every op below:
      change, or a click/toss dispatched a moment ago), so one read that has not caught up yet is
      indistinguishable from the real thing — and turning it into a fact makes an agent retry an action
      that already worked. When an adapter reports that its container view may still be catching up
-     (`containerSyncPending`), core therefore answers **"cannot determine"**: `E_PRECONDITION` with a
-     message beginning `cannot determine …` and error detail `reason:"container-not-synced"`, instead
-     of asserting emptiness, and reports an **unchanged** read-back as **`notClientVerifiable`**,
-     never as `skipped`. Re-read (`state.query`, another op) to establish the outcome. A settled read
-     still produces the plain, factual refusals: `reason:"slot-empty"`, `reason:"no-container"`,
-     `reason:"empty-hand"`.
+     (`containerSyncPending`), core therefore answers **"cannot determine"**: `E_PRECONDITION` whose
+     message **begins with the exact phrase `cannot determine`**, instead of asserting emptiness, and
+     reports an **unchanged** read-back as **`notClientVerifiable`**, never as `skipped`. Re-read
+     (`state.query`, another op) to establish the outcome. A settled read still produces the plain,
+     factual refusals ("slot N is empty", "no container is open", "no item in the hand").
+     **The `cannot determine` prefix is the machine-discriminable marker.** The error object carries
+     only `code`, `message` and `path` (§4.1), so `E_PRECONDITION` is the *same code* for "this state
+     could not be determined" and for a settled refusal ("slot N is empty"). The **only** discriminator
+     is that prefix; consumers **MUST** match it. This is a **known limitation of the error
+     vocabulary**, recorded rather than papered over: distinct codes (or a structured discriminator)
+     are a change for a future protocol revision, and **no new error field is added for it here** — in
+     particular the free-form `detail` object (§4.1) is **not** part of this contract and MUST NOT be
+     relied on to tell the two apart. (The reference implementation currently also carries an
+     informational `detail.reason` key; it is not contractual and is expected to be dropped when the
+     error vocabulary is next revised.)
+     **How to test it — a criterion correction from the closing round.** Judge these two outcomes by
+     the **assertion form** (the `verdict` value, and which of the `applied` / `notClientVerifiable` /
+     `skipped` objects is populated), **not** by whether some string occurs in the message. Substring
+     matching is what made a correct message look like a failure during review:
+     `cannot determine whether slot 1 is empty` legitimately contains the words `is empty`.
+     **Known exception, recorded rather than papered over:** world **block occupancy** has no
+     equivalent synchronisation signal — only container contents do — so `world.place`'s "cell is
+     occupied" refusal (`E_EXEC`) is still a client-side factual assertion about a
+     server-authoritative world. It is deliberately left that way: inventing a sync signal for world
+     blocks would be a guess, and this protocol only claims what the client can witness. Treat that
+     one refusal as **this client's view**, not as the authority's verdict, and read the block back
+     (`blockObserved`) after a placement rather than treating the pre-check as proof of absence.
   2. **A self-reported field MUST NOT exceed what the client can witness.** `world.place`'s `placed` is
      the client's own read-back of its world (`blockObserved` carries the id it observed, `null` when
      the adapter has no block query), never an unconditional `true`, and its verdict is

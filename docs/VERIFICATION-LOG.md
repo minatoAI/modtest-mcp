@@ -24,7 +24,7 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 |---|---|---|
 | 1 | Injected input is *actually taken up* by the client | **PASS** — control drift 0; movement follows the facing direction; open-path magnitude reproducible |
 | 2 | Refusal/allowance semantics (single-player, undeclared remote host, whitelisted host) | **PASS** on both sides after fixes (remote refusal leaves the player provably unmoved) |
-| 3 | The five unimplemented ops keep refusing | **PASS** — all five return `E_UNSUPPORTED`, none implemented |
+| 3 | The five unimplemented ops keep refusing *(status at R1–R15)* | **PASS then; superseded by R16–R20** — all five used to return `E_UNSUPPORTED`; they are now implemented and verified on a real client (README §9.2 item 3) |
 | 4a | The adapter compiles and loads as a mod | **PASS** |
 | 4b | The Mixin really applies in the production (obfuscated) domain | **PASS** |
 | 5 | End-to-end ticket loop closes (ticket → execution → receipt → archive) | **PASS** — 60+ tickets |
@@ -46,6 +46,8 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 | P5 | `pose.set` reported success for a teleport that had already been rolled back → now three honest states. |
 | P7 | A `ticks:20` (one second) hold was **self-renewing**: the player walked ~7.96 blocks over ≥11.8 s. |
 | P8 | On a remote server the teleport *did* work and persist, yet the receipt called it "not applied" → split into three states. |
+| P9 | A `skipped` verdict was derived from a read-back that had not caught up, so a click that **had** landed was reported as "did not happen" — the mirror image of P5, and it invites an agent to repeat a working action. Negative conclusions now require a settled read; otherwise the answer is `cannot determine` / `notClientVerifiable`. |
+| P10 | `world.place` reported `placed:true` and `verdict:"applied"` from the request, with nothing the client could witness → `placed` is now the client's own read-back (`blockObserved`) and the verdict is `notClientVerifiable`. |
 
 ---
 
@@ -173,6 +175,85 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 
 ---
 
+## R16 · 2026-09-17 — the five new ops on a real client, and the first sighting of P9
+
+- **Goal:** execute `inv.click` / `inv.toss` / `use.item` / `shot.capture` / `bench.read` through the
+  bridge on a real 1.20.1 client (the action layer that had just been wired) and read each receipt
+  against what the world actually did.
+- **Saw:** `inv.click` returned `verdict:"skipped"` with the reason *"no change was observed in the
+  client's menu"*, while an `inv.toss` about a second later reported *"slot 0 is empty"* — that is,
+  the click **had** taken effect. The read-back had run before the container synchronisation.
+- **Found:** **P9** — a `skipped` verdict derived from a single read-back that had not caught up.
+  First causal reading (corrected in R17): "the click picked the item up".
+- **Held:** the round stopped at reporting. The fix waited for the second sighting, so that the cause
+  was measured rather than assumed.
+
+## R17 · 2026-09-17 — P10, and P9's causality corrected
+
+- **Goal:** check that `world.place` can be witnessed from the client at all, and re-run the
+  join-time sequence that had produced P9.
+- **Saw:** `world.place` returned `{"block":"minecraft:stone","placed":true,"verdict":"applied"}`
+  while the client had **no way to witness it** — the bridge exposed no block query, and
+  `state.query{what:["block"],x,y,z}` answered `unknown param(s)`. Separately, the **first** `inv.toss`
+  after joining (no click before it) also reported *"slot 0 is empty"*, and a `state.query` **one
+  second later** showed slot 0 occupied.
+- **Found:** **P10** — a self-reported field exceeding what the client can observe (`placed:true` came
+  from the request, not from any read-back) — and a **correction to P9's causality**: not "the click
+  picked the item up", but a **race between a container read and the synchronisation window**, which
+  produces the same wrong answer in both directions.
+- **Fixed:** `eee7093`; re-verified in R18–R20 below.
+
+## R18 · 2026-09-17 — refusal paths and the audit rule, re-measured
+
+- **Goal:** after the P9/P10 fix, re-run the refusal half over the guarded write ops.
+- **Saw:** the refusal paths behaved **6/6** in one run and **7/7** in the other (each op refused the
+  path it was aimed at, with `E_PRECONDITION`, and nothing reached the client); **exactly one**
+  `ALLOWED-MUTATION` line per allowed op; and the token's **literal value appeared 0 times** in the
+  logs — only its 8-character fingerprint.
+- **Note (recorded because it was ambiguous before):** an op precondition that fails *after* the guard
+  allowed — empty slot, no container, cooldown, occupied cell — correctly keeps **its** allowance
+  line. "A refusal leaves no trace" applies to guard and parameter refusals only (PROTOCOL §7.2).
+
+## R19 · 2026-09-17 — P9 re-verified: both decisions
+
+- **Goal:** re-run the two shapes P9 had exposed.
+- **Saw (decision 1):** an `inv.click` whose read-back had not changed came back
+  `verdict:"notClientVerifiable"` with `skipped` **empty**, and a later read showed the change — the
+  receipt no longer claims "it did not happen".
+- **Saw (decision 2):** with the container still catching up, the refusal read `E_PRECONDITION` /
+  *"cannot determine whether slot 0 is empty …"* instead of *"slot 0 is empty"*; once the view is
+  settled, the same absent slot is refused factually again.
+- **Also:** `use.item{hand:"off"}`'s `heldBefore`/`heldAfter` report the **off hand's** item, and
+  `state.query{what:["offhand"]}` makes an off-hand dispatch checkable from the client.
+
+## R20 · 2026-09-17 — P10 re-verified, and the refusal we deliberately left alone
+
+- **Goal:** re-run `world.place` against the new read-back.
+- **Saw:** the receipt carries `blockObserved` with the block id the client sees, `placed` **is** that
+  read-back, and the verdict is `notClientVerifiable` — the unconditional "applied" claim is gone. The
+  equivalent evidence was measured in the other direction too: with an adapter that exposes no block
+  query, `placed` is `false` and `blockObserved` is `null`, so nothing is claimed either way.
+- **Left alone on purpose:** `world.place`'s pre-check still refuses an occupied cell as a
+  **client-side factual assertion** (`E_EXEC`), because world block state has **no** synchronisation
+  signal — only container contents do. Recorded as a known limitation rather than guessed at
+  (PROTOCOL §6.2c, README §9.4).
+
+### Round T · 2026-09-17 — closing acceptance, and three corrections to our review criteria
+
+- **Result:** **PASS.** The five implemented ops, the three newly guarded legacy write ops, the refusal
+  paths (**6/6** and **7/7**), the one-audit-line-per-allowance rule and the never-logged token
+  (literal value **0** occurrences) all held on a real client.
+- **Criteria corrections (all on the review side; now in PROTOCOL §6.2c):**
+  1. The **`cannot determine` message prefix is the machine-discriminable marker**: `E_PRECONDITION` is
+     the *same code* for "could not be determined" and "empty", and the error object has no other
+     discriminator. Recorded as a known limitation of the vocabulary; **no new error field** was added
+     for it.
+  2. **Judge by assertion form, not by substring.** Matching a string is what made a correct message
+     (`cannot determine whether slot 1 is empty`) look like a failure during review.
+  3. **No new `detail` field** — the free-form detail object is not part of that contract.
+
+---
+
 ## Corrections we made to our own earlier claims
 
 This section exists because the log is only trustworthy if it records the moments we changed our
@@ -200,6 +281,17 @@ minds.
    helper process; it was in fact another session's transient build, and the fix was to attribute
    processes by command line rather than to blame the run. A later audit failure was the operator
    playing a game in the background — correctly attributed as foreign activity.
+6. **We got P9's cause wrong the first time.** R16 read it as "the click picked the item up, but the
+   receipt was early". R17's join-time run — the first op after joining, with no click before it —
+   produced the same *"slot 0 is empty"* and a `state.query` one second later showed the item, so the
+   real cause is a **race with the container synchronisation window**, not the click's side effect.
+   The defect (a negative conclusion derived from an unsettled read) is unchanged; only the
+   explanation was corrected, and the fix covers both directions.
+7. **Our own review criterion was wrong twice.** We first judged the new `cannot determine` refusal by
+   asking whether its message contained the words "is empty" — but a correct message legitimately says
+   *"cannot determine whether slot 1 **is empty**"*. The criterion is now: judge by the **assertion
+   form** (the `verdict` and which verdict object is populated) and by the `cannot determine`
+   **prefix**, and **do not** add an error field for the distinction.
 
 ## Not verified, or limited by available means
 

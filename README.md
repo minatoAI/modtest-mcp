@@ -188,9 +188,9 @@ clear about what you are switching off:
 |---|---|
 | product version | `1.0.0a1` (Python/MCP server) / `1.0.0-alpha.1` (Gradle) |
 | protocol version | `modtest-bridge/1.0` (independent of the product version) |
-| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — 122,843 B, **84 entries**, sha256 `CD47C676D360260FF4087E812848A94BDC48F1FCB6310775991744BDC052DE6A`, manifest `Modtest-Guard-Variant: guarded` |
-| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 122,890 B, **84 entries**, sha256 `73C28368A6DB97CBBD55F7CB06FB2C9D45A3857245022B48E8737AD09E495421`, manifest `Modtest-Guard-Variant: unguarded` |
-| packaged `:core` classes | **67** (enforced by the `verifySelfContainedJar` guardrail) |
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
+| packaged `:core` classes | **73** (enforced by the `verifySelfContainedJar` guardrail) |
 | also inside each jar | `pack.mcmeta` (pack_format 15) and `modtest.refmap.json` (Mixin AP output) |
 
 **We do not claim byte-reproducible jars.** Building the same input twice produces different
@@ -209,11 +209,14 @@ variants were exercised:
 2. **Refusal by default, and each allowance path works**: injection is off unless the dev flag *and*
    an unexpired token are present; single-player is allowed; an **undeclared** remote host is
    refused; a host declared in `MODTEST_ALLOWED_HOSTS` is allowed and audited.
-3. **(superseded by the task-70 batch)** The five ops that used to answer `E_UNSUPPORTED`
-   (`inv.click`, `inv.toss`, `use.item`, `shot.capture`, `bench.read`) are now **implemented in
-   `:core`** and **wired in the Forge adapter**. They are no longer a refused scope decision; the
-   real-machine pass for them — and for the three older write ops that were newly brought under the
-   guard (`inv.select`, `pose.set`, `world.place`) — is the open item listed in §9.4.
+3. **The five ops are implemented and verified on a real client** (closing rounds R16–R20):
+   `inv.click`, `inv.toss`, `use.item`, `shot.capture` and `bench.read` no longer answer
+   `E_UNSUPPORTED`. They are **implemented in `:core`**, **wired in the Forge adapter**, and were
+   exercised on a real 1.20.1 client together with the three older write ops that were newly brought
+   under the guard (`inv.select`, `pose.set`, `world.place`): refusal paths behaved **6/6** and
+   **7/7**, every allowed write op left **exactly one** audit line, and the token's literal value
+   appeared **0** times in the logs. What each receipt may claim is now governed by the two rules in
+   §9.3a.
 4. **Both variants build** (4a) and the **Mixin really applies** (4b: `@At` injection resolved in
    the production (SRG) domain, zero mixin errors).
 5. **End-to-end ticket loop closes** (ticket → receipt → archive).
@@ -254,6 +257,32 @@ the change. Reporting both as "skipped" would hide a working capability; reporti
 verdict, so they cannot contradict it. **`ticks` on an `input.set` receipt is the requested hold
 length, not the number of writes performed** (the audit lines are the record of writes).
 
+### 9.3a What a receipt may claim: two rules (found as P9/P10 on a real client)
+
+Two defects, one family — a receipt asserting something the client had not actually witnessed. Both
+rules now apply to every op:
+
+1. **A negative conclusion requires a settled observation.** `verdict:"skipped"`, `slot N is empty`,
+   `no container is open` and `no item in the hand` all assert that something did **not** happen or is
+   **not** there. Container contents synchronise asynchronously (a join, a dimension change, or a
+   click/toss dispatched a moment ago), so one read that has not caught up is indistinguishable from
+   the real thing. When the adapter reports that its container view may still be catching up, the
+   receipt answers **`cannot determine`** — `E_PRECONDITION` whose message begins with that exact
+   phrase — instead of asserting emptiness, and an **unchanged** read-back is
+   **`notClientVerifiable`**, never `skipped`. That was the P9 defect: `inv.click` reported `skipped`
+   for a click that had in fact landed, which invites an agent to repeat an action that already
+   worked. `skipped` now means exactly one thing — a guard no-op. Re-read (`state.query`) to establish
+   the outcome.
+2. **A self-reported field must not exceed what the client can witness.** `world.place` reported
+   `placed:true` and `verdict:"applied"` unconditionally, derived from the request (P10). It now reads
+   its own world back: `placed` is the observed state, `blockObserved` is the block id the client sees
+   (`null` when the adapter has no block query), and the verdict is **`notClientVerifiable`**, because
+   the authority decides whether to keep the block.
+
+Also in this batch: `use.item{hand:"off"}` reports **that** hand's item in `heldBefore`/`heldAfter`,
+and `state.query{what:["offhand"]}` exposes the off hand, so an off-hand dispatch can be checked from
+the client instead of taken on trust.
+
 ### 9.4 Known limitations and things we have **not** verified
 
 * **Official-launcher byte-for-byte parity is not verified** — verification used a locally built
@@ -274,6 +303,18 @@ length, not the number of writes performed** (the audit lines are the record of 
   instead of asserting emptiness. `world.place` likewise reports `placed` from its own read-back
   (`blockObserved` carries the observed id) with verdict `notClientVerifiable` — the client's view of
   the block is not the authority's decision.
+* **`E_PRECONDITION` carries two different meanings, distinguished only by a message prefix.**
+  "This state could not be determined" and "the slot is empty" are the *same* error code; the only
+  machine-readable discriminator is that the former's message **begins with `cannot determine`**. This
+  is a recorded limitation of the error vocabulary — no new error field was added for it — so match
+  the prefix, and judge receipts by their **assertion form** (the `verdict` value and which of the
+  `applied` / `notClientVerifiable` / `skipped` objects is populated), never by whether some string
+  happens to occur in the message.
+* **World-block occupancy still has no sync signal.** Container contents now refuse with
+  `cannot determine` when the view may be stale, but there is no equivalent signal for world blocks
+  (only containers expose one), so `world.place`'s "cell is occupied" refusal remains a **client-side
+  factual assertion** about a server-authoritative world — left as-is on purpose rather than guessed
+  at. Use `blockObserved` after a placement instead of treating that pre-check as proof of absence.
 * **The off hand is observable now.** `state.query{what:["offhand"]}` reports the off-hand item and
   `use.item{hand:"off"}` reports *that* hand's item in `heldBefore`/`heldAfter`; before this, an
   off-hand use could not be checked from the client at all.

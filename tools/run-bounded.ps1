@@ -382,22 +382,36 @@ function Test-PostRunAudit {
     }
     $cpuRecovered = $true
     $memoryRecovered = $true
+    # Lead ruling: on a shared machine a teammate's concurrent process can hold CPU/memory down. When
+    # such a foreign process was actually observed (unattributedExcluded > 0), non-recovery is only an
+    # advisory note and must not fail the round on its own; with no foreign process it stays a hard
+    # gate. The orphan gate itself is NEVER relaxed.
+    $advisories = New-Object System.Collections.Generic.List[string]
+    $foreignPresent = (@($unattributed).Count -gt 0)
     if ($null -ne $BaselineSnapshot -and $null -ne $AfterSnapshot) {
         if ($BaselineSnapshot.cpuPct -ge 0 -and $AfterSnapshot.cpuPct -ge 0) {
             if ($AfterSnapshot.cpuPct -gt ($BaselineSnapshot.cpuPct + $CpuRecoveryTolerancePct)) {
-                $cpuRecovered = $false
-                $problems.Add(('system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%)' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct)) | Out-Null
+                if ($foreignPresent) {
+                    $advisories.Add(('advisory: system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%) -- not judged red because {3} unattributed process(es) were present' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct, @($unattributed).Count)) | Out-Null
+                } else {
+                    $cpuRecovered = $false
+                    $problems.Add(('system CPU did not recover: baseline {0}% -> after {1}% (tolerance {2}%)' -f $BaselineSnapshot.cpuPct, $AfterSnapshot.cpuPct, $CpuRecoveryTolerancePct)) | Out-Null
+                }
             }
         }
         if ($BaselineSnapshot.availableMB -ge 0 -and $AfterSnapshot.availableMB -ge 0) {
             if ($AfterSnapshot.availableMB -lt ($BaselineSnapshot.availableMB - $MemoryRecoveryToleranceMB)) {
-                $memoryRecovered = $false
-                $problems.Add(('available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB)' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB)) | Out-Null
+                if ($foreignPresent) {
+                    $advisories.Add(('advisory: available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB) -- not judged red because {3} unattributed process(es) were present' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB, @($unattributed).Count)) | Out-Null
+                } else {
+                    $memoryRecovered = $false
+                    $problems.Add(('available memory did not recover: baseline {0} MB -> after {1} MB (tolerance {2} MB)' -f $BaselineSnapshot.availableMB, $AfterSnapshot.availableMB, $MemoryRecoveryToleranceMB)) | Out-Null
+                }
             }
         }
     }
     return [pscustomobject]@{
-        ok = ($problems.Count -eq 0); problems = $problems.ToArray()
+        ok = ($problems.Count -eq 0); problems = $problems.ToArray(); advisories = $advisories.ToArray()
         targetGone = (-not $targetAlive); orphanCount = @($orphans).Count
         preexistingExcluded = @($preexisting).Count
         unattributedExcluded = @($unattributed).Count
@@ -543,6 +557,7 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Write-Output ('instance #{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB kill={6}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.killPerformed)
     Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} unattributedExcluded={3} cpuRecovered={4} memRecovered={5} ok={6}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.unattributedExcluded, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
     foreach ($problem in @($audit.problems)) { Write-Output ('  problem: {0}' -f $problem) }
+    foreach ($advisory in @($audit.advisories)) { Write-Output ('  note: {0}' -f $advisory) }
     if ($record.outcome -eq 'timeout-killed') { $verdict = 'FAIL:instance-timeout'; $finalExit = $EXIT_INSTANCE_TIMEOUT }
     elseif ($record.outcome -eq 'stall-killed') { $verdict = 'FAIL:instance-stall'; $finalExit = $EXIT_INSTANCE_STALL }
     if (-not $audit.ok) {

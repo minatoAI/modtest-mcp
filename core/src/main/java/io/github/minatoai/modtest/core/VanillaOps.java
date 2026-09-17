@@ -205,27 +205,33 @@ public final class VanillaOps {
                 settled = c.settled();
             }
 
-            // Read back ONLY now — after the settle loop, never from the instantaneous value.
-            double ax = c.x();
-            double ay = c.y();
-            double az = c.z();
-            float ayaw = c.yaw();
-            float apitch = c.pitch();
+            // A single reading is NOT evidence: on a real client the authority published its own pose
+            // AFTER the settle window (round D/E: the receipt said five fields applied while z never
+            // moved). Take two independent readings one tick apart and trust a field only when both
+            // agree — otherwise it is "not confirmed stable".
+            Reading first = reading(c);
+            c.waitFrames(1);
+            Reading second = reading(c);
+            boolean confirmed = first.sameAs(second);
             JsonObject pose = Json.object();
-            pose.addProperty("x", ax);
-            pose.addProperty("y", ay);
-            pose.addProperty("z", az);
-            pose.addProperty("yaw", ayaw);
-            pose.addProperty("pitch", apitch);
+            pose.addProperty("x", second.x());
+            pose.addProperty("y", second.y());
+            pose.addProperty("z", second.z());
+            pose.addProperty("yaw", second.yaw());
+            pose.addProperty("pitch", second.pitch());
 
             JsonObject applied = Json.object();
             JsonObject skipped = Json.object();
             if (settled) {
-                compare(applied, skipped, "x", rx, ax, COORD_EPS, integrated);
-                compare(applied, skipped, "y", ry, ay, COORD_EPS, integrated);
-                compare(applied, skipped, "z", rz, az, COORD_EPS, integrated);
-                compare(applied, skipped, "yaw", ryaw, ayaw, ANGLE_EPS, integrated);
-                compare(applied, skipped, "pitch", rpitch, apitch, ANGLE_EPS, integrated);
+                // Per field: confirmed by two equal readings AND matching the request => applied.
+                // Anything else is skipped, and the reason says which of the two failed. Position
+                // therefore defaults to "skipped" even in single-player, because the integrated
+                // server is authoritative and its update can land after any single reading.
+                compare(applied, skipped, "x", rx, first.x(), second.x(), COORD_EPS, integrated);
+                compare(applied, skipped, "y", ry, first.y(), second.y(), COORD_EPS, integrated);
+                compare(applied, skipped, "z", rz, first.z(), second.z(), COORD_EPS, integrated);
+                compare(applied, skipped, "yaw", ryaw, first.yaw(), second.yaw(), ANGLE_EPS, integrated);
+                compare(applied, skipped, "pitch", rpitch, first.pitch(), second.pitch(), ANGLE_EPS, integrated);
             } else {
                 // Nothing may be reported as applied when the pose never settled.
                 notSettled(skipped, "x", rx);
@@ -240,7 +246,7 @@ public final class VanillaOps {
             // own note said the server owns the position).
             String note = (integrated
                     ? "single-player: the integrated server is authoritative too, so a field is reported "
-                            + "as applied only after the pose settled"
+                            + "as applied only after two independent readings agree"
                     : "multiplayer: the server owns the player position; position fields that did not "
                             + "settle are reported under skipped")
                     + (settled
@@ -253,6 +259,7 @@ public final class VanillaOps {
             JsonObject out = Json.object();
             out.add("pose", pose);
             out.addProperty("settled", settled);
+            out.addProperty("confirmed", settled && confirmed);
             out.add("applied", applied);
             out.add("skipped", skipped);
             out.addProperty("authority", integrated ? "client" : "server");
@@ -260,14 +267,36 @@ public final class VanillaOps {
             return out;
         }
 
+        /** Two of these must agree before any field is trusted; a single reading is not evidence. */
+        private record Reading(double x, double y, double z, float yaw, float pitch) {
+            boolean sameAs(Reading other) {
+                return Math.abs(x - other.x) <= COORD_EPS
+                        && Math.abs(y - other.y) <= COORD_EPS
+                        && Math.abs(z - other.z) <= COORD_EPS
+                        && Math.abs(yaw - other.yaw) <= ANGLE_EPS
+                        && Math.abs(pitch - other.pitch) <= ANGLE_EPS;
+            }
+        }
+
+        private static Reading reading(ClientModel c) {
+            return new Reading(c.x(), c.y(), c.z(), c.yaw(), c.pitch());
+        }
+
         private static void compare(JsonObject applied, JsonObject skipped, String field, double requested,
-                                    double actual, double eps, boolean integrated) {
-            if (Math.abs(requested - actual) <= eps) {
-                applied.addProperty(field, actual);
+                                    double first, double second, double eps, boolean integrated) {
+            if (Math.abs(first - second) > eps) {
+                JsonObject s = Json.object();
+                s.addProperty("requested", requested);
+                s.addProperty("actual", second);
+                s.addProperty("firstReading", first);
+                s.addProperty("reason", "not confirmed stable");
+                skipped.add(field, s);
+            } else if (Math.abs(requested - second) <= eps) {
+                applied.addProperty(field, second);
             } else {
                 JsonObject s = Json.object();
                 s.addProperty("requested", requested);
-                s.addProperty("actual", actual);
+                s.addProperty("actual", second);
                 s.addProperty("reason", integrated ? "did not take effect" : "server-authoritative position");
                 skipped.add(field, s);
             }

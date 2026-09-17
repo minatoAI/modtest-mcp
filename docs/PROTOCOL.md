@@ -329,25 +329,28 @@ case — MUST report what actually happened: `applied:{field: value}` and
 `ok:true` keeps meaning "the op executed" (§6.2a) and never implies "every requested field took
 effect".
 
-**`applied` MUST come from a settled read-back — never from the value read immediately after the
-request.** The transient value a client sets exists only locally and for an instant; the authority
-publishes the real pose on a later tick. A receipt that reported five applied fields while the
-position never moved (real-machine, round D/E) was produced exactly that way. Rules:
+**Position is never reported as `applied`.** Whenever a server authority exists — which includes a
+single-player world, whose **integrated server is authoritative too** — `x`/`y`/`z` are **always**
+reported under `skipped` with `reason: "server-authoritative position"`, and `applied` is reserved for
+fields the client genuinely owns (measured on a real client: **rotation only**). The receipt's `note`
+says so: *"client position readings cannot be authoritative; position is owned by the server"*.
 
-* take **two independent readings one tick apart** and report a field as `applied` **only** when both
-  readings agree *and* match the request (within a small epsilon); a single reading is not evidence,
-  because the authority's update can land after the settle window (measured: ~0.5 s after
-  `pose.set`). Fields whose two readings differ go to `skipped` with `reason: "not confirmed stable"`
-  and carry `firstReading` alongside `requested`/`actual`; the receipt also carries
-  `confirmed: <bool>` for the verdict as a whole;
-* wait **≥ 1 client tick** before the first reading; a remote session gets a longer bounded budget for
-  the server round trip;
+This is deliberately **not** derived from any read-back, because a read-back cannot establish
+authority: the authority's update lands later than the settle window (measured: the pose is pulled
+back **< 0.57 s** after `pose.set`, while consecutive readings are only ~50 ms apart), so **even two
+agreeing readings can both be the transient local value** (round 12: a receipt claimed five applied
+fields with `dz = -4e-15`). Increasing the number of readings does not help; the window is simply
+shorter than the revert delay. Rules for ops that report what took effect:
+
+* fields the client owns (rotation) may be reported as `applied` when the settled value matches the
+  request; a remote session gets a longer bounded budget for the server round trip;
 * if the pose did not settle in the budget, **nothing** may be reported as applied: every requested
   field goes to `skipped` with `reason: "not settled"`;
-* **position defaults to `skipped`** whenever an authority owns it — including single-player, whose
-  integrated server is authoritative — so only client-side rotation is typically confirmed;
+* every skipped field carries `requested` + `actual` + `reason`;
 * `authority` and `note` are derived from the same verdict as `applied`/`skipped`, so they cannot
-  contradict it.
+  contradict it;
+* **when in doubt, report `skipped`.** An honest "not applied / cannot be determined" is required;
+  an `applied` that turns out to be false is a defect.
 
 **Authority is not "single-player vs multiplayer".** A single-player world's **integrated server is
 authoritative too**: client-side `moveTo` values are overwritten by the next authoritative update, so

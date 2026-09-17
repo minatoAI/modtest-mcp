@@ -271,7 +271,10 @@ class ProductionWiringAndPartialApplyTest {
     }
 
     @Test
-    void poseSetReportsEverythingAppliedOnASingleplayerWorld() {
+    void singlePlayerPositionIsStillReportedAsSkippedAndRotationAsApplied() {
+        // Round 12 proved this the hard way: a single-player world's integrated server is
+        // authoritative too, so even a client that holds the requested position may be reverted by
+        // the authority later. Position is therefore never reported as applied; rotation is.
         RubberBandingClient client = new RubberBandingClient() {
             @Override
             public void teleport(double nx, double ny, double nz, float nyaw, float npitch, int settleMs) {
@@ -286,12 +289,16 @@ class ProductionWiringAndPartialApplyTest {
                 new Protocol.Ticket.Op("p1", "pose.set", poseParams(), null, null, null), ctx(client, true));
 
         JsonObject applied = out.getAsJsonObject("applied");
-        for (String f : List.of("x", "y", "z", "yaw", "pitch")) {
-            assertTrue(applied.has(f), f + " must be applied in single-player: " + out);
+        JsonObject skipped = out.getAsJsonObject("skipped");
+        for (String f : List.of("x", "y", "z")) {
+            assertFalse(applied.has(f), f + " must never be applied: " + out);
+            assertEquals("server-authoritative position",
+                    skipped.getAsJsonObject(f).get("reason").getAsString(), out.toString());
         }
-        assertEquals(0, out.getAsJsonObject("skipped").size(), "nothing may be skipped on a client-authoritative world");
+        assertTrue(applied.has("yaw") && applied.has("pitch"),
+                "rotation is client-authoritative and must be applied: " + out);
         assertEquals("client", out.get("authority").getAsString());
-        assertEquals(12.0, out.getAsJsonObject("pose").get("z").getAsDouble(), 1e-6,
-                "single-player: the requested position is the real position");
+        assertTrue(out.get("note").getAsString().contains("client position readings cannot be authoritative"),
+                out.toString());
     }
 }

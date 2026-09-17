@@ -205,14 +205,11 @@ public final class VanillaOps {
                 settled = c.settled();
             }
 
-            // A single reading is NOT evidence: on a real client the authority published its own pose
-            // AFTER the settle window (round D/E: the receipt said five fields applied while z never
-            // moved). Take two independent readings one tick apart and trust a field only when both
-            // agree — otherwise it is "not confirmed stable".
-            Reading first = reading(c);
-            c.waitFrames(1);
+            // Position is NEVER judged from a client reading: the authority publishes its own pose
+            // after the settle window (measured: < 0.57 s after pose.set), so any reading taken inside
+            // the window — even two identical ones — can be the transient local value. Only
+            // client-authoritative rotation is decided from the read-back.
             Reading second = reading(c);
-            boolean confirmed = first.sameAs(second);
             JsonObject pose = Json.object();
             pose.addProperty("x", second.x());
             pose.addProperty("y", second.y());
@@ -223,15 +220,15 @@ public final class VanillaOps {
             JsonObject applied = Json.object();
             JsonObject skipped = Json.object();
             if (settled) {
-                // Per field: confirmed by two equal readings AND matching the request => applied.
-                // Anything else is skipped, and the reason says which of the two failed. Position
-                // therefore defaults to "skipped" even in single-player, because the integrated
-                // server is authoritative and its update can land after any single reading.
-                compare(applied, skipped, "x", rx, first.x(), second.x(), COORD_EPS, integrated);
-                compare(applied, skipped, "y", ry, first.y(), second.y(), COORD_EPS, integrated);
-                compare(applied, skipped, "z", rz, first.z(), second.z(), COORD_EPS, integrated);
-                compare(applied, skipped, "yaw", ryaw, first.yaw(), second.yaw(), ANGLE_EPS, integrated);
-                compare(applied, skipped, "pitch", rpitch, first.pitch(), second.pitch(), ANGLE_EPS, integrated);
+                // x/y/z are owned by the authority on BOTH session types (a single-player world's
+                // integrated server included) => always skipped, never "applied". A window-internal
+                // read-back cannot prove anything about them.
+                serverOwned(skipped, "x", rx, second.x());
+                serverOwned(skipped, "y", ry, second.y());
+                serverOwned(skipped, "z", rz, second.z());
+                // Rotation is client-authoritative, so it may legitimately be reported as applied.
+                compareApplied(applied, skipped, "yaw", ryaw, second.yaw(), ANGLE_EPS, integrated);
+                compareApplied(applied, skipped, "pitch", rpitch, second.pitch(), ANGLE_EPS, integrated);
             } else {
                 // Nothing may be reported as applied when the pose never settled.
                 notSettled(skipped, "x", rx);
@@ -245,10 +242,9 @@ public final class VanillaOps {
             // contradict it (a real receipt once claimed every position field was applied while its
             // own note said the server owns the position).
             String note = (integrated
-                    ? "single-player: the integrated server is authoritative too, so a field is reported "
-                            + "as applied only after two independent readings agree"
-                    : "multiplayer: the server owns the player position; position fields that did not "
-                            + "settle are reported under skipped")
+                    ? "single-player: the integrated server is authoritative too"
+                    : "multiplayer: the server owns the player position")
+                    + "; client position readings cannot be authoritative; position is owned by the server"
                     + (settled
                             ? (applied.size() == FIELDS.size()
                                     ? "; every requested field took effect"
@@ -259,7 +255,6 @@ public final class VanillaOps {
             JsonObject out = Json.object();
             out.add("pose", pose);
             out.addProperty("settled", settled);
-            out.addProperty("confirmed", settled && confirmed);
             out.add("applied", applied);
             out.add("skipped", skipped);
             out.addProperty("authority", integrated ? "client" : "server");
@@ -267,36 +262,31 @@ public final class VanillaOps {
             return out;
         }
 
-        /** Two of these must agree before any field is trusted; a single reading is not evidence. */
+        /** A pose snapshot; its position fields are informational only (the authority owns them). */
         private record Reading(double x, double y, double z, float yaw, float pitch) {
-            boolean sameAs(Reading other) {
-                return Math.abs(x - other.x) <= COORD_EPS
-                        && Math.abs(y - other.y) <= COORD_EPS
-                        && Math.abs(z - other.z) <= COORD_EPS
-                        && Math.abs(yaw - other.yaw) <= ANGLE_EPS
-                        && Math.abs(pitch - other.pitch) <= ANGLE_EPS;
-            }
         }
 
         private static Reading reading(ClientModel c) {
             return new Reading(c.x(), c.y(), c.z(), c.yaw(), c.pitch());
         }
 
-        private static void compare(JsonObject applied, JsonObject skipped, String field, double requested,
-                                    double first, double second, double eps, boolean integrated) {
-            if (Math.abs(first - second) > eps) {
-                JsonObject s = Json.object();
-                s.addProperty("requested", requested);
-                s.addProperty("actual", second);
-                s.addProperty("firstReading", first);
-                s.addProperty("reason", "not confirmed stable");
-                skipped.add(field, s);
-            } else if (Math.abs(requested - second) <= eps) {
-                applied.addProperty(field, second);
+        /** Position is reported as skipped by construction: the server owns it on every session type. */
+        private static void serverOwned(JsonObject skipped, String field, double requested, double observed) {
+            JsonObject s = Json.object();
+            s.addProperty("requested", requested);
+            s.addProperty("actual", observed);
+            s.addProperty("reason", "server-authoritative position");
+            skipped.add(field, s);
+        }
+
+        private static void compareApplied(JsonObject applied, JsonObject skipped, String field, double requested,
+                                           double actual, double eps, boolean integrated) {
+            if (Math.abs(requested - actual) <= eps) {
+                applied.addProperty(field, actual);
             } else {
                 JsonObject s = Json.object();
                 s.addProperty("requested", requested);
-                s.addProperty("actual", second);
+                s.addProperty("actual", actual);
                 s.addProperty("reason", integrated ? "did not take effect" : "server-authoritative position");
                 skipped.add(field, s);
             }

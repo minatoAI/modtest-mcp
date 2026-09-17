@@ -13,19 +13,21 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * slice 1 of task-66: the pose verdict must be confirmed by TWO independent readings.
+ * task-66 P5 hardening: position is never judged from a client reading.
  *
- * <p>Real-machine measurement: the position set by {@code pose.set} is pulled back by the authority
- * within ~0.5 s, i.e. <b>after</b> the settle window the previous version read in — so a single
- * read-back still caught the transient value and reported "applied". The fake below reverts on tick 5,
- * later than any single read the previous implementation took, so this test <b>fails against it</b>.
+ * <p>The previous slice required two agreeing readings, which is <b>not</b> authority evidence: the
+ * authority pulls the pose back in &lt; 0.57 s (round 11), while two readings are only ~50 ms apart, so
+ * both can land before the revert and agree on the transient value (round 12: {@code confirmed:true},
+ * five fields applied, {@code dz=-4e-15}). The fake below therefore returns the <b>requested</b>
+ * values for the first two readings and only reverts after them — the timing that broke that logic —
+ * and the assertions require position to be skipped anyway.
  */
 class PoseLateRevertTest {
 
     private static final long NOW = 1_700_000_000_000L;
     private static final Bridge.Clock CLOCK = Bridge.Clock.fixed(NOW);
 
-    /** Transient pose visible until tick 5, then the authority publishes its own pose again. */
+    /** Requested pose visible past both readings; the authority publishes its own pose at tick 6. */
     static class LateRevertClient implements ClientModel {
         private final double sx;
         private final double sy;
@@ -35,15 +37,12 @@ class PoseLateRevertTest {
         private double z;
         private float yaw;
         private float pitch;
-        private int transientTicks;
         private int elapsed;
-        private final boolean sticks;
 
-        LateRevertClient(double sx, double sy, double sz, boolean sticks) {
+        LateRevertClient(double sx, double sy, double sz) {
             this.sx = sx;
             this.sy = sy;
             this.sz = sz;
-            this.sticks = sticks;
             this.x = sx;
             this.y = sy;
             this.z = sz;
@@ -86,29 +85,29 @@ class PoseLateRevertTest {
 
         @Override
         public void teleport(double nx, double ny, double nz, float nyaw, float npitch, int settleMs) {
-            x = nx;
+            x = nx;                 // the transient value an in-window reading sees
             y = ny;
             z = nz;
-            yaw = nyaw;
+            yaw = nyaw;             // client-authoritative: survives the authority's update
             pitch = npitch;
-            transientTicks = sticks ? 0 : 5;   // the authority pulls the position back at tick 5
+            elapsed = 0;
         }
 
         @Override
         public void waitFrames(int frames) {
             for (int i = 0; i < frames; i++) {
                 elapsed++;
-                if (transientTicks > 0 && --transientTicks == 0) {
+                if (elapsed >= 6) {   // later than BOTH readings of the previous implementation
                     x = sx;
                     y = sy;
-                    z = sz;   // rotation is client-side and survives
+                    z = sz;
                 }
             }
         }
 
         @Override
         public boolean settled() {
-            return elapsed >= 4;   // the settle window the previous implementation trusted
+            return elapsed >= 4;      // the settle window the previous implementation trusted
         }
 
         @Override
@@ -164,9 +163,8 @@ class PoseLateRevertTest {
         }
     }
 
-    /** x=3/y=71/z=12 sticks; the (2000,121,12) request below does not. */
     private static final JsonObject REQUEST = JsonParser.parseString(
-            "{\"x\":2000,\"y\":121,\"z\":12,\"yaw\":0,\"pitch\":0}").getAsJsonObject();
+            "{\"x\":2000,\"y\":121,\"z\":12,\"yaw\":180,\"pitch\":0}").getAsJsonObject();
 
     private static JsonObject poseSet(ClientModel client, boolean singleplayer) {
         Bridge.BridgeConfig cfg = new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test",
@@ -179,42 +177,35 @@ class PoseLateRevertTest {
                 new Protocol.Ticket.Op("p1", "pose.set", REQUEST, null, null, null), ctx);
     }
 
-    @Test
-    void aRevertAfterTheSettleWindowIsNotReportedAsApplied() {
-        // Single-player: the integrated server is authoritative too (real run D).
-        JsonObject out = poseSet(new LateRevertClient(3.0, 71.0, 10.699965724359156, false), true);
-
-        assertEquals(false, out.get("confirmed").getAsBoolean(),
-                "a value that changed between the two readings is not confirmed: " + out);
+    private static void assertPositionAlwaysSkipped(JsonObject out, String authority) {
         JsonObject applied = out.getAsJsonObject("applied");
         JsonObject skipped = out.getAsJsonObject("skipped");
         for (String f : List.of("x", "y", "z")) {
-            assertFalse(applied.has(f), f + " must not be applied (single reading was the transient one): " + out);
+            assertFalse(applied.has(f), f + " must never be applied (the server owns position): " + out);
             assertTrue(skipped.has(f), out.toString());
-            assertEquals("not confirmed stable", skipped.getAsJsonObject(f).get("reason").getAsString(),
-                    out.toString());
-            assertTrue(skipped.getAsJsonObject(f).has("firstReading"), out.toString());
+            assertEquals("server-authoritative position",
+                    skipped.getAsJsonObject(f).get("reason").getAsString(), out.toString());
         }
-        assertTrue(out.get("note").getAsString().contains("two independent readings agree"), out.toString());
+        assertFalse(out.has("confirmed"),
+                "the misleading 'confirmed' field must be gone: " + out);
+        assertTrue(out.get("note").getAsString().contains("client position readings cannot be authoritative"),
+                out.toString());
+        assertEquals(authority, out.get("authority").getAsString());
     }
 
     @Test
-    void aPoseConfirmedByTwoEqualReadingsIsReportedAsApplied() {
-        // The request matches the authoritative pose, so nothing pulls it back: two readings agree.
-        JsonObject request = JsonParser.parseString(
-                "{\"x\":3,\"y\":71,\"z\":12,\"yaw\":0,\"pitch\":0}").getAsJsonObject();
-        LateRevertClient client = new LateRevertClient(3.0, 71.0, 12.0, true);
-        Bridge.BridgeConfig cfg = new Bridge.BridgeConfig(Path.of("."), 500L, "exec-test",
-                "1.0.0-alpha.1", true, Bridge.BusyPolicy.ANSWER_BUSY, 64);
-        JsonObject out = new VanillaOps.PoseOps().handle(new Protocol.Ticket.Op("p1", "pose.set", request,
-                        null, null, null),
-                new Executor.ExecContext(cfg, Guard.SessionState.singleplayer(),
-                        new Guard.ActivationState(true, new Guard.ActivationToken("tok", NOW + 60_000L)),
-                        CLOCK, Map.of("allow-mutate", true), client));
+    void positionIsNotAppliedEvenWhenBothReadingsSeeTheRequestedValue() {
+        // Single-player (round 12): the receipt said every field applied while z never moved.
+        JsonObject out = poseSet(new LateRevertClient(3.0, 71.0, 2.851360022260494), true);
+        assertPositionAlwaysSkipped(out, "client");
+        // Rotation IS client-authoritative, so the requested 180° is legitimately applied.
+        assertTrue(out.getAsJsonObject("applied").has("yaw"), out.toString());
+    }
 
-        assertEquals(true, out.get("confirmed").getAsBoolean(), out.toString());
-        assertEquals(5, out.getAsJsonObject("applied").size(), out.toString());
-        assertEquals(0, out.getAsJsonObject("skipped").size(), out.toString());
-        assertTrue(out.get("note").getAsString().contains("every requested field took effect"), out.toString());
+    @Test
+    void positionIsSkippedOnARemoteSessionToo() {
+        JsonObject out = poseSet(new LateRevertClient(-4.5, 70.0, 7.1018), false);
+        assertPositionAlwaysSkipped(out, "server");
+        assertTrue(out.getAsJsonObject("applied").has("yaw"), out.toString());
     }
 }

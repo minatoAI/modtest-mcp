@@ -149,7 +149,7 @@ class PoseLateRevertTest {
         }
 
         @Override
-        public void placeBlock(int bx, int by, int bz, String block) {
+        public void useItemOnBlock(int bx, int by, int bz, String block) {
         }
 
         @Override

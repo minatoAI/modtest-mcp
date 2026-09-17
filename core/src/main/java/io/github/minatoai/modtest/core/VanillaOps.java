@@ -1148,7 +1148,23 @@ public final class VanillaOps {
                 throw new Protocol.ProtocolException(Protocol.ErrorCode.E_EXEC,
                         "cell (" + x + "," + y + "," + z + ") is occupied");
             }
-            c.placeBlock(x, y, z, block);
+            // P11: a real placement uses the item the player is holding, so an empty hand is an honest
+            // precondition failure — the op must not conjure the block into the world (and, per the P9
+            // rule, an empty read inside the container sync window is not evidence of an empty hand).
+            String held = c.heldItemId();
+            if (held == null || held.isBlank()) {
+                boolean unsynced = c.containerSyncPending();
+                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                        unsynced
+                                ? "cannot determine whether the selected slot holds " + block + ": the "
+                                        + "inventory has not caught up with the authority yet"
+                                : "no item in the selected slot: a real placement needs " + block
+                                        + " in hand, and world.place now goes through the "
+                                        + "player-interaction path, so it cannot place a block the player "
+                                        + "is not holding")
+                        .with("reason", unsynced ? "container-not-synced" : "empty-hand");
+            }
+            c.useItemOnBlock(x, y, z, block);
             // P10: `placed` used to be an unconditional `true` — a self-report derived from the request,
             // which is exactly the class of claim this protocol forbids. It is now the client's own
             // read-back of its world, and the verdict says who owns the outcome.

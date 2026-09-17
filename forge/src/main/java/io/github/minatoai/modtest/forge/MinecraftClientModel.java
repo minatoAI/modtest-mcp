@@ -2,17 +2,27 @@ package io.github.minatoai.modtest.forge;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.platform.NativeImage;
+import io.github.minatoai.modtest.core.BlockIds;
 import io.github.minatoai.modtest.core.ClientModel;
 import io.github.minatoai.modtest.core.Protocol;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -210,9 +220,23 @@ public final class MinecraftClientModel implements ClientModel {
         player().releaseUsingItem();
     }
 
+    /**
+     * Select a hotbar slot <b>the way the hotbar keys do</b>: set the local index <i>and</i> tell the
+     * server.
+     *
+     * <p>Audited as part of P11 (same family: a direct state write that skips the real path). Setting
+     * {@code inventory.selected} alone leaves the server on the old slot — the server learns the carried
+     * slot only from {@code ServerboundSetCarriedItemPacket} (its listener method is
+     * {@code handleSetCarriedItem}), and the vanilla key path sends exactly that packet. That divergence
+     * was also a correctness bug for the new {@code world.place}: the server decides <i>which item is in
+     * hand</i> from its own view, so an unsynced selection would place the wrong item or refuse.
+     */
     @Override
     public void selectSlot(int slot) {
         player().getInventory().selected = slot;
+        if (mc.getConnection() != null) {
+            mc.getConnection().send(new ServerboundSetCarriedItemPacket(slot));
+        }
     }
 
     /**
@@ -348,19 +372,102 @@ public final class MinecraftClientModel implements ClientModel {
         return net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(state.getBlock()).toString();
     }
 
+    /**
+     * Place through the <b>real player interaction path</b> (P11).
+     *
+     * <p>The mod used to write the world directly ({@code ClientLevel#setBlockAndUpdate}). That skips the
+     * interaction entirely: the server never runs its placement path, so Forge events, KubeJS
+     * {@code BlockEvents.placed}, protection plugins and anti-cheat all see nothing — measured on a real
+     * client, where {@code BlockEvents.placed} did not fire (the event type existed, the handler was
+     * registered, and a positive control did fire, so this was the interaction, not the event).
+     *
+     * <p>This method instead does what a player's right-click does: take the item in the selected slot,
+     * aim at the face of a neighbouring block, and call {@link MultiPlayerGameMode#useItemOn} — which
+     * predicts locally and sends {@code ServerboundUseItemOnPacket}, so the server runs
+     * {@code ServerPlayerGameMode.useItemOn} (registered as {@code handleUseItemOn} on the server
+     * listener).
+     *
+     * <p>The consequences are enforced, not hidden: no item in the selected slot, a held item whose block
+     * is not the requested one, a target that cannot be replaced, no supporting neighbour, or a target
+     * outside {@link IForgePlayer#getBlockReach()} are all honest {@code E_PRECONDITION} refusals. The
+     * block is never conjured into the world.
+     */
     @Override
-    public void placeBlock(int x, int y, int z, String block) {
-        // Honour the requested block instead of silently placing stone: the ticket contract says
-        // `world.place {block}`, so an unknown id is an error, not a substitution.
-        String id = io.github.minatoai.modtest.core.BlockIds.normalize(block);
-        net.minecraft.world.level.block.Block target =
-                net.minecraftforge.registries.ForgeRegistries.BLOCKS.getValue(
-                        net.minecraft.resources.ResourceLocation.tryParse(id));
-        if (target == null || target == Blocks.AIR) {
-            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_BAD_PARAMS,
-                    "unknown block: " + id);
+    public void useItemOnBlock(int x, int y, int z, String block) {
+        LocalPlayer p = player();
+        String id = BlockIds.normalize(block);
+
+        ItemStack held = p.getMainHandItem();
+        if (held.isEmpty()) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "no item in the selected slot: a real placement needs " + id + " in hand")
+                    .with("reason", "empty-hand");
         }
-        player().level().setBlockAndUpdate(new BlockPos(x, y, z), target.defaultBlockState());
+        if (!(held.getItem() instanceof BlockItem blockItem)) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "the selected slot holds " + itemIdOf(held) + ", which is not a placeable block: "
+                            + "world.place can only place the item the player is holding")
+                    .with("reason", "held-item-not-a-block");
+        }
+        String heldBlockId = blockIdOf(blockItem.getBlock());
+        if (!heldBlockId.equals(id)) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "the selected slot holds " + itemIdOf(held) + " (" + heldBlockId + "), not " + id
+                            + ": a real placement can only place the item in hand — select the slot that "
+                            + "holds " + id + " first")
+                    .with("reason", "held-item-mismatch");
+        }
+
+        BlockPos target = new BlockPos(x, y, z);
+        Level level = p.level();
+        BlockState targetState = level.getBlockState(target);
+        if (!targetState.canBeReplaced()) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "the target cell is occupied by " + blockIdOf(targetState.getBlock())
+                            + " and cannot be replaced")
+                    .with("reason", "target-not-replaceable");
+        }
+
+        // Aim at the face of a neighbouring solid block, exactly like a player standing next to it.
+        double reach = p.getBlockReach();
+        BlockPos support = null;
+        Direction face = null;
+        boolean anySolidNeighbour = false;
+        for (Direction direction : Direction.values()) {
+            BlockPos candidate = target.relative(direction.getOpposite());
+            if (level.getBlockState(candidate).isAir()) {
+                continue;
+            }
+            anySolidNeighbour = true;
+            if (!p.canReach(Vec3.atCenterOf(candidate).relative(direction, 0.5), reach)) {
+                continue;   // this face is too far; another one may still be in range
+            }
+            support = candidate;
+            face = direction;
+            break;
+        }
+        if (support == null) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    anySolidNeighbour
+                            ? "the target cell is out of block reach (" + reach + " blocks): a real "
+                                    + "placement has to be aimed at from where the player stands"
+                            : "the target cell has no neighbouring block to place against")
+                    .with("reason", anySolidNeighbour ? "out-of-reach" : "no-support");
+        }
+
+        Vec3 hitPoint = Vec3.atCenterOf(support).relative(face, 0.5);
+        mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND,
+                new BlockHitResult(hitPoint, face, support, false));
+    }
+
+    private static String itemIdOf(ItemStack stack) {
+        ResourceLocation key = net.minecraftforge.registries.ForgeRegistries.ITEMS.getKey(stack.getItem());
+        return key == null ? "(unregistered)" : key.toString();
+    }
+
+    private static String blockIdOf(Block block) {
+        ResourceLocation key = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(block);
+        return key == null ? "(unregistered)" : key.toString();
     }
 
     // ---- frame telemetry ------------------------------------------------------------------------

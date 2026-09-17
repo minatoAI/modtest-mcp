@@ -959,7 +959,7 @@ class WiredOpsTest {
         }
 
         @Override
-        public void placeBlock(int x, int y, int z, String block) {
+        public void useItemOnBlock(int x, int y, int z, String block) {
         }
 
         @Override
@@ -1169,6 +1169,7 @@ class WiredOpsTest {
     @Test
     void p10APlacementTheClientCannotWitnessIsNotReportedAsApplied() {
         NoBlockQueryClient client = new NoBlockQueryClient();
+        client.held = "minecraft:oak_planks";   // P11: the block has to be in hand
         List<String> audit = new ArrayList<>();
 
         JsonObject out = result(run(fail("world.place",
@@ -1176,6 +1177,7 @@ class WiredOpsTest {
                 ctx(client, Guard.SessionState.singleplayer(), audit, armed())));
 
         assertEquals(1, client.placed.size(), "the placement was dispatched");
+        assertEquals(1, client.useItemOnCalls, "and through the interaction entry");
         // The old code wrote `placed:true, verdict:"applied"` unconditionally — a self-report with no
         // witness at all. Nothing here may claim the block is there.
         assertEquals(false, out.get("placed").getAsBoolean(),
@@ -1192,6 +1194,7 @@ class WiredOpsTest {
     @Test
     void p10APlacementTheClientCanReadBackReportsTheBlockItObserved() {
         FakeClient client = new FakeClient();
+        client.held = "minecraft:oak_planks";   // P11: the block has to be in hand
 
         JsonObject out = result(run(fail("world.place",
                 "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), client));
@@ -1201,6 +1204,75 @@ class WiredOpsTest {
         assertEquals("notClientVerifiable", out.get("verdict").getAsString(),
                 "the client's own view is not the authority's decision: " + out);
         assertEquals(0, out.getAsJsonObject("applied").size(), out.toString());
+    }
+
+    // ================================================================ P11: like a player, or not at all
+
+    @Test
+    void p11WorldPlaceGoesThroughThePlayerInteractionEntryAndNeverWritesTheWorldDirectly() {
+        FakeClient client = new FakeClient();
+        client.held = "minecraft:oak_planks";
+        List<String> audit = new ArrayList<>();
+
+        JsonObject out = result(run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"),
+                ctx(client, Guard.SessionState.singleplayer(), audit, armed())));
+
+        assertEquals(1, client.useItemOnCalls,
+                "world.place must go through the interaction entry, like a right-click: " + out);
+        assertEquals(0, client.directPlaceCalls,
+                "P11: it must NOT write the world directly — that is why no KubeJS BlockEvents.placed "
+                        + "fired on a real client: " + out);
+        assertEquals(1, audit.size(), "exactly one allowance line: " + audit);
+        assertTrue(audit.get(0).startsWith("ALLOWED-MUTATION"), audit.get(0));
+        assertEquals("8", String.valueOf(audit.get(0).split("token=")[1].split("\\s")[0].length()),
+                "the fingerprint stays 8 characters: " + audit.get(0));
+        assertEquals(0, out.getAsJsonObject("skipped").size(), out.toString());
+    }
+
+    @Test
+    void p11WorldPlaceWithoutTheBlockInHandIsRefusedHonestlyInsteadOfConjuringIt() {
+        FakeClient client = new FakeClient();
+        client.held = "";   // nothing in the selected slot
+
+        Protocol.Receipt r = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("in hand"), only(r).error().message());
+        assertEquals("empty-hand", only(r).error().detail().get("reason").getAsString());
+        assertEquals(0, client.useItemOnCalls, "nothing may be placed");
+        assertEquals(0, client.directPlaceCalls, "and certainly not conjured");
+        assertTrue(client.placed.isEmpty(), "the world must be untouched: " + client.placed);
+    }
+
+    @Test
+    void p11WorldPlaceWithADifferentItemInHandIsRefusedByTheInteractionPath() {
+        FakeClient client = new FakeClient();
+        client.held = "minecraft:stone";   // the ticket asks for oak_planks
+
+        Protocol.Receipt r = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("not minecraft:oak_planks"),
+                only(r).error().message());
+        assertEquals(0, client.directPlaceCalls, "a wrong item must not become a direct write");
+        assertTrue(client.placed.isEmpty(), "the world must be untouched: " + client.placed);
+    }
+
+    @Test
+    void p11AnUnsyncedInventoryIsNotReportedAsAnEmptyHandForWorldPlace() {
+        NotYetSyncedClient client = new NotYetSyncedClient();
+        client.held = "";
+
+        Protocol.Receipt r = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertTrue(only(r).error().message().contains("cannot determine"), only(r).error().message());
+        assertEquals("container-not-synced", only(r).error().detail().get("reason").getAsString());
+        assertTrue(client.placed.isEmpty(), client.placed.toString());
     }
 
     // ================================================================ the corrected audit rule

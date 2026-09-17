@@ -257,10 +257,10 @@ the change. Reporting both as "skipped" would hide a working capability; reporti
 verdict, so they cannot contradict it. **`ticks` on an `input.set` receipt is the requested hold
 length, not the number of writes performed** (the audit lines are the record of writes).
 
-### 9.3a What a receipt may claim: two rules (found as P9/P10 on a real client)
+### 9.3a What a receipt may claim: three rules (found as P9/P10/P11 on a real client)
 
-Two defects, one family — a receipt asserting something the client had not actually witnessed. Both
-rules now apply to every op:
+Defects of one family — a receipt, or a write, that asserts more than the client actually did. All
+three rules now apply to every op:
 
 1. **A negative conclusion requires a settled observation.** `verdict:"skipped"`, `slot N is empty`,
    `no container is open` and `no item in the hand` all assert that something did **not** happen or is
@@ -278,6 +278,16 @@ rules now apply to every op:
    its own world back: `placed` is the observed state, `blockObserved` is the block id the client sees
    (`null` when the adapter has no block query), and the verdict is **`notClientVerifiable`**, because
    the authority decides whether to keep the block.
+3. **A write must take the path a player would take (P11).** `world.place` used to write the world
+   directly (`level.setBlockAndUpdate`), which nobody else can observe: on a real client that write
+   produced **no KubeJS `BlockEvents.placed`** (the event type existed, the handler was registered, and
+   a positive control did fire), so it was not equivalent to a player placing a block. It now goes
+   through the client's real interaction entry (`MultiPlayerGameMode.useItemOn` → the server's own
+   placement path). The consequences are enforced instead of hidden: the block **must be the item in
+   the selected slot**, the target must be replaceable and within the player's block reach, and each
+   failure is an honest `E_PRECONDITION` — the block is never conjured into the world. Selecting a
+   hotbar slot likewise now tells the server (`ServerboundSetCarriedItemPacket`), because the server
+   learns the carried slot only from that packet and would otherwise place the wrong item.
 
 Also in this batch: `use.item{hand:"off"}` reports **that** hand's item in `heldBefore`/`heldAfter`,
 and `state.query{what:["offhand"]}` exposes the off hand, so an off-hand dispatch can be checked from
@@ -310,6 +320,14 @@ the client instead of taken on trust.
   the prefix, and judge receipts by their **assertion form** (the `verdict` value and which of the
   `applied` / `notClientVerifiable` / `skipped` objects is populated), never by whether some string
   happens to occur in the message.
+* **`pose.set` is a scripted divergence, and it is the only one left.** It writes the client's own pose
+  (`moveTo` / `setYRot` / `setXRot`) and there is **no packet-equivalent player path to take, because a
+  player cannot teleport** — so unlike `world.place` and `inv.select` (which were moved onto the real
+  player paths, §9.3a rule 3) it cannot be made "like a human" and is not pretending to be. Treat it as
+  putting a client in position, with the three-state receipt saying what actually stuck. The other
+  state-writing ops were audited and are not divergent: `input.set` writes the very input state the
+  keyboard feeds the game, `inv.click`/`inv.toss` use the vanilla container-click path, `use.item` uses
+  the vanilla use path.
 * **World-block occupancy still has no sync signal.** Container contents now refuse with
   `cannot determine` when the view may be stale, but there is no equivalent signal for world blocks
   (only containers expose one), so `world.place`'s "cell is occupied" refusal remains a **client-side

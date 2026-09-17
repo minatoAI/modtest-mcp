@@ -389,6 +389,18 @@ authoritative too**: client-side `moveTo` values are overwritten by the next aut
 types is client-side **rotation**; position may land in `skipped` in either case, and the receipt
 must say so.
 
+**`pose.set` is a scripted divergence, and it is the only one left (P11 audit).** Unlike
+`world.place` (§6.2d) and `inv.select` (§6.2e), `pose.set` deliberately writes the client's own pose
+(`moveTo` / `setYRot` / `setXRot`) **without any packet-equivalent player path, because none exists**:
+a player cannot teleport, so there is no "real" interaction to take. It is therefore a scripted
+divergence by construction — useful for putting a client in position, not a claim about what the
+server will accept — and the receipt says exactly that through the three states and the settled
+read-back. The other state-writing ops were audited at the same time and are **not** divergent:
+`input.set` writes the same input state the keyboard feeds the game (the movement packets the server
+receives are derived from it), `inv.click`/`inv.toss` go through the vanilla container-click path,
+`use.item` goes through the vanilla use path, and `world.place`/`inv.select` were moved onto their
+real paths above.
+
 ### 6.2c Implemented op set: `inv.click`, `inv.toss`, `use.item`, `shot.capture`, `bench.read`
 
 These five were declared in the catalog but answered `E_UNSUPPORTED` in the reference client. As of
@@ -455,7 +467,66 @@ conventions apply to every op below:
 
 **World interaction is out of scope.** Using or placing blocks against the world (`useItemOn`, block
 placement/interaction through this path) is **not** part of this batch: those ops keep answering
-`E_UNSUPPORTED`. `use.item` covers only the hand-held *use* action.
+`E_UNSUPPORTED`. `use.item` covers only the hand-held *use* action. (`world.place` has its own section,
+§6.2d — it is a separate op with its own interaction-path rules.)
+
+### 6.2d `world.place` — place a block the way a player does
+
+| | |
+|---|---|
+| Params | `x`, `y`, `z` (integers, **required**) · `block` (string, default `"minecraft:stone"`) |
+| Side effects | `world.blocks` |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+Result: `block`, `placed`, `blockObserved`, the three verdict objects, `note`.
+
+**It must be a real player interaction (P11).** The block used to be written straight into the world
+(`level.setBlockAndUpdate`), which nobody else can see: measured on a real 1.20.1 client, that write
+produced **no KubeJS `BlockEvents.placed`** — the event type existed, the handler was registered, and a
+positive control did fire, so what differed was the *interaction*, not the event. The op therefore goes
+through the client's ordinary placement path (`MultiPlayerGameMode.useItemOn`), which predicts locally
+and sends the interaction packet, so the **server** runs its own placement path and Forge events,
+KubeJS, protection plugins and anti-cheat see exactly what they see for a right-click.
+
+**What follows from that — refusals are honest, never conjured:**
+
+* the requested block **MUST be the item in the player's selected slot**. An empty hand, an item that is
+  not a block, or a different block in hand is `E_PRECONDITION` (`reason` is `empty-hand`,
+  `held-item-not-a-block` or `held-item-mismatch`). The op **MUST NOT** place a block the player is not
+  holding — that was the pre-P11 behaviour, and it is not a placement;
+* the target cell **MUST** be replaceable (otherwise `E_PRECONDITION`, `reason:"target-not-replaceable"`);
+* the target **MUST** have a neighbouring block to place against and be within the player's block reach
+  (otherwise `E_PRECONDITION`, `reason:"no-support"` / `"out-of-reach"`). A player cannot place a block
+  three hundred metres away, so neither can this op;
+* the cell-occupied pre-check remains a **client-side** factual assertion (see the known limitation in
+  §6.2c) and the receipt still reports the client's **read-back**: `placed` is what this client's world
+  shows (`blockObserved` carries the id it observed, `null` when the adapter has no block query), and the
+  verdict is **`notClientVerifiable`** because the authority decides whether to keep the block. A world
+  effect is never reported `applied`;
+* as with every state read, an empty or unsettled inventory inside the container sync window is not
+  evidence of an empty hand: the refusal is `cannot determine` (§6.2c rule 1).
+
+**Divergence, stated rather than hidden:** a real placement is bounded by reach, by what is in hand, and
+by what the target supports. Scripted runs that used to place far-away blocks must select the matching
+slot and stand within reach — otherwise they are now refused. This is the intended trade: a placement
+that no other mod, plugin or server can observe is not a placement.
+
+### 6.2e `inv.select` — select a hotbar slot, and tell the server
+
+| | |
+|---|---|
+| Params | `slot` (integer, **required**, hotbar index `0..8`) |
+| Side effects | `player.inventory` |
+| Preconditions | `permitted-session`, `flag: allow-mutate` |
+
+**It notifies the server (P11 audit).** Selecting a slot must not be a purely local state change: the
+server learns the carried slot **only** from the carried-item packet (`ServerboundSetCarriedItemPacket`;
+its server-side consumer is `handleSetCarriedItem`), which is exactly what the vanilla hotbar keys send.
+Setting the client's selected index alone leaves the server on the old slot, so:
+(a) the server keeps using the wrong item, and
+(b) the new `world.place` (§6.2d) — where the *server* decides what is in hand — would place the wrong
+item or refuse. An executor that selects a slot **MUST** therefore make the selection visible to the
+server, not just to its own state.
 
 #### `inv.click` — click a slot in the open container
 

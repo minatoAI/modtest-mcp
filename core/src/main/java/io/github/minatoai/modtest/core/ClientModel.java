@@ -135,7 +135,37 @@ public interface ClientModel {
         return null;
     }
 
-    void placeBlock(int x, int y, int z, String block);
+    /**
+     * Place a block <b>the way a player does</b>: aim at a neighbouring block's face and use the item in
+     * the selected slot.
+     *
+     * <p>P11: {@code world.place} used to write the world directly, so no player interaction ever happened
+     * — the server, Forge events, KubeJS {@code BlockEvents.placed} and protection plugins all saw
+     * nothing. The implementation MUST therefore go through the client's real interaction entry
+     * ({@code MultiPlayerGameMode.useItemOn}), which predicts locally and sends the interaction packet to
+     * the server, where the ordinary placement path runs.
+     *
+     * <p>That path has consequences the op must not paper over: the block has to be **in the player's
+     * hand**, and the target has to be **within the player's block reach** with a neighbouring block to
+     * place against. An adapter refuses with {@code E_PRECONDITION} when any of that does not hold; it
+     * must never conjure the requested block into the world by itself.
+     */
+    void useItemOnBlock(int x, int y, int z, String block);
+
+    /**
+     * Direct world write. <b>This is not a placement path.</b>
+     *
+     * <p>It exists only so that the bypass removed in P11 stays detectable: the default refuses, the
+     * Forge adapter does not implement it, and no op may call it. A caller that reaches this method is
+     * writing the world without a player interaction — precisely the defect this method now exists to
+     * make impossible (and so a test can prove it).
+     */
+    @Deprecated
+    default void placeBlock(int x, int y, int z, String block) {
+        throw new Protocol.ProtocolException(Protocol.ErrorCode.E_UNSUPPORTED,
+                "direct world writes are not available: world.place goes through the player-interaction "
+                        + "path (useItemOnBlock)");
+    }
 
     // ---- telemetry ------------------------------------------------------
     record BenchSample(double fpsMedian, double frameMsP95, double onePercentLow) {

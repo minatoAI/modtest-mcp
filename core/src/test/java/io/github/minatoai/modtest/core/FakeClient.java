@@ -52,6 +52,10 @@ class FakeClient implements ClientModel {
     int tossCalls;
     int useCalls;
     int selectCalls;
+    /** Placements that went through the player-interaction entry (what P11 requires). */
+    int useItemOnCalls;
+    /** Placements that wrote the world directly (what P11 forbids). */
+    int directPlaceCalls;
     /** Which hand each accepted {@code use.item} asked for. */
     final List<Boolean> useOffHand = new ArrayList<>();
 
@@ -218,10 +222,42 @@ class FakeClient implements ClientModel {
         return occupied.contains(cx + "," + cy + "," + cz);
     }
 
+    /**
+     * The player-interaction placement entry — what {@code world.place} must use.
+     *
+     * <p>Modelled honestly: the fake requires the block to be the item in the selected slot, exactly as
+     * the real interaction path does, and refuses otherwise.
+     */
     @Override
-    public void placeBlock(int cx, int cy, int cz, String block) {
-        placed.add(cx + "," + cy + "," + cz + "=" + block);
+    public void useItemOnBlock(int cx, int cy, int cz, String block) {
+        useItemOnCalls++;
+        if (held == null || held.isBlank()) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "no item in the selected slot: a real placement needs " + block + " in hand")
+                    .with("reason", "empty-hand");
+        }
+        if (!held.equals(block)) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "the selected slot holds " + held + ", not " + block)
+                    .with("reason", "held-item-mismatch");
+        }
+        // Recorded as an observed block, not as pre-existing occupancy: `cellOccupied` models the world
+        // *before* the op, while `blockIdAt` reports what the client sees now (P10's read-back).
         blocks.put(cx + "," + cy + "," + cz, block);
+        placed.add(cx + "," + cy + "," + cz + "=" + block);
+    }
+
+    /**
+     * The legacy direct world write (P11). Production no longer has this path — {@link ClientModel}
+     * refuses it by default and the Forge adapter does not implement it — but the fake keeps it so a test
+     * can prove the op does <b>not</b> use it, and so the old behaviour can be reproduced on purpose.
+     */
+    @Override
+    @SuppressWarnings("deprecation")   // deliberate: this is the bypass the P11 test must detect
+    public void placeBlock(int cx, int cy, int cz, String block) {
+        directPlaceCalls++;
+        blocks.put(cx + "," + cy + "," + cz, block);
+        placed.add(cx + "," + cy + "," + cz + "=" + block);
     }
 
     /**

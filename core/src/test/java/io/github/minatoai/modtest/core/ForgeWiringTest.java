@@ -242,12 +242,120 @@ class ForgeWiringTest {
 
         assertFalse(source.contains("is not wired yet"),
                 "MinecraftClientModel must not keep a stub refusal for the five task-70 ops");
-        for (String marker : List.of("handleInventoryMouseClick", "ClickType.THROW", "Screenshot.grab",
-                "benchWindow", "useItem(boolean")) {
+        for (String marker : List.of("handleInventoryMouseClick", "ClickType.THROW",
+                "Screenshot.takeScreenshot", "benchWindow", "useItem(boolean")) {
             assertTrue(source.contains(marker),
                     "MinecraftClientModel is missing the wiring for " + marker);
         }
         // The two legacy entry points may still refuse (core no longer calls them), but each must say so.
         assertTrue(source.contains("the legacy screenshot path is gone"));
+    }
+
+    /**
+     * P11: the world write went around the player. The spike showed that {@code setBlockAndUpdate} never
+     * produces a KubeJS {@code BlockEvents.placed} (the event type existed, the handler was registered,
+     * and a positive control fired), so the adapter must use the interaction entry instead — and must not
+     * keep a direct write anywhere.
+     */
+    @Test
+    void theForgeAdapterPlacesThroughThePlayerInteractionPathAndNeverWritesTheWorldDirectly()
+            throws IOException {
+        String source = read(forgeSource("MinecraftClientModel.java"));
+
+        assertTrue(source.contains("mc.gameMode.useItemOn("),
+                "world.place must go through MultiPlayerGameMode.useItemOn (the player interaction path)");
+        assertTrue(source.contains("BlockHitResult"),
+                "the interaction needs a real aim: a block hit result against a neighbouring face");
+        assertFalse(source.contains(".setBlockAndUpdate("),
+                "P11: no direct world write may remain in the adapter — that path is invisible to the "
+                        + "server, to Forge/KubeJS events and to protection plugins");
+        assertFalse(source.contains("void placeBlock("),
+                "the adapter must not implement the direct-write entry at all (the interface default "
+                        + "refuses it)");
+        assertTrue(source.contains("new ServerboundSetCarriedItemPacket("),
+                "the audited same-family fix: selecting a slot must reach the server, which learns the "
+                        + "carried slot only from this packet (otherwise the server places the wrong item)");
+        assertTrue(source.contains("getBlockReach"),
+                "a real placement is bounded by the player's block reach, and must refuse honestly");
+    }
+
+    /**
+     * The audited same-family fix: the server learns the carried hotbar slot <b>only</b> from
+     * {@code ServerboundSetCarriedItemPacket}. Writing {@code inventory.selected} alone leaves the server
+     * on the old slot — which would make the new {@code world.place} place the wrong item (the server
+     * decides what is in hand). Scoped to the method, not the file, so a stray mention elsewhere cannot
+     * satisfy it.
+     */
+    @Test
+    void theForgeAdapterTellsTheServerWhichSlotWasSelected() throws IOException {
+        String source = read(forgeSource("MinecraftClientModel.java"));
+        String body = methodBody(source, "public void selectSlot(");
+
+        assertTrue(body.contains("getInventory().selected = slot"),
+                "selectSlot must still set the local index: " + body);
+        assertTrue(body.contains("new ServerboundSetCarriedItemPacket("),
+                "and must tell the server, which learns the carried slot only from that packet: " + body);
+        assertTrue(body.contains("getConnection().send("),
+                "the packet has to be sent on the connection: " + body);
+    }
+
+    /**
+     * KubeJS exists only in a developer's instance {@code mods/} folder — never as a dependency of this
+     * repository. Declared dependencies are what put a jar inside the product, so the check is mechanical:
+     * no declarative build file may mention it. (Text in comments and docs is fine and deliberately not
+     * policed here.)
+     */
+    @Test
+    void noDeclarativeKubeJsDependencyExistsInTheBuild() {
+        List<String> declarative = List.of("build.gradle", "settings.gradle", "gradle.properties",
+                "core/build.gradle", "forge/build.gradle", "forge/src/main/resources/META-INF/mods.toml",
+                "pyproject.toml");
+        int checked = 0;
+        for (String relative : declarative) {
+            for (Path candidate : List.of(Path.of(relative), Path.of("..", relative))) {
+                if (!Files.exists(candidate)) {
+                    continue;
+                }
+                checked++;
+                try {
+                    String text = Files.readString(candidate, StandardCharsets.UTF_8)
+                            .toLowerCase(java.util.Locale.ROOT);
+                    assertFalse(text.contains("kubejs"),
+                            candidate + " declares a KubeJS dependency (or mentions it as one): KubeJS is "
+                                    + "a dev-instance mod, and a declared dependency is how it would end up "
+                                    + "inside the product jar");
+                } catch (IOException e) {
+                    throw new AssertionError("could not read " + candidate, e);
+                }
+                break;
+            }
+        }
+        assertTrue(checked >= 6,
+                "expected to check the declarative build files, checked=" + checked);
+    }
+
+    /** The text inside a method, found by its signature and closed by balanced braces. */
+    private static String methodBody(String source, String signature) {
+        int at = source.indexOf(signature);
+        assertTrue(at >= 0, "method not found in the adapter: " + signature);
+        int open = source.indexOf('{', at);
+        assertTrue(open > 0, "method has no body: " + signature);
+        int depth = 1;
+        int i = open + 1;
+        StringBuilder body = new StringBuilder();
+        while (i < source.length() && depth > 0) {
+            char c = source.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    break;
+                }
+            }
+            body.append(c);
+            i++;
+        }
+        return body.toString();
     }
 }

@@ -202,17 +202,24 @@ fact and it stays on the record:
 | guarded jar (release asset) | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
 | unguarded jar (same cut, not published) | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
 
-**(b) What the current source revision builds.** `d2559ba` (P11 + P12) builds:
+**(b) What the current source revision builds.** `10e8eee` (P11 + P12; its main sources are byte-identical
+to `d2559ba` — the later commit touches only `README.md` and `docs/VERIFICATION-LOG.md`) builds:
 
 | | |
 |---|---|
-| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **159,308 B**, **90 entries**, sha256 `915BDA5CB9BCC2BAE91070BFB7428302F8030205D95AAF77C9202EF4A8F10CB2`, `modtest.refmap.json` present |
-| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `811114E403755C7F2D4F5AD6FD75D1909BE239DCAA1A89E8A7B24B90B36F0CD6` |
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **160,157 B**, **90 entries**, sha256 `D5EDB68412533198E73FB207E85829AEBD5759987A3292D8ED5CA6B4D81CFC81`, manifest `Modtest-Guard-Variant: guarded`, `modtest.refmap.json` + `modtest.harness.mixins.json` present, **73** `:core` classes |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `811114E403755C7F2D4F5AD6FD75D1909BE239DCAA1A89E8A7B24B90B36F0CD6`, manifest `Modtest-Guard-Variant: unguarded` |
 
-**Why the two differ — so a source build's sha is not a contradiction.** Two independent reasons:
+The two variants differ by **47 B**, and that difference is **entirely `META-INF/MANIFEST.MF`** (316 B vs
+369 B uncompressed): every other entry, and its size, is identical. (The published pair differs by the same
+47 B: 156,601 − 156,554.) A larger gap than that is not a labelling difference — it means one of the two
+jars is not in its final state.
+
+**Why the two identities differ — so a source build's sha is not a contradiction.** Two independent reasons:
 1. **The code changed.** P11/P12 add the interaction-path placement, the bounded sync window and the
-   agent-facing text, so the current jars are *bigger* (+537 B guarded, +1,386 B unguarded) than the
-   published one. Same entry count (90), different content.
+   agent-facing text, so the current canonical jars are *bigger* — each grew by **+1,386 B** against their
+   alpha.2 counterparts (158,771 → 160,157 guarded, 158,818 → 160,204 unguarded), i.e. **+3,603 B** for the
+   guarded jar against the published asset. Same entry count (90), different content.
 2. **Jar bytes are not reproducible.** Zip entry timestamps make a rebuild of the *same* input produce a
    different sha256; even rebuilding `8720db0` would not reproduce `9FD682D9…`.
 
@@ -221,13 +228,18 @@ released asset. **The next release will carry the new artifacts, and this sectio
 sha as the published identity** (the internal Gradle version string stays `1.0.0-alpha.1`; the version
 lines were deliberately not bumped).
 
-**Take the artifact from `:forge:build`, never from a guardrail-only run.** `:forge:jar` alone produces the
-jar *before* ForgeGradle's `addMixinsToJar` step, so a build that only ran `:forge:verifyMixinRefmap` /
-`:forge:verifySelfContainedJar` leaves a jar **865 B smaller** than the shippable one (157,906 B vs
-159,308 B in the current revision) — and it still passes those checks. Always `:forge:build` (or
-`:forge:build -Punguarded`) before handing a jar to anyone. **Follow-up, deliberately not done in this
-cut so the artifact identity is not churned again:** make the guardrail tasks depend on
-`addMixinsToJar`, or fail when the jar they inspect was not produced through it.
+**Take the artifact from `:forge:build`, never from a guardrail-only run — this is not a theoretical risk.**
+`:forge:jar` alone produces the jar *before* ForgeGradle's `addMixinsToJar` step, so an invocation that
+only ran `:forge:verifyMixinRefmap` / `:forge:verifySelfContainedJar` leaves `build/libs` holding a reduced
+jar that nevertheless passes those checks. Measured directly: after a guardrail-only invocation the jar was
+**159,308 B**, and a following `:forge:build` restored it to **160,157 B** — a **849 B** difference whose
+content is byte-identical across rebuilds otherwise. The trap has already cost us: a reduced jar was once
+reported as the canonical identity (see the corrections in `docs/VERIFICATION-LOG.md`), and a real-machine
+round was stopped by the tester's hash gate because the jar on disk did not match the reported one. Always
+`:forge:build` (or `:forge:build -Punguarded`) before handing a jar to anyone, and **re-measure the identity
+after every rebuild**. **Follow-up, deliberately not done in this cut so the artifact identity is not
+churned again:** make the guardrail tasks depend on `addMixinsToJar`, or fail when the jar they inspect was
+not produced through it.
 
 **We do not claim byte-reproducible jars.** A sha identifies *one* build's output only. Integrity rests
 on the **entry count**, the **four guardrails** (`verifyMixinRefmap`, `verifySelfContainedJar`,

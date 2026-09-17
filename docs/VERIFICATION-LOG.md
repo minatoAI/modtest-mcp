@@ -280,10 +280,17 @@ operator's own machine; **nothing was simulated or copied from a green unit test
      in the same instant can be answered `cannot determine` even though the selection was correct.
   3. **Take the artifact from `:forge:build`, never from a guardrail-only run.** Running only the guardrail
      tasks triggers `:forge:jar` but not ForgeGradle's `addMixinsToJar`, so `build/libs` is left holding a
-     jar **865 B smaller** than the shippable one (157,906 B vs 159,308 B) that nevertheless passes those
-     checks. Found while freezing an artifact for a real-machine round; now written into `README` §9.1
-     together with the follow-up (make the guardrails depend on `addMixinsToJar`), deliberately not done in
-     this cut so the artifact identity is not churned again.
+     reduced jar that still passes those checks. **Measured directly (this round):** after a guardrail-only
+     invocation the guarded jar was **159,308 B / `B63DFE6B…`**, and the following `:forge:build -PwithForge`
+     restored **160,157 B / `D5EDB684…`** — an **849 B** difference, with the content otherwise byte-identical
+     across rebuilds. This trap is not theoretical, and it had already cost us twice: **a reduced jar was
+     reported as the canonical identity** (correction 9 below), and **a real-machine round was stopped** by
+     the tester's hash gate because the jar on disk did not match the reported one. The canonical pair for
+     this revision is **guarded 160,157 B / `D5EDB684…`** and **unguarded 160,204 B / `811114E4…`**, which
+     differ by **47 B, entirely `META-INF/MANIFEST.MF`** (316 vs 369 B) — that 47 B is the normal variant
+     gap, so a larger gap means one jar is not in its final state. Now written into `README` §9.1 with the
+     follow-up (make the guardrails depend on `addMixinsToJar`), deliberately deferred until after this
+     release closes so the artifact identity is not churned again.
 
 ---
 
@@ -331,6 +338,20 @@ minds.
    `empty-hand` refusal was unreachable and a caller had no honest answer to wait for (R21, P12). The
    window is now counted in client ticks and closable by evidence (the open menu's state id moves).
    **Conservative must still mean bounded.**
+9. **We reported a reduced jar as the canonical artifact.** While freezing the artifact for the P11/P12
+   real-machine round we reported guarded **159,308 B / `915BDA5C…`** as canonical. It was not: a
+   guardrail-only invocation in the same command had left `build/libs` holding the jar written by
+   `:forge:jar` *before* ForgeGradle's `addMixinsToJar`, and we measured that reduced file. The tester's
+   **hash gate caught it** — the on-disk jar (`160,157 B / 7D6CBAFA…`) matched neither our "canonical"
+   guarded number nor the unguarded one — and the round was stopped rather than run against an
+   unverified artifact. The mismatch was then made concrete rather than argued: running the guardrails
+   alone produced **159,308 B / `B63DFE6B…`**, and the following `:forge:build -PwithForge` produced
+   **160,157 B / `D5EDB684…`**, content-identical to the pre-rebuild jar, with the mixin config, the
+   refmap (SRG member resolved) and 73 `:core` classes present. The "guarded is 896 B smaller than
+   unguarded" story that came with it was also ours and also wrong: the only difference between the
+   variants is **`META-INF/MANIFEST.MF`**, a **47 B** gap. **Two lessons, both now recorded in `README`
+   §9.1: an artifact identity must come from a `:forge:build` output and be re-measured after every
+   rebuild; and a variant gap that is not 47 B means a jar is not in its final state.**
 
 ## Not verified, or limited by available means
 

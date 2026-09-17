@@ -298,6 +298,21 @@ variants were exercised:
 5. **End-to-end ticket loop closes** (ticket → receipt → archive).
 6. **Unguarded variant: 4/4** of the above, with its own manifest stamp.
 
+**Audit lines come in three granularities — count them per class, never across classes.** This is existing
+design, not a gap, and a real-machine round mistook it for one (it counted only `ALLOWED-MUTATION`):
+
+| Class | Ops | One line per | Tag |
+|---|---|---|---|
+| mutation | `inv.select`, `inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place`, **`input.stop`** | one **allowed, non-no-op op call** — exactly 1, no matter how the op then turns out | `ALLOWED-MUTATION` (one per call, so calling the same op twice leaves two lines) |
+| injection | `input.set` | one **tick actually written**: the op installs a hold of `ticks:N`, and every held tick goes through the same gate again ⇒ **up to N+1** lines | `ALLOWED-INPUT` |
+| recording | `shot.capture`, `bench.read` | **never** — 0 lines: they write inside the bridge dir / read the render pipeline and never touch the game | — |
+
+Guard **no-ops** (paused / handshake / no world) and **refusals** produce **no** line by design (a no-op
+still returns `ok:true` with `verdict:"skipped"`; a refusal returns `E_PRECONDITION`). So
+`write ops ok:true ≠ ALLOWED-MUTATION count`: when a ticket contains an `input.set`, its lines are the
+`ALLOWED-INPUT` family, and for `ticks:N` that is the number that proves exactly N ticks were written
+(the P7 guarantee). Counting one tag over a mixed ticket will always appear to "lose" lines.
+
 The defect chain found on real machines is **closed, each one first proven, then fixed, then
 re-verified on a real client**: missing audit sink wiring, the Gson API mismatch
 (`JsonObject.isEmpty()` vs runtime gson 2.10), the self-contained-jar failure, the missing refmap
@@ -420,10 +435,19 @@ the client instead of taken on trust.
   `stopped:false` + `verdict:"notClientVerifiable"` when it could only arm the stop — it never claims a
   player has stopped who has not.
 * **Four codes are "non-failure terminations", not errors (C).** `E_SUPERSEDED`, `E_STOPPED`, `E_NO_PATH`
-  and `E_STUCK` mean *the task did not complete and that is not a defect*. The first two are produced today
-  (`input.stop`); `E_NO_PATH`/`E_STUCK` are **declared but reserved** for the movement planner
-  (`walk.within`) and nothing produces them yet. Existing codes keep their exact meaning, and no error
-  field was added for the distinction.
+  and `E_STUCK` mean *the task did not complete and that is not a defect*. `E_STOPPED` (nothing was moving
+  to stop) and `E_SUPERSEDED` are produced by `input.stop`; `E_NO_PATH`/`E_STUCK` are **declared but
+  reserved** for the movement planner (`walk.within`) and nothing produces them yet. Existing codes keep
+  their exact meaning, and no error field was added for the distinction.
+* **`E_SUPERSEDED` is narrow, and an `input.set` that replaces a hold is *not* it.** A real-machine round
+  sent a second `input.set` while a hold was still running and got `ok:true`, then read that as "the code
+  never fires". That receipt is **correct**: the superseded party is the *old hold*, whose op already
+  answered, and only a **stop request** can be superseded in a way a later receipt can report. The one
+  reachable trigger is `input.stop{mode:"safe"}` armed while the player is **not** at a safe point → a newer
+  `input.set` supersedes it → a further `input.stop` sees that **inside the same ticket** and answers
+  `E_SUPERSEDED`. Across tickets the client-tick loop deliberately discards the supersession (so a stale
+  stop can never cancel the command that now owns the player), which is why the code is narrow rather than
+  impossible. Full wording: PROTOCOL §4.1 and §6.2g.
 * **A "cannot determine" answer is bounded, never permanent.** The container sync window is counted in
   **client ticks** (20) and also closes as soon as the server's own answer arrives, so the plain
   refusals (`empty-hand`, `slot-empty`, …) are always reachable. The first version used wall-clock

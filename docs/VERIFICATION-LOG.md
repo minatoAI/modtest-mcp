@@ -367,10 +367,25 @@ operator's own machine; **nothing was simulated or copied from a green unit test
 - **`verifyProductJar` (root task, a gate on *product* jars):** on the clean product reference ⇒
   `PRODUCT-JAR-CLEAN`, exit 0; on our harness jar ⇒ `PRODUCT-JAR-CONTAINS-HARNESS`, exit 1 — the gate
   refusing a harness jar as a product is its designed behaviour, not a regression.
-- **Not verified here:** nothing of A/B/C has been exercised on a real client. `blockReplaceableAt`'s
-  three-state honesty on an unloaded chunk, `isMoving` against real motion, the two stop tiers'
-  observable difference and the absence of per-tick renewal on a live client, and criterion ③ via our own
-  op are all **pending qa-tester's real-machine round** (the release waits on it).
+- **Follow-up from the real-machine round (as reported by the round; includes two things NOT observed).**
+  The round's initial alarm — "8 write ops but only 4 `ALLOWED-MUTATION` lines" — was a **counting error
+  across two families**, not a missing line: mutation class = exactly 1 line per allowed op (**4/4**),
+  injection class = 1 `ALLOWED-INPUT` line per **written tick** (**106** lines for the `input.set` hold,
+  the P7 design). Nothing was broken, so the fix is **wording**: PROTOCOL §7.2 and README §9.2
+  now state the three granularity classes (mutation / injection / recording) and the fact that a single-tag
+  count over a mixed ticket must undercount. The round also showed a second `input.set` while a hold was
+  still running returning **`ok:true`**, which is **correct** per §4.1: `E_SUPERSEDED` describes a
+  superseded **stop request**, not a replaced hold — its one reachable trigger (safe stop armed while not at
+  a safe point → newer `input.set` → a further `input.stop` **inside the same ticket**) is now written into
+  PROTOCOL §4.1/§6.2g with a reproduction recipe.
+  **NOT observed (honest gaps, limited means):** (1) the two stop tiers' **observable difference** — both
+  real-machine stops landed `atSafePoint:true`, i.e. the *applied* branch, so the **`armed` branch has still
+  only been exercised by the core unit test** (`anArmedSafeStopDoesNotClaimThePlayerHasStopped`) and never on
+  a live client; seeing it needs the player to be genuinely off a safe point (airborne / in a wall) when the
+  stop arrives. (2) `state.query{what:["moving"]}` with `movingKnown:false` — that branch was never reached
+  on a real client, so the "unknown movement" answer rests on unit tests only.
+- **Still pending a real-machine round:** `blockReplaceableAt`'s three-state honesty on an unloaded chunk,
+  and the absence of per-tick renewal (the `ALLOWED-INPUT` tick count) against a live client.
 
 ---
 

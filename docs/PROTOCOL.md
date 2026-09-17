@@ -152,7 +152,7 @@ fields are how test rigs drift.
 | `E_EXEC` | the op ran and failed (world/state/vanilla error) |
 | `E_ASSERT` | an `expect` assertion failed |
 | `E_UNSUPPORTED` | op exists but is not available in this build/mode |
-| `E_SUPERSEDED` | **non-failure termination** — a newer request replaced this one (e.g. another input command arrived while a safe-point stop was waiting). Retrying is usually wrong: the newer request owns the player now. |
+| `E_SUPERSEDED` | **non-failure termination** — a **stop request** was replaced before it took effect. It has exactly one trigger today, and it is narrow: an `input.stop{mode:"safe"}` is **armed** (the client is not at a safe point), a newer `input.set` supersedes it, and a further `input.stop` observes that supersession **inside the same ticket / same relay batch**. The client-tick loop throws a superseded arm away as soon as it sees one — deliberately, so a stale stop cannot cancel the command that now owns the player — so a supersession split across tickets is **not** reported and the later stop simply acts on the current input. **A plain `input.set` that replaces a running hold is `ok:true` and never this code**: the superseded party is the *old hold*, and that op already answered; only a *stop request* can be superseded in a way this code can report. Retrying is usually wrong: the newer request owns the player now. |
 | `E_STOPPED` | **non-failure termination** — the movement asked about had already stopped (or never started), so there was nothing to stop. Not an error, and not a success to claim twice. |
 | `E_NO_PATH` | **non-failure termination** — no route to the target exists. **Reserved**: declared for the movement planner (`walk.within`); nothing produces it yet, and a test pins that so a stray user goes red. |
 | `E_STUCK` | **non-failure termination** — movement stopped making progress. **Reserved**, as above (pinned by the same test). |
@@ -819,7 +819,15 @@ Result: `mode`, `stopRequested`, `stopped`, `atSafePoint` (`true`/`false`/`null`
   has stopped. Observe the outcome with `state.query{what:["moving"]}` or the pose over time.
 * Two outcomes are **non-failure terminations** (§4.1): `E_STOPPED` when nothing was moving to stop, and
   `E_SUPERSEDED` when a newer input command took the player while the stop was waiting — the tick loop must
-  then **not** cancel the command that now owns the player.
+  then **not** cancel the command that now owns the player. `E_SUPERSEDED` is narrow and only reachable
+  **within one ticket**: send `input.set` (so a hold exists), then `input.stop{mode:"safe"}` while the player
+  is *not* at a safe point (it then reports `armed:true`), then `input.set` again (this supersedes the armed
+  stop), then `input.stop{mode:"safe"}` — that last op is the one that answers `E_SUPERSEDED`. Across
+  tickets the supersession is deliberately discarded (see §4.1), so an `input.set` that merely replaces a
+  hold is `ok:true`.
+* An **armed** stop still produced exactly one `ALLOWED-MUTATION` line: the allowance is granted before the
+  tier is chosen, so `armed` vs `applied` does not change the audit accounting (see §7.2's granularity
+  table).
 * `verdict:"applied"` is used only when the adapter reports the injection was actually cancelled: the
   injected-input state is the client's own, unlike a server-owned world effect, which never reports
   `applied` (§6.2d).
@@ -866,16 +874,34 @@ The rule is **default deny, plus an explicit allow-list of hosts you own**. A co
 
 **Loud audit.** Every tier-3 allowance **MUST** be recorded — who acted, which host, at what time,
 which token, which op — in a durable log. Never log the token *value*: record a fingerprint
-(e.g. the first bytes of its SHA-256) instead. Every write op — `input.set`, `inv.select`,
-`inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place` — goes through this one gate, so an
-allowance always produces **exactly one** audit line. **A refusal that happens *before* the allowance
-produces no line at all** (a refusal is not an allowance, and recording it would bury the real ones):
-that covers guard refusals (policy, activation, host, missing `allow-mutate`) and parameter validation.
-**An op precondition that fails *after* the guard allowed does have an allowance, and its line MUST
-exist**: an empty slot, a missing container, a cooldown or an occupied cell is discovered while the op
-is already running, so denying its line would hide a write the guard really permitted. In short: the
-test is not "did the op fail?" but "did the guard hand out an allowance?". A no-op
-(paused / handshake / not in a world) writes nothing, so it is not an allowance either.
+(e.g. the first bytes of its SHA-256) instead. Every write op — `input.set`, `input.stop`, `inv.select`,
+`inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place` — goes through this one gate.
+**A refusal that happens *before* the allowance produces no line at all** (a refusal is not an allowance,
+and recording it would bury the real ones): that covers guard refusals (policy, activation, host, missing
+`allow-mutate`) and parameter validation. **An op precondition that fails *after* the guard allowed does
+have an allowance, and its line MUST exist**: an empty slot, a missing container, a cooldown or an occupied
+cell is discovered while the op is already running, so denying its line would hide a write the guard really
+permitted. In short: the test is not "did the op fail?" but "did the guard hand out an allowance?".
+A no-op (paused / handshake / not in a world) writes nothing, so it is not an allowance either: it produces
+**no** line and an `ok:true` receipt whose `verdict` is `skipped`.
+
+**Audit granularity: three classes, and the line count is only meaningful per class.** A bare count of one
+tag is *not* a defect signal — the classes are deliberately different, because what is being accounted for
+is different:
+
+| Class | Ops | One line per | Tag |
+|---|---|---|---|
+| **mutation** | `inv.select`, `inv.click`, `inv.toss`, `use.item`, `pose.set`, `world.place`, `input.stop` | **one allowed, non-no-op op call** (exactly 1, no matter how the op then turns out) | `ALLOWED-MUTATION` |
+| **injection** | `input.set` | **one tick actually written**: the op installs a hold of `ticks:N` and *every* held tick goes through the same gate again, so one `input.set{ticks:N}` yields **up to N+1** lines (1 at op time + 1 per held tick) | `ALLOWED-INPUT` |
+| **recording** | `shot.capture` (`render.pipeline`), `bench.read` (`telemetry.recording`) | **never** — 0 lines, by design | — |
+
+The recording class is never gated because it does not touch the game: it writes inside the bridge
+directory or reads the render pipeline (`Guard.READ_ONLY_EFFECTS`). Read-only ops (`state.query`) likewise
+produce no line. **Consequences for anyone auditing a real log:** `ALLOWED-MUTATION` must equal the number
+of **allowed, non-no-op mutation-class calls** (not the number of write ops in the ticket if an `input.set`
+was among them), and `ALLOWED-INPUT` must equal the number of ticks actually injected — for P7 that is the
+number that proves a `ticks:N` request wrote exactly N ticks. Counting one tag across both families
+undercounts; it is a measurement error, not a missing line.
 
 Mutating ops in general (`sideEffects` beyond `none`/`telemetry.recording`) **MUST** additionally
 require the executor's explicit `allow-mutate` opt-in, and fail with `E_PRECONDITION` without it.
@@ -883,8 +909,10 @@ Ops that may run on a declared host SHOULD declare the `permitted-session` preco
 `singleplayer` remains the strictly-local variant.
 
 **Real-machine acceptance criteria — every write op, three paths.** The gate is verified by three
-receipts, never by reading the source. The guarded ops are `input.set`, `inv.select`, `inv.click`,
-`inv.toss`, `use.item`, `pose.set` and `world.place`:
+receipts, never by reading the source. The mutation-class ops — the ones whose "exactly one line" rule
+applies, listed in the granularity table above — are `input.stop`, `inv.select`, `inv.click`, `inv.toss`,
+`use.item`, `pose.set` and `world.place`; `input.set` is the injection class and is counted per tick
+(`ALLOWED-INPUT`), so it is deliberately **not** in the table below:
 
 | Path | Receipt | Audit log | Client |
 |---|---|---|---|

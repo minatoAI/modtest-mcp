@@ -361,18 +361,22 @@ function Test-PostRunAudit {
     $newSinceLaunch = @($matching | Where-Object { $BaselineProcessIds -notcontains [int]$_.pid })
     $preexisting = @($matching | Where-Object { $BaselineProcessIds -contains [int]$_.pid })
     $unattributed = @()
+    $ours = @()
     if ($LaunchSignature.Length -gt 0) {
-        $ours = New-Object System.Collections.Generic.List[object]
+        $oursList = New-Object System.Collections.Generic.List[object]
         foreach ($candidate in $newSinceLaunch) {
             $cmdLine = ''
             $ci = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f [int]$candidate.pid) -ErrorAction SilentlyContinue
             if ($null -ne $ci -and $null -ne $ci.CommandLine) { $cmdLine = [string]$ci.CommandLine }
-            if ($cmdLine.Contains($LaunchSignature)) { $ours.Add($candidate) | Out-Null } else { $unattributed += $candidate }
+            if ($cmdLine.Contains($LaunchSignature)) { $oursList.Add($candidate) | Out-Null } else { $unattributed += $candidate }
         }
-        $orphans = @($ours)
+        # NOTE: @(<List[object]>) throws System.ArgumentException 'Argument types do not match' in
+        # PowerShell; always go through .ToArray() (see the PS 5.1 note in docs/agent-harness).
+        $ours = $oursList.ToArray()
     } else {
-        $orphans = @($newSinceLaunch)
+        $ours = @($newSinceLaunch)
     }
+    $orphans = @($ours)
     if (@($orphans).Count -gt 0) {
         foreach ($orphan in $orphans) { $problems.Add(('orphan process: pid={0} name={1} title={2}' -f $orphan.pid, $orphan.name, $orphan.title)) | Out-Null }
     }
@@ -468,7 +472,14 @@ if (-not $DryRun) {
     if ($launchSignature.Length -eq 0) {
         foreach ($a in $launchArgs) { if (($a -notlike '-*') -and ($a -like '*.*')) { $launchSignature = [string]$a; break } }
     }
-    if ($launchSignature.Length -eq 0) { $launchSignature = [string]$launchExe }
+    if ($launchSignature.Length -eq 0) {
+        for ($i = 0; $i -lt ($launchArgs.Count - 1); $i++) {
+            if ($launchArgs[$i] -eq '--username') { $launchSignature = [string]$launchArgs[$i + 1]; break }
+        }
+    }
+    # Deliberately NO exe-path fallback: the interpreter path is shared by every JVM on the machine,
+    # so it would misattribute a teammate's process as ours. With no signature we fall back to
+    # counting every new survivor (conservative: possible false red, never a silent miss).
 }
 
 $roundStartedAt = Get-Date

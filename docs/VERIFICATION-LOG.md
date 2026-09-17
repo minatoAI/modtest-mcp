@@ -278,19 +278,48 @@ operator's own machine; **nothing was simulated or copied from a green unit test
   2. **After `inv.select`, let the synchronisation window close before sending the placement.** The server
      learns the carried slot from the packet, and the view core reads may still be catching up; an op sent
      in the same instant can be answered `cannot determine` even though the selection was correct.
-  3. **Take the artifact from `:forge:build`, never from a guardrail-only run.** Running only the guardrail
-     tasks triggers `:forge:jar` but not ForgeGradle's `addMixinsToJar`, so `build/libs` is left holding a
-     reduced jar that still passes those checks. **Measured directly (this round):** after a guardrail-only
-     invocation the guarded jar was **159,308 B / `B63DFE6B…`**, and the following `:forge:build -PwithForge`
-     restored **160,157 B / `D5EDB684…`** — an **849 B** difference, with the content otherwise byte-identical
-     across rebuilds. This trap is not theoretical, and it had already cost us twice: **a reduced jar was
-     reported as the canonical identity** (correction 9 below), and **a real-machine round was stopped** by
-     the tester's hash gate because the jar on disk did not match the reported one. The canonical pair for
-     this revision is **guarded 160,157 B / `D5EDB684…`** and **unguarded 160,204 B / `811114E4…`**, which
-     differ by **47 B, entirely `META-INF/MANIFEST.MF`** (316 vs 369 B) — that 47 B is the normal variant
-     gap, so a larger gap means one jar is not in its final state. Now written into `README` §9.1 with the
-     follow-up (make the guardrails depend on `addMixinsToJar`), deliberately deferred until after this
-     release closes so the artifact identity is not churned again.
+  3. **Take the artifact from `:forge:build`, never from a guardrail-only run.** `build/libs` is written
+     **twice**: `:forge.jar` writes it with **official/mapped names and no SRG references**, and `reobfJar`
+     then *replaces* it with the shippable bytes. A guardrail-only invocation used to stop after the first
+     write, leaving a **non-reobfuscated** jar that still passed both guardrail checks. **Measured:** the
+     intermediate is **159,308 B with 0 `m_*_` / 0 `f_*_` SRG references**, the real artifact is
+     **160,157 B with 40 / 10** — an **849 B** gap, and a jar that would not work against a real client.
+     Both states contain `modtest.refmap.json` **and** `modtest.harness.mixins.json`, which is why a
+     mixin-product check alone is necessary but **not sufficient** (correction 10). This trap had already
+     cost us twice: **a reduced jar was reported as the canonical identity** (correction 9) and **a
+     real-machine round was stopped** by the tester's hash gate. The canonical pair is **guarded 160,157 B**
+     and **unguarded 160,204 B**, differing by **47 B, entirely `META-INF/MANIFEST.MF`** (316 vs 369 B); a
+     larger gap means one jar is not in its final state. **Fixed under task-77** (see R22): both guardrails
+     now depend on `reobfJar` and assert entry-CRC identity with `reobfJar`'s output.
+
+---
+
+## R22 · 2026-09-18 — the build graph could hand a non-reobfuscated jar to a tester (task-77, fixed)
+
+- **Goal:** make it impossible for a guardrail-only invocation to leave a wrong jar in `build/libs`, after
+  R21's identity mix-up.
+- **Root cause, measured (and it was NOT what we first assumed):** `build/libs` is written twice — `:forge.jar`
+  writes it with **official/mapped names**, then `reobfJar` *replaces* it with the shippable bytes. The two
+  guardrail tasks only pulled in `jar`, so a guardrail-only run left the **non-reobfuscated** jar behind.
+  Discriminator: the intermediate's `MinecraftClientModel.class` contains **0 `m_*_` / 0 `f_*_`** SRG
+  references (and still contains the readable `getBlockReach`), the real artifact has **40 / 10**. Sizes:
+  **159,308 B** vs **160,157 B** (849 B). **Both** states contain `modtest.refmap.json` **and**
+  `modtest.harness.mixins.json`, which is why the mixin-product check the task originally called for would
+  have passed the wrong jar.
+- **Fix:** both guardrail tasks now `dependsOn 'reobfJar'`, and both compare the **entry CRCs of `build/libs`
+  against `reobfJar`'s own output** (`build/reobfJar/output.jar`), failing when any other task's bytes are
+  sitting there. The mixin-product presence check is kept as a second assertion.
+- **Acceptance, measured:** `:forge:clean` + the two guardrail tasks alone now end with **160,157 B / 40 `m_*_`
+  references**, and the jar is **entry-for-entry identical (names + uncompressed sizes + CRC32) to the
+  shipped `v1.0.0-alpha.3` artifact** — for **both** variants (guarded and unguarded). Removing the
+  `reobfJar` dependency reproduces the defect and makes **both guardrails fail loudly**
+  (`reobfJar/output.jar does not exist — reobfJar never ran, so the jar in build/libs cannot be the
+  shippable artifact`) while leaving the 159,308 B intermediate behind; the sources were then restored
+  byte-exactly (sha verified, zero residue) and both variants re-verified green, plus the four guardrails
+  and `verifyProductJar` (`PRODUCT-JAR-CLEAN`) in both variants.
+- **Artifact identities after the fix (local, per-build sha):** guarded **160,157 B /
+  `CCF801A4…7481AE`**, unguarded **160,204 B / `CA4599A8…01A686`** — content identical to the published
+  asset's build (`D5EDB684…`), which remains untouched.
 
 ---
 
@@ -341,7 +370,7 @@ minds.
 9. **We reported a reduced jar as the canonical artifact.** While freezing the artifact for the P11/P12
    real-machine round we reported guarded **159,308 B / `915BDA5C…`** as canonical. It was not: a
    guardrail-only invocation in the same command had left `build/libs` holding the jar written by
-   `:forge:jar` *before* ForgeGradle's `addMixinsToJar`, and we measured that reduced file. The tester's
+   `:forge.jar`, which **reobfJar had not yet replaced** — and we measured that file. The tester's
    **hash gate caught it** — the on-disk jar (`160,157 B / 7D6CBAFA…`) matched neither our "canonical"
    guarded number nor the unguarded one — and the round was stopped rather than run against an
    unverified artifact. The mismatch was then made concrete rather than argued: running the guardrails
@@ -352,6 +381,19 @@ minds.
    variants is **`META-INF/MANIFEST.MF`**, a **47 B** gap. **Two lessons, both now recorded in `README`
    §9.1: an artifact identity must come from a `:forge:build` output and be re-measured after every
    rebuild; and a variant gap that is not 47 B means a jar is not in its final state.**
+
+10. **We blamed the build graph's `addMixinsToJar` step, and that was wrong too.** Following correction 9 we
+   wrote into `README` §9.1 and R21 lesson 3 that the reduced jar was the state *before*
+   `addMixinsToJar`, and task-77's first requirement was to assert that the jar contains the mixin products.
+   Measurement disproved it: **the non-reobfuscated intermediate already contains both
+   `modtest.refmap.json` and `modtest.harness.mixins.json`**, so that assertion passed on the wrong jar;
+   the actual discriminator is **reobfuscation** — 0 `m_*_` references in the intermediate against 40 (plus
+   10 `f_*_`) in the real artifact, because `build/libs` is written by `jar` and then *replaced* by
+   `reobfJar`. The fix was therefore re-aimed at `reobfJar` (dependency **and** an entry-CRC identity
+   assertion against `reobfJar`'s output), and the acceptance now includes the old graph failing loudly.
+   **Lesson: name the task that writes the bytes you measure before blaming a step in the graph.**
+
+---
 
 ## Not verified, or limited by available means
 

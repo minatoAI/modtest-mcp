@@ -202,13 +202,18 @@ fact and it stays on the record:
 | guarded jar (release asset) | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
 | unguarded jar (same cut, not published) | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
 
-**(b) What the current source revision builds.** `10e8eee` (P11 + P12; its main sources are byte-identical
-to `d2559ba` — the later commit touches only `README.md` and `docs/VERIFICATION-LOG.md`) builds:
+**(b) What the current source revision builds.** `3016c53`-era sources (P11 + P12 + the task-77 build-graph
+fix; the P11/P12 *main* sources are byte-identical to `d2559ba`, whose later commits touch only `README.md`
+and `docs/VERIFICATION-LOG.md`, plus the guardrail wiring in `forge/build.gradle`) build:
 
 | | |
 |---|---|
-| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **160,157 B**, **90 entries**, sha256 `D5EDB68412533198E73FB207E85829AEBD5759987A3292D8ED5CA6B4D81CFC81`, manifest `Modtest-Guard-Variant: guarded`, `modtest.refmap.json` + `modtest.harness.mixins.json` present, **73** `:core` classes |
-| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `811114E403755C7F2D4F5AD6FD75D1909BE239DCAA1A89E8A7B24B90B36F0CD6`, manifest `Modtest-Guard-Variant: unguarded` |
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **160,157 B**, **90 entries**, sha256 `CCF801A4CAC432C0A4D0D12B42174D14B879A97FA8670FCDD666565D267481AE`, manifest `Modtest-Guard-Variant: guarded`, `modtest.refmap.json` + `modtest.harness.mixins.json` present, **40 `m_*_` / 10 `f_*_` SRG references** (i.e. reobfuscated), **73** `:core` classes |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `CA4599A87587BA4FE53CDA407B5B9089A4D4CFDC06465BA7F3AB129FA701A686`, manifest `Modtest-Guard-Variant: unguarded` |
+
+**Entry-for-entry identity with the published build.** Both current jars match the bytes shipped as
+`v1.0.0-alpha.3` **entry by entry** — same 90 entry names, same uncompressed sizes, same CRC32s — so the
+content is identical and only the zip timestamps (hence the sha256) differ.
 
 The two variants differ by **47 B**, and that difference is **entirely `META-INF/MANIFEST.MF`** (316 B vs
 369 B uncompressed): every other entry, and its size, is identical. (The published pair differs by the same
@@ -223,27 +228,36 @@ jars is not in its final state.
 2. **Jar bytes are not reproducible.** Zip entry timestamps make a rebuild of the *same* input produce a
    different sha256; even rebuilding `8720db0` would not reproduce `9FD682D9…`.
 
-So compare by **entry count + the four guardrails + content**, never by hashing a local build against the
-released asset. **The next release will carry the new artifacts, and this section will then name the new
-sha as the published identity** (the internal Gradle version string stays `1.0.0-alpha.1`; the version
-lines were deliberately not bumped).
+So compare by **entry count, entry CRC32s and content**, never by hashing a local build against the released
+asset. **The next release will carry the new artifacts, and this section will then name the new sha as the
+published identity** (the internal Gradle version string stays `1.0.0-alpha.1`; the version lines were
+deliberately not bumped).
 
-**Take the artifact from `:forge:build`, never from a guardrail-only run — this is not a theoretical risk.**
-`:forge:jar` alone produces the jar *before* ForgeGradle's `addMixinsToJar` step, so an invocation that
-only ran `:forge:verifyMixinRefmap` / `:forge:verifySelfContainedJar` leaves `build/libs` holding a reduced
-jar that nevertheless passes those checks. Measured directly: after a guardrail-only invocation the jar was
-**159,308 B**, and a following `:forge:build` restored it to **160,157 B** — a **849 B** difference whose
-content is byte-identical across rebuilds otherwise. The trap has already cost us: a reduced jar was once
-reported as the canonical identity (see the corrections in `docs/VERIFICATION-LOG.md`), and a real-machine
-round was stopped by the tester's hash gate because the jar on disk did not match the reported one. Always
-`:forge:build` (or `:forge:build -Punguarded`) before handing a jar to anyone, and **re-measure the identity
-after every rebuild**. **Follow-up, deliberately not done in this cut so the artifact identity is not
-churned again:** make the guardrail tasks depend on `addMixinsToJar`, or fail when the jar they inspect was
-not produced through it.
+**`build/libs` is written twice — verify and ship only the reobfuscated write (task-77, fixed and asserted).**
+`:forge:jar` writes the jar with **official/mapped names and no SRG references**; `reobfJar` then *replaces*
+it with the shippable bytes. An invocation that only ran `:forge:verifyMixinRefmap` /
+`:forge:verifySelfContainedJar` used to stop after the first write, leaving a **non-reobfuscated** jar in
+`build/libs` that nevertheless passed both checks. Measured: that state is **159,308 B with 0 `m_*_`/0 `f_*_`
+references**, versus **160,157 B with 40/10** for the real artifact — an **849 B** gap, and a jar that would
+not work against a real client. Note that both states contain `modtest.refmap.json` **and**
+`modtest.harness.mixins.json`, so checking for the mixin products is *necessary but not sufficient*.
+The trap has already cost us: a reduced (non-reobfuscated) jar was once reported as the canonical identity
+(see the corrections in `docs/VERIFICATION-LOG.md`), and a real-machine round was stopped by the tester's
+hash gate because the jar on disk did not match the reported one. **Fixed in the build graph:**
+- both guardrail tasks now `dependsOn 'reobfJar'`, so a guardrail-only run ends with the final artifact;
+- both guardrails additionally **compare the entry CRCs of `build/libs` against `reobfJar`'s own output**
+  and fail if anything else produced those bytes (the mixin-product check is kept as a second assertion).
+
+Acceptance (measured): `:forge:clean` + the two guardrails alone now leave **160,157 B / 40 `m_*_` refs /
+entry-identical to the shipped jar**, and the same two guardrails **fail loudly** if the `reobfJar`
+dependency is removed (`reobfJar/output.jar does not exist — reobfJar never ran, so the jar in build/libs
+cannot be the shippable artifact`). Always `:forge:build` (or `:forge:build -Punguarded`) before handing a
+jar to anyone, and **re-measure the identity after every rebuild**.
 
 **We do not claim byte-reproducible jars.** A sha identifies *one* build's output only. Integrity rests
 on the **entry count**, the **four guardrails** (`verifyMixinRefmap`, `verifySelfContainedJar`,
-`:core:verifyGsonApiSurface`, and the `pack.mcmeta` assertion) and the **content**, not on the hash.
+`:core:verifyGsonApiSurface`, and the `pack.mcmeta` assertion), the **reobfJar identity assertion** and the
+**content**, not on the hash.
 
 ### 9.2 Real-machine verification (honest list)
 

@@ -41,6 +41,17 @@ dependencies {
 // Same build flag as :core, so both artifacts identify the same way (see Guard.BuildVariant).
 def guardVariant = project.hasProperty('unguarded') ? 'unguarded' : 'guarded'
 
+// ---- shared: entry CRCs of a jar, used to prove a task inspected the FINAL artifact ------------
+// task-77. Two different wrong states were mistaken for the shippable jar during the alpha.3 cut,
+// so the guardrails now compare what they read against what reobfJar produced, entry by entry.
+ext.jarEntryCrcs = { File f ->
+    def crcs = [:]
+    new java.util.zip.ZipFile(f).withCloseable { zf ->
+        zf.entries().each { e -> if (!e.isDirectory()) { crcs[e.name] = e.crc } }
+    }
+    return crcs
+}
+
 // ---- guardrail: fail the build when a mixin member reference would not be remapped -----------
 // "0/1 injection points matched" is otherwise only observable when a real client starts (and then
 // it is fatal). This task reads the mixin sources, resolves every member reference against the same
@@ -57,8 +68,15 @@ tasks.register('verifyMixinRefmap') {
     group = 'verification'
     description = 'Fails the build when a mixin member reference is missing from the packaged refmap'
     dependsOn 'compileJava'
+    // task-77: verify the FINAL artifact. `build/libs` is written twice — by `jar` (official/mapped
+    // names, no SRG references) and then by `reobfJar`, which replaces it with the shippable bytes.
+    // A guardrail-only invocation used to stop after `jar`, leaving build/libs holding the
+    // NON-REOBFUSCATED intermediate: measured 159,308 B with ZERO SRG references, versus 160,157 B
+    // with 40 m_*/10 f_* references for the real artifact. That jar would not work in a client.
+    dependsOn 'reobfJar'
     def tsrgFile = file("$buildDir/createMcpToSrg/output.tsrg")
     def refmapName = 'modtest.refmap.json'
+    def mixinConfigName = 'modtest.harness.mixins.json'
     def sources = fileTree('src/main/java') { include '**/*Mixin*.java' }
     inputs.files sources
     inputs.file tsrgFile
@@ -121,6 +139,26 @@ tasks.register('verifyMixinRefmap') {
         if (!jarFile.exists()) {
             throw new GradleException("[modtest] guardrail: jar not built: ${jarFile}")
         }
+        // task-77: `build/libs` must hold what reobfJar produced, not the plain `jar` output that
+        // reobfuscation has not touched yet. Comparing entry CRCs with reobfJar's own output is the
+        // mechanical check — it fails whenever any other task's bytes are sitting in build/libs,
+        // which the mixin-product check below does NOT catch (the intermediate has both products).
+        // ForgeGradle declares no outputs for reobfJar, so use the path this project actually produces
+        // (verified: build/reobfJar/output.jar, content-identical to the shipped build/libs jar).
+        def reobfOutput = file("$buildDir/reobfJar/output.jar")
+        if (!reobfOutput.exists()) {
+            throw new GradleException("[modtest] guardrail FAILED: ${reobfOutput} does not exist — " +
+                    "reobfJar never ran, so the jar in build/libs cannot be the shippable artifact.")
+        }
+        def expectedCrcs = jarEntryCrcs(reobfOutput)
+        def actualCrcs = jarEntryCrcs(jarFile)
+        def mismatched = (expectedCrcs.keySet() + actualCrcs.keySet()).findAll { expectedCrcs[it] != actualCrcs[it] }
+        if (!mismatched.isEmpty()) {
+            throw new GradleException("[modtest] guardrail FAILED: ${jarFile} is NOT the reobfuscated " +
+                    "artifact — ${mismatched.size()} entrie(s) differ from ${reobfOutput}: " +
+                    "${mismatched.take(8)}. A guardrail-only invocation must not leave a " +
+                    "non-reobfuscated jar in build/libs.")
+        }
         def refmapText = null
         new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
             def entry = zf.getEntry(refmapName)
@@ -128,6 +166,15 @@ tasks.register('verifyMixinRefmap') {
                 throw new GradleException("[modtest] guardrail: the jar contains no ${refmapName}")
             }
             refmapText = zf.getInputStream(entry).getText('UTF-8')
+            // task-77: and it must carry the mixin products. This check alone is NOT sufficient — the
+            // measured non-reobfuscated intermediate contains both of them — so the reobfJar identity
+            // comparison above is the one that actually holds the line.
+            def missingProducts = [refmapName, mixinConfigName].findAll { zf.getEntry(it) == null }
+            if (!missingProducts.isEmpty()) {
+                throw new GradleException("[modtest] guardrail FAILED: the jar is not the final artifact — " +
+                        "it is missing the mixin product(s) ${missingProducts}. Never verify or ship an " +
+                        "intermediate jar; build with :forge:build.")
+            }
         }
 
         def problems = []
@@ -145,7 +192,8 @@ tasks.register('verifyMixinRefmap') {
             throw new GradleException("[modtest] guardrail FAILED:\n  " + problems.join("\n  "))
         }
         logger.lifecycle("[modtest] guardrail OK — C1 bare names ${bareNames} present, " +
-                "C2/C3 member refs resolved: ${expected}")
+                "C2/C3 member refs resolved: ${expected}; final artifact carries " +
+                "[${refmapName}, ${mixinConfigName}]")
     }
 }
 
@@ -158,6 +206,10 @@ tasks.register('verifySelfContainedJar') {
     group = 'verification'
     description = 'Fails the build when the packaged jar does not carry the :core library'
     dependsOn 'jar'
+    // task-77: this task is the one that triggers `jar`, so without reobfJar in its graph it inspects
+    // the NON-REOBFUSCATED intermediate (build/libs is written by `jar` first, then replaced by
+    // `reobfJar`). Both the dependency and the identity assertion below are needed.
+    dependsOn 'reobfJar'
     outputs.upToDateWhen { false }
     doLast {
         def coreClassesDir = project(':core').layout.buildDirectory.dir('classes/java/main').get().asFile
@@ -172,8 +224,13 @@ tasks.register('verifySelfContainedJar') {
         boolean packMcmeta = false
         def nestedJars = [:]
         def metadata = null
+        def mixinProductsPresent = [] as Set
+        def requiredMixinProducts = ['modtest.refmap.json', 'modtest.harness.mixins.json']
         new java.util.zip.ZipFile(jarFile).withCloseable { zf ->
             zf.entries().each { e ->
+                if (e.name in requiredMixinProducts) {
+                    mixinProductsPresent << e.name
+                }
                 if (e.name.startsWith('io/github/minatoai/modtest/core/') && e.name.endsWith('.class')) {
                     topLevelCore++
                 }
@@ -199,8 +256,34 @@ tasks.register('verifySelfContainedJar') {
             }
         }
         int nestedCore = nestedJars.values().sum() ?: 0
+        // task-77: the artifact read here must be what reobfJar produced. This is the assertion that
+        // catches the non-reobfuscated intermediate (measured: 0 SRG references, 159,308 B); the mixin
+        // products exist in BOTH states, so checking those alone would have passed the wrong jar.
+        def reobfOutput = file("$buildDir/reobfJar/output.jar")
+        if (!reobfOutput.exists()) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: ${reobfOutput} does not " +
+                    "exist — reobfJar never ran, so the jar in build/libs cannot be the shippable artifact.")
+        }
+        def expectedCrcs = jarEntryCrcs(reobfOutput)
+        def actualCrcs = jarEntryCrcs(jarFile)
+        def notReobfuscated = (expectedCrcs.keySet() + actualCrcs.keySet())
+                .findAll { expectedCrcs[it] != actualCrcs[it] }
+        if (!notReobfuscated.isEmpty()) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: ${jarFile} is NOT the " +
+                    "reobfuscated artifact — ${notReobfuscated.size()} entrie(s) differ from ${reobfOutput}: " +
+                    "${notReobfuscated.take(8)}. A guardrail-only invocation must not leave a " +
+                    "non-reobfuscated jar in build/libs.")
+        }
+        // task-77: same final-artifact mixin check as verifyMixinRefmap — necessary, not sufficient.
+        def missingMixinProducts = requiredMixinProducts.findAll { !mixinProductsPresent.contains(it) }
+        if (!missingMixinProducts.isEmpty()) {
+            throw new GradleException("[modtest] self-contained guardrail FAILED: the jar is not the final " +
+                    "artifact — it is missing the mixin product(s) ${missingMixinProducts}. Build with " +
+                    ":forge:build so addMixinsToJar runs.")
+        }
         logger.lifecycle("[modtest] self-contained check: :core compiled=${coreClasses} class(es); " +
-                "top-level core=${topLevelCore}; nested jars=${nestedJars}; metadata=${metadata}")
+                "top-level core=${topLevelCore}; nested jars=${nestedJars}; metadata=${metadata}; " +
+                "mixin products=${mixinProductsPresent.sort()}")
         if (topLevelCore + nestedCore == 0) {
             throw new GradleException("[modtest] self-contained guardrail FAILED: the jar carries NO " +
                     ":core classes (top-level=0, nested=0). Use jarJar(implementation(project(':core'))) " +

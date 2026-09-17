@@ -154,6 +154,9 @@ public final class ModtestHarnessMod {
         int ticks = readTicks(op.params());
         Guard.Decision decision = guardedWriter.submit(command, inputOp,
                 new MinecraftSessionState(mc), activation, Bridge.Clock.system());
+        // A refusal is NOT a successful op: `ok:true` must mean "this op really executed". The
+        // executor turns this exception into ops[].ok=false + error.code (see Guard.requireAllowed).
+        Guard.requireAllowed(decision, "input.set");
         if (decision.allowed() && !decision.noop() && ticks > 1) {
             PENDING_TICKS.set(ticks - 1);
         }
@@ -163,7 +166,13 @@ public final class ModtestHarnessMod {
         out.addProperty("noop", decision.noop());
         out.addProperty("reason", decision.reason());
         out.addProperty("ticks", ticks);
-        out.addProperty("command", command.summary());
+        // Named for what it is: the command that was QUEUED (the ticket's own values). What the client
+        // actually receives is the clamped value, reported as `writtenCommand` and in the audit line
+        // (`ALLOWED-INPUT … cmd=[…]`), which is the authoritative record.
+        out.addProperty("queuedCommand", command.summary());
+        if (decision.allowed() && !decision.noop() && guardedWriter.lastCommand() != null) {
+            out.addProperty("writtenCommand", guardedWriter.lastCommand().summary());
+        }
         return out;
     }
 

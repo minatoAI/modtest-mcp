@@ -286,6 +286,29 @@ values actually written. `ticks` is a **hold duration** (the reference implement
 it is a scheduling hint, not part of the command value, and every tick of the hold is re-evaluated
 by the guard.
 
+**What the receipt reports, and what it does not.** The result carries `queued:true` (the command was
+accepted for injection), `queuedCommand` (the values **as requested in the ticket**), and — when a
+write actually happened — `writtenCommand` (the values **after** clamping) plus `ticks`. These are
+*not* the authoritative record of what reached the client: the **audit line**
+`ALLOWED-INPUT … cmd=[…]` in the executor log is. Read `writtenCommand` as a convenience copy;
+read the audit line as the evidence.
+
+### 6.2a Op outcome: `ok:true` means the op really executed (clarification)
+
+**Normative rule:** `ok:true` on an `ops[]` entry means *that op executed*. Consequences:
+
+* A **guard refusal** (dev flag off, no valid activation token, undeclared host) is **not** an
+  executed op: it MUST be reported as `ok:false` with a stable `error.code` —
+  `E_PRECONDITION` — and a message that preserves the detail (`allowed=false`, `queued=false`, the
+  refusal reason). It MUST NOT be reported as `ok:true` with `allowed:false`.
+* A **no-op** is different: the op *did* execute and determined there was nothing to do (client
+  paused, handshake, not in a world). It keeps `ok:true` together with `noop:true`.
+* Therefore "every `ops[].ok` is true" is a valid success test, and this is a **clarification inside
+  1.0, not a version change**: no new error code is introduced (`E_PRECONDITION` already covers the
+  guard's conditions), so no negotiation is affected. Executors that previously emitted
+  `ok:true` + `allowed:false` for guard refusals were the bug; agents that keyed on
+  `ops[].ok` were being told that a refused injection had happened.
+
 ### 6.3 Preconditions
 
 | Kind | Payload | Satisfied when |

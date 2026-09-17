@@ -300,6 +300,27 @@ public final class Guard {
         }
     }
 
+    /**
+     * The executor contract for a guard decision: <b>a refusal means the op did not execute</b>, so
+     * callers must surface it as an op with {@code ok:false} and a stable error code — never as a
+     * successful op that merely reports {@code allowed:false}. Otherwise the natural reading
+     * ("all ops ok ⇒ the ticket succeeded") would treat a guarded injection as having happened.
+     *
+     * <p>Lives in core (not in the Forge adapter) so the encoding is unit-tested without Minecraft.
+     * {@code E_PRECONDITION} is reused deliberately: the guard's conditions (dev flag, unexpired
+     * token, single-player or declared host) are preconditions, so no new wire code and no protocol
+     * version change are needed. A no-op decision (paused / handshake) is <i>not</i> a refusal: the
+     * op did execute and decided there was nothing to do, and keeps {@code ok:true} + {@code noop:true}.
+     */
+    public static void requireAllowed(Decision decision, String opName) {
+        if (!decision.allowed()) {
+            throw (Protocol.ProtocolException) new Protocol.ProtocolException(
+                    Protocol.ErrorCode.E_PRECONDITION,
+                    opName + " refused by the guard (allowed=false, queued=false, noop=false): "
+                            + decision.reason());
+        }
+    }
+
     /** The injection port. The only thing allowed to touch player input. */
     public interface InputWriter {
         void write(InputCommand command);

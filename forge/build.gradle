@@ -234,6 +234,11 @@ tasks.named('jar') {
     // its own test suite and a Minecraft-free classpath). reobfJar then reobfuscates everything;
     // :core contains no Minecraft references, so reobf is a no-op for it.
     from(project(':core').sourceSets.main.output)
+    // The unguarded variant gets its own classifier so BOTH artifacts can sit on disk at once and
+    // can never be confused inside mods/ (each still identifies itself in its manifest).
+    if (guardVariant == 'unguarded') {
+        archiveClassifier = 'unguarded'
+    }
     archiveBaseName = 'modtest-harness-forge'
     manifest {
         attributes(

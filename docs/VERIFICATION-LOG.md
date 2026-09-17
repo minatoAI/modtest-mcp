@@ -278,6 +278,12 @@ operator's own machine; **nothing was simulated or copied from a green unit test
   2. **After `inv.select`, let the synchronisation window close before sending the placement.** The server
      learns the carried slot from the packet, and the view core reads may still be catching up; an op sent
      in the same instant can be answered `cannot determine` even though the selection was correct.
+  3. **Take the artifact from `:forge:build`, never from a guardrail-only run.** Running only the guardrail
+     tasks triggers `:forge:jar` but not ForgeGradle's `addMixinsToJar`, so `build/libs` is left holding a
+     jar **865 B smaller** than the shippable one (157,906 B vs 159,308 B) that nevertheless passes those
+     checks. Found while freezing an artifact for a real-machine round; now written into `README` §9.1
+     together with the follow-up (make the guardrails depend on `addMixinsToJar`), deliberately not done in
+     this cut so the artifact identity is not churned again.
 
 ---
 

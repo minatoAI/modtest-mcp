@@ -188,13 +188,48 @@ clear about what you are switching off:
 |---|---|
 | product version | `1.0.0a1` (Python/MCP server) / `1.0.0-alpha.1` (Gradle) |
 | protocol version | `modtest-bridge/1.0` (independent of the product version) |
-| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
-| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
 | packaged `:core` classes | **73** (enforced by the `verifySelfContainedJar` guardrail) |
 | also inside each jar | `pack.mcmeta` (pack_format 15) and `modtest.refmap.json` (Mixin AP output) |
 
-**We do not claim byte-reproducible jars.** Building the same input twice produces different
-sha256 values (zip entry timestamps), so a sha identifies *one* build's output only. Integrity rests
+**There are two artifact identities. They differ, on purpose, and neither one is wrong.**
+
+**(a) The published asset — what a downloader gets.** Release `v1.0.0-alpha.2` was cut from `8720db0`,
+*before* the P11 (real interaction path) and P12 (bounded sync window) fixes. This is an already-published
+fact and it stays on the record:
+
+| | |
+|---|---|
+| guarded jar (release asset) | `modtest-harness-forge-1.0.0-alpha.1.jar` — 156,554 B, **90 entries**, sha256 `9FD682D9C7241AA600F15EBAD2C74332E803AE1B461E262DEFDAF184AA79CDD2`, manifest `Modtest-Guard-Variant: guarded` |
+| unguarded jar (same cut, not published) | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — 156,601 B, **90 entries**, sha256 `610C6AE91D794293955DAAE822966DFDDC104F17394C46FB43187CA36E15CE71`, manifest `Modtest-Guard-Variant: unguarded` |
+
+**(b) What the current source revision builds.** `d2559ba` (P11 + P12) builds:
+
+| | |
+|---|---|
+| guarded jar | `modtest-harness-forge-1.0.0-alpha.1.jar` — **159,308 B**, **90 entries**, sha256 `915BDA5CB9BCC2BAE91070BFB7428302F8030205D95AAF77C9202EF4A8F10CB2`, `modtest.refmap.json` present |
+| unguarded jar | `modtest-harness-forge-1.0.0-alpha.1-unguarded.jar` — **160,204 B**, **90 entries**, sha256 `811114E403755C7F2D4F5AD6FD75D1909BE239DCAA1A89E8A7B24B90B36F0CD6` |
+
+**Why the two differ — so a source build's sha is not a contradiction.** Two independent reasons:
+1. **The code changed.** P11/P12 add the interaction-path placement, the bounded sync window and the
+   agent-facing text, so the current jars are *bigger* (+537 B guarded, +1,386 B unguarded) than the
+   published one. Same entry count (90), different content.
+2. **Jar bytes are not reproducible.** Zip entry timestamps make a rebuild of the *same* input produce a
+   different sha256; even rebuilding `8720db0` would not reproduce `9FD682D9…`.
+
+So compare by **entry count + the four guardrails + content**, never by hashing a local build against the
+released asset. **The next release will carry the new artifacts, and this section will then name the new
+sha as the published identity** (the internal Gradle version string stays `1.0.0-alpha.1`; the version
+lines were deliberately not bumped).
+
+**Take the artifact from `:forge:build`, never from a guardrail-only run.** `:forge:jar` alone produces the
+jar *before* ForgeGradle's `addMixinsToJar` step, so a build that only ran `:forge:verifyMixinRefmap` /
+`:forge:verifySelfContainedJar` leaves a jar **865 B smaller** than the shippable one (157,906 B vs
+159,308 B in the current revision) — and it still passes those checks. Always `:forge:build` (or
+`:forge:build -Punguarded`) before handing a jar to anyone. **Follow-up, deliberately not done in this
+cut so the artifact identity is not churned again:** make the guardrail tasks depend on
+`addMixinsToJar`, or fail when the jar they inspect was not produced through it.
+
+**We do not claim byte-reproducible jars.** A sha identifies *one* build's output only. Integrity rests
 on the **entry count**, the **four guardrails** (`verifyMixinRefmap`, `verifySelfContainedJar`,
 `:core:verifyGsonApiSurface`, and the `pack.mcmeta` assertion) and the **content**, not on the hash.
 

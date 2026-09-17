@@ -309,6 +309,29 @@ read the audit line as the evidence.
   `ok:true` + `allowed:false` for guard refusals were the bug; agents that keyed on
   `ops[].ok` were being told that a refused injection had happened.
 
+### 6.2b Declared hosts, and "requested ≠ applied"
+
+**Host allow-list matching (normative).** The allow-list compares the **host only**; the port is
+ignored in both directions (`MODTEST_ALLOWED_HOSTS=127.0.0.1` matches a connection to
+`127.0.0.1:25585`, and a declaration of `localhost:25585` matches a connection to `localhost`).
+Rationale: declaring a host declares *the machine*, so a development server may move ports without
+invalidating the declaration, and a low port number cannot become a way to slip past a declaration.
+IPv6 addresses **must be bracketed** when a port is present (`[::1]`, `[::1]:25585`); a bracketed
+address matches a connection to the same address. If an executor cannot determine the address of a
+**connected** session it **MUST** refuse and say so — *"host address unavailable … cannot verify
+ownership; refusing instead of assuming it is allowed"* — and MUST NOT guess an address, and MUST NOT
+treat an unknown address as an allowance. (Single-player needs no address: the policy allows it
+before the allow-list is consulted.)
+
+**Partial application.** An op that can only partially take effect — `pose.set` against a
+server-authoritative session is the reference case — MUST report what actually happened:
+`applied:{field: value}` and `skipped:{field: {requested, actual}}`, plus
+`authority: "client" | "server"` and a `note` naming the authority. `ok:true` keeps meaning "the op
+executed" (§6.2a) and never implies "every requested field took effect". Semantics by session:
+single-player (client authority) — a settled teleport *is* the real pose, so `applied` should be
+complete; multiplayer (server authority) — the server owns the player position, so position fields
+may land in `skipped` while client-side rotation still applies.
+
 ### 6.3 Preconditions
 
 | Kind | Payload | Satisfied when |

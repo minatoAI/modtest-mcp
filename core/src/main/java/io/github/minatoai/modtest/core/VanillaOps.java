@@ -164,25 +164,69 @@ public final class VanillaOps {
         }
     }
 
-    /** {@code pose.set} — teleport then read back (settle verification). */
+    /** {@code pose.set} — teleport then read back, reporting what actually took effect. */
     public static final class PoseOps implements Executor.OpHandler {
+        private static final double COORD_EPS = 1.0e-3;
+        private static final double ANGLE_EPS = 1.0e-3;
+
         @Override
         public JsonObject handle(Protocol.Ticket.Op op, Executor.ExecContext ctx) {
             JsonObject p = op.params() == null ? Json.object() : op.params();
             ClientModel c = ctx.client();
-            c.teleport(p.get("x").getAsDouble(), p.get("y").getAsDouble(), p.get("z").getAsDouble(),
-                    p.get("yaw").getAsFloat(), p.get("pitch").getAsFloat(),
-                    Json.intOr(p, "settle_ms", 250));
+            double rx = p.get("x").getAsDouble();
+            double ry = p.get("y").getAsDouble();
+            double rz = p.get("z").getAsDouble();
+            float ryaw = p.get("yaw").getAsFloat();
+            float rpitch = p.get("pitch").getAsFloat();
+            c.teleport(rx, ry, rz, ryaw, rpitch, Json.intOr(p, "settle_ms", 250));
+
+            double ax = c.x();
+            double ay = c.y();
+            double az = c.z();
+            float ayaw = c.yaw();
+            float apitch = c.pitch();
             JsonObject pose = Json.object();
-            pose.addProperty("x", c.x());
-            pose.addProperty("y", c.y());
-            pose.addProperty("z", c.z());
-            pose.addProperty("yaw", c.yaw());
-            pose.addProperty("pitch", c.pitch());
+            pose.addProperty("x", ax);
+            pose.addProperty("y", ay);
+            pose.addProperty("z", az);
+            pose.addProperty("yaw", ayaw);
+            pose.addProperty("pitch", apitch);
+
+            // "requested" is not "applied". On a server-authoritative session the position the client
+            // sets is rubber-banded back while client-side rotation survives, so the receipt must say
+            // which fields actually took effect instead of letting ok:true imply "all of them did".
+            JsonObject applied = Json.object();
+            JsonObject skipped = Json.object();
+            compare(applied, skipped, "x", rx, ax, COORD_EPS);
+            compare(applied, skipped, "y", ry, ay, COORD_EPS);
+            compare(applied, skipped, "z", rz, az, COORD_EPS);
+            compare(applied, skipped, "yaw", ryaw, ayaw, ANGLE_EPS);
+            compare(applied, skipped, "pitch", rpitch, apitch, ANGLE_EPS);
+
+            boolean integrated = ctx.session().hasIntegratedServer() && !ctx.session().connectedToRemoteServer();
             JsonObject out = Json.object();
             out.add("pose", pose);
             out.addProperty("settled", c.settled());
+            out.add("applied", applied);
+            out.add("skipped", skipped);
+            out.addProperty("authority", integrated ? "client" : "server");
+            out.addProperty("note", integrated
+                    ? "single-player: the client is authoritative, so a settled pose is the real pose"
+                    : "multiplayer: the server owns the player position, so position fields may be "
+                            + "requested but not take effect (rotation is client-side and usually does)");
             return out;
+        }
+
+        private static void compare(JsonObject applied, JsonObject skipped, String field,
+                                    double requested, double actual, double eps) {
+            if (Math.abs(requested - actual) <= eps) {
+                applied.addProperty(field, actual);
+            } else {
+                JsonObject s = Json.object();
+                s.addProperty("requested", requested);
+                s.addProperty("actual", actual);
+                skipped.add(field, s);
+            }
         }
     }
 

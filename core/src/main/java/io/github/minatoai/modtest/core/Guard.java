@@ -423,6 +423,13 @@ public final class Guard {
                 return Decision.allow("single-player world");
             }
             String host = session.serverAddress();
+            if (host == null || host.isBlank() || host.equalsIgnoreCase("unknown")) {
+                // No address means ownership cannot be checked. Refuse explicitly (and say why) rather
+                // than letting a null quietly miss the whitelist and be reported as a miss.
+                return Decision.deny("refused: host address unavailable (session reports '"
+                        + (host == null ? "null" : host) + "') — cannot verify ownership; refusing "
+                        + "instead of assuming it is allowed");
+            }
             if (whitelist.permitsHost(host)) {
                 return Decision.allow("explicitly whitelisted host: " + host);
             }

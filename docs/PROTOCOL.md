@@ -356,10 +356,32 @@ shorter than the revert delay. Rules for ops that report what took effect:
   **`poseSource: "client-readback"`**; `settled` means "the settle loop converged", not "this pose is
   authoritative"; and `ticks` on an `input.set` receipt is the **requested hold length**, not the
   number of writes performed (those appear only in the audit lines);
-* `authority` and `note` are derived from the same verdict as `applied`/`skipped`, so they cannot
+* **three states, not two.** A field is reported in exactly one of:
+  * **`applied`** — the client owns it and the settled value matches the request (rotation);
+  * **`notClientVerifiable`** — the authority owns it and the client cannot witness the outcome. The
+    request was delivered; whether the authority applied it is not observable from the client. Each
+    entry carries `requested` + `observedAtReadback` + `reason: "the server owns the position; the
+    client cannot witness whether it applied"`;
+  * **`skipped`** — it did **not** take effect, or could not be decided: `reason` is
+    `"server-authoritative position"` (the client watched the value revert), `"did not take effect"`,
+    or `"not settled"` (the settle window expired).
+  **One word must never carry two meanings**: conflating "did not take effect" with "applied but the
+  client cannot testify to it" reported a *working* remote teleport as if it had failed.
+* `authority` and `note` are derived from the same verdict as the three states, so they cannot
   contradict it;
-* **when in doubt, report `skipped`.** An honest "not applied / cannot be determined" is required;
-  an `applied` that turns out to be false is a defect.
+* **when in doubt, report `skipped` or `notClientVerifiable`.** An honest "not applied / cannot be
+  determined" is required; an `applied` that turns out to be false is a defect.
+
+**Session asymmetry (measured, and it is not a detail).** The same `pose.set` behaves in opposite ways:
+
+| Session | Position after `pose.set` | Evidence |
+|---|---|---|
+| single-player (integrated server) | **reverted to the old value in < 0.57 s** | round 11/12 read-backs; the value was back to `2.85136002226049` |
+| remote (LAN, dedicated server) | **applied and persisted; no revert within 16.4 s** | round 14: client read `z=12` for +16.39 s; a *newly connected* client read `z=12.0` before sending any request; the server log shows `at (…, 17.60936942239352)` on first login and `at (…, 12.0)` on the second |
+
+So "position does not stick" is a **single-player** fact, not a protocol fact. On a remote session the
+position change is a real, usable capability — which is exactly why it must be reported as
+`notClientVerifiable` rather than `skipped`.
 
 **Authority is not "single-player vs multiplayer".** A single-player world's **integrated server is
 authoritative too**: client-side `moveTo` values are overwritten by the next authoritative update, so

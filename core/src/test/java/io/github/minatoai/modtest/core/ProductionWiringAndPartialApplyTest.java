@@ -256,10 +256,10 @@ class ProductionWiringAndPartialApplyTest {
                 new Protocol.Ticket.Op("p1", "pose.set", poseParams(), null, null, null), ctx(client, false));
 
         assertEquals(1, client.teleports);
-        JsonObject skipped = out.getAsJsonObject("skipped");
+        JsonObject skipped = out.getAsJsonObject("notClientVerifiable");
         assertNotNull(skipped, "a partial application must be reportable: " + out);
         for (String f : List.of("x", "y", "z")) {
-            assertTrue(skipped.has(f), f + " must be reported as skipped: " + out);
+            assertTrue(skipped.has(f), f + " must be reported as notClientVerifiable: " + out);
             assertTrue(skipped.getAsJsonObject(f).has("requested"), out.toString());
             assertTrue(skipped.getAsJsonObject(f).has("observedAtReadback"), out.toString());
         }

@@ -219,16 +219,26 @@ public final class VanillaOps {
 
             JsonObject applied = Json.object();
             JsonObject skipped = Json.object();
-            if (settled) {
-                // x/y/z are owned by the authority on BOTH session types (a single-player world's
-                // integrated server included) => always skipped, never "applied". A window-internal
-                // read-back cannot prove anything about them.
+            JsonObject notClientVerifiable = Json.object();
+            if (settled && integrated) {
+                // Single-player: the integrated server is authoritative AND the client can watch the
+                // value revert (measured < 0.57 s), so "did not take effect" is the honest verdict.
                 serverOwned(skipped, "x", rx, second.x());
                 serverOwned(skipped, "y", ry, second.y());
                 serverOwned(skipped, "z", rz, second.z());
                 // Rotation is client-authoritative, so it may legitimately be reported as applied.
-                compareApplied(applied, skipped, "yaw", ryaw, second.yaw(), ANGLE_EPS, integrated);
-                compareApplied(applied, skipped, "pitch", rpitch, second.pitch(), ANGLE_EPS, integrated);
+                compareApplied(applied, skipped, "yaw", ryaw, second.yaw(), ANGLE_EPS, true);
+                compareApplied(applied, skipped, "pitch", rpitch, second.pitch(), ANGLE_EPS, true);
+            } else if (settled) {
+                // Remote authority. On a real LAN the position change DID apply and persist (16.4 s,
+                // survived a reconnect, confirmed by the server log), but the client cannot witness
+                // that. Calling it `skipped` hid a working feature; calling it `applied` would claim
+                // something the client cannot see. Hence the third state.
+                notVerifiable(notClientVerifiable, "x", rx, second.x());
+                notVerifiable(notClientVerifiable, "y", ry, second.y());
+                notVerifiable(notClientVerifiable, "z", rz, second.z());
+                compareApplied(applied, skipped, "yaw", ryaw, second.yaw(), ANGLE_EPS, false);
+                compareApplied(applied, skipped, "pitch", rpitch, second.pitch(), ANGLE_EPS, false);
             } else {
                 // Nothing may be reported as applied when the pose never settled.
                 notSettled(skipped, "x", rx);
@@ -242,13 +252,19 @@ public final class VanillaOps {
             // contradict it (a real receipt once claimed every position field was applied while its
             // own note said the server owns the position).
             String note = (integrated
-                    ? "single-player: the integrated server is authoritative too"
-                    : "multiplayer: the server owns the player position")
+                    ? "single-player: the integrated server is authoritative too, and the client can "
+                            + "watch the value revert (< 0.57 s measured) — position is reported as skipped"
+                    : "multiplayer: the server owns the player position; a LAN measurement showed the "
+                            + "position change DID apply and persist (16.4 s, survived a reconnect, "
+                            + "confirmed by the server log), but the client cannot witness it — position "
+                            + "is reported as notClientVerifiable")
                     + "; client position readings cannot be authoritative; position is owned by the server"
                     + (settled
                             ? (applied.size() == FIELDS.size()
                                     ? "; every requested field took effect"
-                                    : "; not applied: " + skipped.keySet())
+                                    : (skipped.size() > 0
+                                            ? "; not applied: " + skipped.keySet()
+                                            : "; position is not client-verifiable (see notClientVerifiable)"))
                             : "; the pose did not settle within " + budget
                                     + " client ticks, so nothing is reported as applied");
 
@@ -260,6 +276,7 @@ public final class VanillaOps {
             out.addProperty("settled", settled);
             out.add("applied", applied);
             out.add("skipped", skipped);
+            out.add("notClientVerifiable", notClientVerifiable);
             out.addProperty("authority", integrated ? "client" : "server");
             out.addProperty("note", note);
             return out;
@@ -283,6 +300,19 @@ public final class VanillaOps {
             s.addProperty("observedAtReadback", observed);
             s.addProperty("reason", "server-authoritative position");
             skipped.add(field, s);
+        }
+
+        /**
+         * A field the client cannot witness: the request was delivered, but whether the authority
+         * applied it is not observable from here. Distinct from {@code skipped}, which means "did not
+         * take effect" — conflating the two reported a working remote teleport as if it had failed.
+         */
+        private static void notVerifiable(JsonObject target, String field, double requested, double observed) {
+            JsonObject s = Json.object();
+            s.addProperty("requested", requested);
+            s.addProperty("observedAtReadback", observed);
+            s.addProperty("reason", "the server owns the position; the client cannot witness whether it applied");
+            target.add(field, s);
         }
 
         private static void compareApplied(JsonObject applied, JsonObject skipped, String field, double requested,

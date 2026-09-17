@@ -196,10 +196,11 @@ class PoseSettleVerdictTest {
 
         assertEquals(true, out.get("settled").getAsBoolean(), out.toString());
         JsonObject applied = out.getAsJsonObject("applied");
-        JsonObject skipped = out.getAsJsonObject("skipped");
+        JsonObject skipped = out.getAsJsonObject("notClientVerifiable");
         for (String f : List.of("x", "y", "z")) {
             assertFalse(applied.has(f), f + " must NOT be reported as applied: " + out);
-            assertTrue(skipped.has(f), f + " must be reported as skipped: " + out);
+            assertTrue(skipped.has(f), f + " must be reported as notClientVerifiable (a remote authority"
+                    + " owns it and the client cannot witness it): " + out);
             assertTrue(skipped.getAsJsonObject(f).has("observedAtReadback"), out.toString());
             assertTrue(skipped.getAsJsonObject(f).has("requested"), out.toString());
         }
@@ -256,14 +257,19 @@ class PoseSettleVerdictTest {
                 assertEquals(0, applied.size(), "unsettled ⇒ nothing applied: " + out);
                 assertTrue(note.contains("did not settle"), note);
             } else {
-                // Every field is accounted for exactly once, and applied values equal the read-back.
-                assertEquals(5, applied.size() + skipped.size(), out.toString());
+                // Every requested field must be accounted for in exactly ONE of the three states, so
+                // "did not take effect" (skipped) can never be confused with "the client cannot
+                // witness it" (notClientVerifiable).
+                JsonObject unverifiable = out.getAsJsonObject("notClientVerifiable");
+                assertEquals(5, applied.size() + skipped.size() + unverifiable.size(), out.toString());
                 for (String f : List.of("x", "y", "z", "yaw", "pitch")) {
-                    assertTrue(applied.has(f) ^ skipped.has(f), f + " must appear exactly once: " + out);
+                    int states = (applied.has(f) ? 1 : 0) + (skipped.has(f) ? 1 : 0)
+                            + (unverifiable.has(f) ? 1 : 0);
+                    assertEquals(1, states, f + " must appear in exactly one state: " + out);
                 }
                 assertEquals(applied.size() == 5, note.contains("every requested field took effect"), note);
                 if (applied.size() < 5) {
-                    assertTrue(note.contains("not applied: "), note);
+                    assertTrue(note.contains("not applied: ") || note.contains("not client-verifiable"), note);
                 }
             }
         }

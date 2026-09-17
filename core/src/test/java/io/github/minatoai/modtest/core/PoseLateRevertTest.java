@@ -177,35 +177,56 @@ class PoseLateRevertTest {
                 new Protocol.Ticket.Op("p1", "pose.set", REQUEST, null, null, null), ctx);
     }
 
-    private static void assertPositionAlwaysSkipped(JsonObject out, String authority) {
+    /**
+     * Position is never `applied` on either session type — but the reason differs, and that difference
+     * is what P8 was about: single-player means "did not take effect" (the client watches the revert),
+     * while a remote authority may well have applied it without the client being able to witness it.
+     */
+    private static void assertPositionNotApplied(JsonObject out, String authority, boolean remote) {
         JsonObject applied = out.getAsJsonObject("applied");
-        JsonObject skipped = out.getAsJsonObject("skipped");
+        JsonObject target = out.getAsJsonObject(remote ? "notClientVerifiable" : "skipped");
         for (String f : List.of("x", "y", "z")) {
             assertFalse(applied.has(f), f + " must never be applied (the server owns position): " + out);
-            assertTrue(skipped.has(f), out.toString());
-            assertEquals("server-authoritative position",
-                    skipped.getAsJsonObject(f).get("reason").getAsString(), out.toString());
+            assertTrue(target.has(f), f + " must be reported as "
+                    + (remote ? "notClientVerifiable" : "skipped") + ": " + out);
         }
         assertFalse(out.has("confirmed"),
                 "the misleading 'confirmed' field must be gone: " + out);
         assertTrue(out.get("note").getAsString().contains("client position readings cannot be authoritative"),
                 out.toString());
         assertEquals(authority, out.get("authority").getAsString());
+        if (remote) {
+            assertEquals(0, out.getAsJsonObject("skipped").size(),
+                    "a remote position must NOT be reported as 'skipped' (= did not take effect): " + out);
+            assertEquals("the server owns the position; the client cannot witness whether it applied",
+                    out.getAsJsonObject("notClientVerifiable").getAsJsonObject("z").get("reason").getAsString(),
+                    out.toString());
+        } else {
+            assertEquals(0, out.getAsJsonObject("notClientVerifiable").size(),
+                    "single-player can observe the revert, so nothing is merely unverifiable: " + out);
+            assertEquals("server-authoritative position",
+                    out.getAsJsonObject("skipped").getAsJsonObject("z").get("reason").getAsString(),
+                    out.toString());
+        }
     }
 
     @Test
-    void positionIsNotAppliedEvenWhenBothReadingsSeeTheRequestedValue() {
+    void singlePlayerPositionIsSkippedBecauseTheClientWatchesItRevert() {
         // Single-player (round 12): the receipt said every field applied while z never moved.
         JsonObject out = poseSet(new LateRevertClient(3.0, 71.0, 2.851360022260494), true);
-        assertPositionAlwaysSkipped(out, "client");
+        assertPositionNotApplied(out, "client", false);
         // Rotation IS client-authoritative, so the requested 180° is legitimately applied.
         assertTrue(out.getAsJsonObject("applied").has("yaw"), out.toString());
     }
 
     @Test
-    void positionIsSkippedOnARemoteSessionToo() {
+    void remotePositionIsNotClientVerifiableNotSkipped() {
+        // Round 14 (LAN, 2 clients + dedicated server): the remote position change DID apply and
+        // persist (16.4 s without reverting, survived a reconnect, confirmed by the server log
+        // z=17.609… -> 12.0). Reporting that as "skipped" hid a working feature; it must be reported
+        // as a state the client cannot witness, which is a different statement.
         JsonObject out = poseSet(new LateRevertClient(-4.5, 70.0, 7.1018), false);
-        assertPositionAlwaysSkipped(out, "server");
+        assertPositionNotApplied(out, "server", true);
         assertTrue(out.getAsJsonObject("applied").has("yaw"), out.toString());
     }
 }

@@ -50,16 +50,34 @@ class TrapTest {
     }
 
     @Test
-    void placingIntoAnOccupiedCellIsRefused() {
+    void placingIntoACellThatCannotBeReplacedIsRefused() {
         FakeClient client = new FakeClient();
-        client.occupied.add("3,64,-2");
+        client.notReplaceable.add("3,64,-2");   // a solid block: the adapter decides this, not core
         Protocol.Receipt r = run("{\"op\":\"world.place\",\"params\":{\"x\":3,\"y\":64,\"z\":-2,"
                 + "\"block\":\"minecraft:stone\"}}", client);
 
         assertFalse(r.ok());
-        assertEquals("E_EXEC", r.ops().get(0).error().code());
-        assertTrue(r.ops().get(0).error().message().contains("occupied"));
+        assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
+        assertTrue(r.ops().get(0).error().message().contains("cannot be replaced"),
+                r.ops().get(0).error().message());
+        assertEquals("target-not-replaceable",
+                r.ops().get(0).error().detail().get("reason").getAsString());
         assertTrue(client.placed.isEmpty(), "the block must not be placed");
+    }
+
+    @Test
+    void placingIntoAReplaceableBlockCellIsAllowedLikeAPlayerWould() {
+        // P11 follow-up: a non-air but replaceable cell (tall grass, a snow layer) used to be refused by
+        // core's "cell is occupied" pre-check, which never stopped a player from placing there.
+        FakeClient client = new FakeClient();
+        client.occupied.add("3,64,-2");   // non-air, and replaceable
+
+        Protocol.Receipt r = run("{\"op\":\"world.place\",\"params\":{\"x\":3,\"y\":64,\"z\":-2,"
+                + "\"block\":\"minecraft:stone\"}}", client);
+
+        assertTrue(r.ok(), r.ops().toString());
+        assertEquals(1, client.useItemOnCalls, "it goes through the interaction path");
+        assertEquals(1, client.placed.size(), "and the placement really happened");
     }
 
     @Test

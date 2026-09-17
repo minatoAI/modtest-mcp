@@ -252,6 +252,33 @@ operator's own machine; **nothing was simulated or copied from a green unit test
      (`cannot determine whether slot 1 is empty`) look like a failure during review.
   3. **No new `detail` field** — the free-form detail object is not part of that contract.
 
+## R21 · 2026-09-17 — P11 on a real client: the placement became visible
+
+- **Goal:** does a scripted placement now look like a player's placement to everyone else?
+- **Saw:** with the fix, **KubeJS `BlockEvents.placed` really fired** —
+  `block_placed seq=2, payload block:"minecraft:stone_bricks"` — against the spike round, where the
+  direct world write produced no event at all under the same setup. And after `inv.select`, the server
+  placed from the **new** slot (`smooth_stone`), i.e. the carried-item packet reached it. `verdict` did
+  not fall back to `applied`, and the regression suite stayed green.
+- **Found (P12):** the conservative answer did not converge. With an empty hand the op answered
+  `reason:"container-not-synced"` immediately **and still after four seconds**, so `empty-hand` was
+  unreachable and a caller could wait forever. The window had been counted in wall-clock milliseconds.
+- **Fixed:** the window is now an age in **client ticks** (`containerSyncAgeTicks`, 20 ticks), which
+  always grows while the client keeps running, and a dispatched click/toss closes it as soon as the open
+  menu's state id moves — the server's own answer rather than a timer. `empty-hand` and `slot-empty` are
+  therefore reachable again, just not immediately; selecting a slot opens no window at all.
+- **Also decided (P11 follow-up):** core's `E_EXEC "cell occupied"` pre-check was removed. It ran before
+  the interaction and so (a) made the adapter's honest `target-not-replaceable` check unreachable and
+  (b) refused replaceable targets a player *can* place into (tall grass, a snow layer). Replaceability is
+  now decided once, in the adapter, from the block state.
+- **Two operational lessons (each cost a run):**
+  1. **World changes persist across instances.** A block placed in one round is still there in the next,
+     so a fixed target cell becomes "not replaceable" on the second run, and a test reusing it looks like
+     a regression when it is only stale ground. Round targets MUST be on **fresh, empty ground per round**.
+  2. **After `inv.select`, let the synchronisation window close before sending the placement.** The server
+     learns the carried slot from the packet, and the view core reads may still be catching up; an op sent
+     in the same instant can be answered `cannot determine` even though the selection was correct.
+
 ---
 
 ## Corrections we made to our own earlier claims
@@ -292,6 +319,12 @@ minds.
    *"cannot determine whether slot 1 **is empty**"*. The criterion is now: judge by the **assertion
    form** (the `verdict` and which verdict object is populated) and by the `cannot determine`
    **prefix**, and **do not** add an error field for the distinction.
+8. **We shipped a conservative answer that could never converge.** The P9/P10 round introduced a
+   wall-clock container sync window. On the next real-machine round it answered "cannot determine"
+   *forever*: an empty hand was still `container-not-synced` four seconds later, so the plain
+   `empty-hand` refusal was unreachable and a caller had no honest answer to wait for (R21, P12). The
+   window is now counted in client ticks and closable by evidence (the open menu's state id moves).
+   **Conservative must still mean bounded.**
 
 ## Not verified, or limited by available means
 

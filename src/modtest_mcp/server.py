@@ -197,7 +197,13 @@ class Bridge:
 
 TOOLS: dict[str, dict] = {
     "drop_ticket": {
-        "desc": "Write a modtest-bridge ticket into <dir>/inbox atomically (bridge picks it up).",
+        "desc": ("Write a modtest-bridge ticket into <dir>/inbox atomically (bridge picks it up). "
+                 "Ops that touch the world act the way the player does: world.place only places the "
+                 "block that is in the selected slot, and only within the player's block reach "
+                 "(about 4.5 blocks; 5 in creative). Stay within reach instead of reaching across the "
+                 "map: move the player first (input.set/pose.set) or place an adjacent cell, otherwise "
+                 "the op is refused with E_PRECONDITION reason=out-of-reach, and a wrong/missing item "
+                 "in hand is refused with reason=held-item-mismatch / empty-hand."),
         "schema": {"type": "object",
                    "properties": {"ticket": {"type": "string"},
                                   "payload": {"type": "object"}},

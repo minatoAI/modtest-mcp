@@ -35,6 +35,20 @@ public final class VanillaOps {
     public static final java.util.Set<String> WIRED_IN_CORE =
             java.util.Set.of("inv.click", "inv.toss", "use.item", "shot.capture", "bench.read");
 
+    /**
+     * Whether this client's container view may still be stale, i.e. whether a read of it can be turned into
+     * a factual negative.
+     *
+     * <p>One place decides this (P12): the adapter reports the <b>age in client ticks</b> of the newest
+     * reason to distrust the view, and core compares it against
+     * {@link ClientModel#CONTAINER_SYNC_WINDOW_TICKS}. Being tick-counted, the answer always converges —
+     * the earlier wall-clock window did not, so on a real client an empty hand stayed
+     * {@code container-not-synced} and {@code empty-hand} was unreachable.
+     */
+    static boolean containerUnsettled(ClientModel c) {
+        return c.containerSyncAgeTicks() < ClientModel.CONTAINER_SYNC_WINDOW_TICKS;
+    }
+
     /** Click modes accepted by {@code inv.click}; the wire vocabulary is closed. */
     public static final java.util.Set<String> CLICK_MODES =
             java.util.Set.of("pickup", "quick_move", "swap", "clone", "throw", "quick_craft", "pickup_all");
@@ -148,7 +162,51 @@ public final class VanillaOps {
     // ------------------------------------------------------------------ specs
     private static Protocol.OpSpec spec(String name, String title, JsonObject params, JsonObject result,
                                         List<Protocol.Precondition> pre, List<Protocol.SideEffect> effects) {
-        return new Protocol.OpSpec(name, title, params, result, pre, effects, "vanilla-client", null, "1.0");
+        return spec(name, title, params, result, pre, effects, null);
+    }
+
+    /**
+     * The same, with the agent-facing {@code divergence} block the catalog publishes for an op that
+     * cannot behave exactly like vanilla (§6.2). This is where an agent reads the workflow consequences —
+     * e.g. that a placement needs the item in hand and the target within reach.
+     */
+    private static Protocol.OpSpec spec(String name, String title, JsonObject params, JsonObject result,
+                                        List<Protocol.Precondition> pre, List<Protocol.SideEffect> effects,
+                                        JsonObject divergence) {
+        return new Protocol.OpSpec(name, title, params, result, pre, effects, "vanilla-client", divergence, "1.0");
+    }
+
+    /**
+     * The agent-facing consequences of {@code world.place} acting like a player (P11). This text travels in
+     * {@code catalog.json} — the description an agent actually reads before sending a ticket — so the
+     * reach requirement lives here and not only in PROTOCOL.md.
+     */
+    private static JsonObject placeDivergence() {
+        JsonObject d = Json.object();
+        d.addProperty("vanilla", "none: the op goes through the player's own interaction path "
+                + "(MultiPlayerGameMode.useItemOn), so Forge events, KubeJS BlockEvents.placed, protection "
+                + "plugins and anti-cheat see the same interaction a right-click produces");
+        d.addProperty("workflow", "before placing, the player must ALREADY be within block reach of the "
+                + "target (about 4.5 blocks; 5 in creative): move first (input.set / pose.set) or place an "
+                + "adjacent cell instead of reaching across the map, otherwise the op is refused with "
+                + "E_PRECONDITION reason=out-of-reach");
+        d.addProperty("heldItem", "the block must be the item in the selected slot (inv.select first); "
+                + "otherwise E_PRECONDITION reason=empty-hand / held-item-not-a-block / held-item-mismatch");
+        d.addProperty("target", "the target cell must be replaceable and supported by a neighbouring block; "
+                + "otherwise E_PRECONDITION reason=target-not-replaceable / no-support");
+        d.addProperty("receipt", "a world effect is never reported applied: placed is this client's own "
+                + "read-back (next to blockObserved) and the verdict is notClientVerifiable");
+        return d;
+    }
+
+    /** The one-line agent-facing consequence of {@code inv.select} telling the server (P11). */
+    private static JsonObject selectDivergence() {
+        JsonObject d = Json.object();
+        d.addProperty("vanilla", "none: the selection reaches the server with the carried-item packet, "
+                + "the same one the hotbar keys send");
+        d.addProperty("workflow", "select the slot that holds the block you are about to place: the server "
+                + "decides what is in hand from its own view of the selected slot");
+        return d;
     }
 
     /** A closed object schema whose listed keys are all required (the pre-task-70 shape). */
@@ -319,7 +377,7 @@ public final class VanillaOps {
                         List.of(Protocol.SideEffect.PLAYER_STATE)), new PoseOps());
         add(catalog, spec("inv.select", "Select a hotbar slot", schema("slot"), null,
                         List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
-                        List.of(Protocol.SideEffect.PLAYER_INVENTORY)), new InvOps("select"));
+                        List.of(Protocol.SideEffect.PLAYER_INVENTORY), selectDivergence()), new InvOps("select"));
         add(catalog, spec("inv.click", "Click an inventory slot", objectSchema(
                                 prop("slot", "integer"), prop("button", "integer"),
                                 prop("mode", "string", CLICK_MODES)),
@@ -356,7 +414,7 @@ public final class VanillaOps {
                         List.of(Protocol.SideEffect.PLAYER_STATE, Protocol.SideEffect.PLAYER_INVENTORY)), new UseOps());
         add(catalog, spec("world.place", "Place a block", schema("x", "y", "z", "block"), null,
                         List.of(Protocol.Precondition.of("permitted-session"), Protocol.Precondition.of("flag", "name", "allow-mutate")),
-                        List.of(Protocol.SideEffect.WORLD_BLOCKS)), new WorldOps());
+                        List.of(Protocol.SideEffect.WORLD_BLOCKS), placeDivergence()), new WorldOps());
         add(catalog, spec("shot.capture", "Capture a screenshot and report its bytes",
                         objectSchema(prop("name", "string")),
                         resultSchema(objectOf(
@@ -826,7 +884,7 @@ public final class VanillaOps {
          * and the machine-readable {@code reason} distinguishes the two cases.
          */
         private static void refuseEmptySlot(ClientModel c, int slot, String action) {
-            boolean unsynced = c.containerSyncPending();
+            boolean unsynced = containerUnsettled(c);
             throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
                     unsynced
                             ? "cannot determine whether slot " + slot + " is empty: the container has not "
@@ -867,7 +925,7 @@ public final class VanillaOps {
                     // Same rule as the empty-slot refusal: "no container is open" is a factual negative
                     // about a synchronised view, so an adapter that reports its view may still be catching
                     // up gets "cannot determine" instead of an assertion.
-                    boolean unsynced = c.containerSyncPending();
+                    boolean unsynced = containerUnsettled(c);
                     throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
                             unsynced
                                     ? "cannot determine whether a container is open (windowId=" + window
@@ -1034,7 +1092,7 @@ public final class VanillaOps {
             if (heldBefore == null || heldBefore.isBlank()) {
                 // "no item in the <hand> hand" is a factual negative about synchronised state: when the
                 // adapter says its inventory may still be catching up, it cannot be determined here (P9).
-                boolean unsynced = c.containerSyncPending();
+                boolean unsynced = containerUnsettled(c);
                 throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
                         unsynced
                                 ? "cannot determine whether the " + hand + " hand holds an item: the "
@@ -1144,16 +1202,18 @@ public final class VanillaOps {
                 out.addProperty("placed", false);
                 return guardNoOp(out, "place " + block + " at " + x + "," + y + "," + z, decision);
             }
-            if (c.cellOccupied(x, y, z)) {
-                throw new Protocol.ProtocolException(Protocol.ErrorCode.E_EXEC,
-                        "cell (" + x + "," + y + "," + z + ") is occupied");
-            }
+            // P11 follow-up: the "cell is occupied" pre-check used to run HERE — before the interaction —
+            // and it won the race against the adapter's replaceability check, so `target-not-replaceable`
+            // was effectively unreachable AND a legitimately replaceable target (tall grass, a snow layer)
+            // was refused as "occupied". A player can place into those, so the decision belongs where the
+            // real interaction is decided: the adapter asks the block state itself
+            // (`canBeReplaced()`, E_PRECONDITION reason=target-not-replaceable). One check, in one place.
             // P11: a real placement uses the item the player is holding, so an empty hand is an honest
             // precondition failure — the op must not conjure the block into the world (and, per the P9
             // rule, an empty read inside the container sync window is not evidence of an empty hand).
             String held = c.heldItemId();
             if (held == null || held.isBlank()) {
-                boolean unsynced = c.containerSyncPending();
+                boolean unsynced = containerUnsettled(c);
                 throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
                         unsynced
                                 ? "cannot determine whether the selected slot holds " + block + ": the "

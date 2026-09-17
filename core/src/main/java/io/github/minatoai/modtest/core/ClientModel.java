@@ -51,22 +51,47 @@ public interface ClientModel {
     List<String> inventory();
 
     /**
-     * Whether the container/inventory view this client reports may still be catching up with the
-     * authority — a join, a dimension change, or a click/toss this client dispatched moments ago.
+     * How many client ticks after a join, a dimension change, or a container action this client's view may
+     * still be stale.
      *
-     * <p>Container contents are synchronised asynchronously, so a single early read of an unchanged or
-     * empty menu is <b>indistinguishable</b> from "nothing happened". Core therefore uses this signal to
-     * stop turning such a read into a factual negative: an apparently empty slot becomes
-     * {@code E_PRECONDITION} whose message says "cannot determine …" rather than "slot N is empty", and
-     * an unchanged read-back becomes {@code verdict:"notClientVerifiable"} rather than "skipped"
-     * (qa-tester measured both directions on a real client: P9).
+     * <p>Counted in **ticks the client actually ran**, never in wall-clock time. That distinction is a
+     * defect fix (P12): the first version of this window used {@code System.currentTimeMillis()}, and on a
+     * real client an empty hand was still reported as {@code container-not-synced} four seconds later —
+     * i.e. the conservative answer never converged, so {@code empty-hand} was unreachable and a caller
+     * could wait forever. A tick-counted window always closes while the client keeps running.
+     */
+    int CONTAINER_SYNC_WINDOW_TICKS = 20;
+
+    /**
+     * Age, in client ticks, of the newest reason this adapter's container view may be stale — a join or
+     * world change, or a click/toss this client dispatched whose answer has not arrived — or
+     * {@link Long#MAX_VALUE} when it knows of none.
      *
-     * <p>The default is {@code false} — "my view is settled" — because a test double's state <i>is</i>
-     * exact and an adapter that does not model a race window must not become unable to refuse anything.
-     * An adapter that knows it cannot vouch for the window (see the Forge one) must override this.
+     * <p>Two properties are required, both from P12:
+     * <ol>
+     *   <li><b>Conservative inside the window:</b> while the age is below
+     *       {@link #CONTAINER_SYNC_WINDOW_TICKS}, core MUST NOT turn an unread slot or hand into a factual
+     *       negative ("the slot is empty"); it answers "cannot determine";</li>
+     *   <li><b>Bounded convergence:</b> the age MUST grow as the client keeps ticking, so the window
+     *       always closes and the plain refusal ({@code reason:"empty-hand"}, {@code "slot-empty"}, …)
+     *       becomes reachable. An adapter that can see the answer arrive — e.g. the open menu's state id
+     *       moved after a click — SHOULD close the window immediately: that is evidence, not a timer.</li>
+     * </ol>
+     * The default is "settled" ({@code Long.MAX_VALUE}): a test double's state is exact, and an adapter
+     * that models no race window must not become unable to refuse anything.
+     */
+    default long containerSyncAgeTicks() {
+        return Long.MAX_VALUE;
+    }
+
+    /**
+     * The conservative gate core applies, derived from {@link #containerSyncAgeTicks()}.
+     *
+     * <p>Core reads the age; this boolean exists so a receipt or a reader can talk about the same state
+     * without repeating the comparison.
      */
     default boolean containerSyncPending() {
-        return false;
+        return containerSyncAgeTicks() < CONTAINER_SYNC_WINDOW_TICKS;
     }
 
     boolean usingItem();
@@ -122,6 +147,15 @@ public interface ClientModel {
         return false;
     }
 
+    /**
+     * Whether a cell is non-air, as this client sees it.
+     *
+     * <p><b>Not a placement gate.</b> {@code world.place} used to refuse on this before the interaction,
+     * which made the adapter's precise replaceability check unreachable and wrongly refused replaceable
+     * targets (tall grass, snow layers) that a player can place into. Replaceability is now decided by the
+     * adapter from the block state itself; this read remains what it is — the client's own view, used for
+     * the receipt's read-back.
+     */
     boolean cellOccupied(int x, int y, int z);
 
     /**

@@ -24,17 +24,24 @@ class FakeClient implements ClientModel {
     /** The off-hand item, so {@code use.item{hand:"off"}} and {@code state.query} can be checked. */
     String offHand = "";
     /**
-     * Whether this client's container view may still be catching up with the authority.
+     * Age, in client ticks, of the newest reason this fake's container view may be stale.
      *
-     * <p>{@code false} by default: the fake's state <i>is</i> exact, so a test that wants the P9 race
-     * window sets this to {@code true} explicitly.
+     * <p>{@link Long#MAX_VALUE} (settled) by default: the fake's state <i>is</i> exact, so a test that wants
+     * the P9/P12 race window sets a small age. Core compares it against
+     * {@link ClientModel#CONTAINER_SYNC_WINDOW_TICKS}.
      */
-    boolean containerSyncPending;
+    long containerSyncAgeTicks = Long.MAX_VALUE;
     boolean settled = true;
     boolean using;
     boolean useThrows;
     final List<String> slots = new ArrayList<>(List.of("minecraft:stone", "", "", "minecraft:torch"));
     final Set<String> occupied = new HashSet<>();
+    /**
+     * Cells the fake world refuses to replace, as {@code "x,y,z"} — the modelling of a solid block. A cell
+     * that is merely non-air (tall grass, a snow layer) may be placed into, exactly like vanilla, which is
+     * why replaceability is a separate knob from {@link #occupied}.
+     */
+    final Set<String> notReplaceable = new HashSet<>();
     final Set<String> placed = new HashSet<>();
     /** Block ids the fake world reports, keyed {@code "x,y,z"}; an unrecorded cell is air. */
     final java.util.Map<String, String> blocks = new java.util.HashMap<>();
@@ -125,8 +132,8 @@ class FakeClient implements ClientModel {
     }
 
     @Override
-    public boolean containerSyncPending() {
-        return containerSyncPending;
+    public long containerSyncAgeTicks() {
+        return containerSyncAgeTicks;
     }
 
     @Override
@@ -240,6 +247,13 @@ class FakeClient implements ClientModel {
             throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
                     "the selected slot holds " + held + ", not " + block)
                     .with("reason", "held-item-mismatch");
+        }
+        // Replaceability is the adapter's decision from the block state — the same place the real
+        // interaction decides it — not core's `cellOccupied` pre-check (which used to win this race).
+        if (notReplaceable.contains(cx + "," + cy + "," + cz)) {
+            throw new Protocol.ProtocolException(Protocol.ErrorCode.E_PRECONDITION,
+                    "the target cell cannot be replaced (the fake world marks it solid)")
+                    .with("reason", "target-not-replaceable");
         }
         // Recorded as an observed block, not as pre-existing occupancy: `cellOccupied` models the world
         // *before* the op, while `blockIdAt` reports what the client sees now (P10's read-back).

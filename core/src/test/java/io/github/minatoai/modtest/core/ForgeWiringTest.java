@@ -334,6 +334,30 @@ class ForgeWiringTest {
                 "expected to check the declarative build files, checked=" + checked);
     }
 
+    /**
+     * P12: the container sync window must be counted in client ticks (so it always closes) and must be
+     * closable when the server's own answer arrives (the menu state id moving). The first version used
+     * wall-clock milliseconds and never converged on a real client: an empty hand stayed
+     * {@code container-not-synced} four seconds later, so {@code empty-hand} was unreachable.
+     */
+    @Test
+    void theForgeSyncWindowIsTickCountedAndClosesOnEvidence() throws IOException {
+        String source = read(forgeSource("MinecraftClientModel.java"));
+        String body = methodBody(source, "public long containerSyncAgeTicks(");
+
+        assertTrue(body.contains("clientTicks"), "the age must be counted in client ticks: " + body);
+        assertFalse(body.contains("currentTimeMillis"),
+                "P12: a wall-clock window did not converge — do not reintroduce one: " + body);
+        assertTrue(body.contains("getStateId()"),
+                "a dispatched click/toss must be able to close the window on the server's own answer: "
+                        + body);
+        assertTrue(source.contains("public static void noteClientTick("),
+                "the counter needs the client-tick hook MinecraftClientModel.noteClientTick()");
+        assertTrue(read(forgeSource("ModtestHarnessMod.java")).contains(
+                        "MinecraftClientModel.noteClientTick()"),
+                "and ModtestHarnessMod must actually call it, otherwise the window never advances");
+    }
+
     /** The text inside a method, found by its signature and closed by balanced braces. */
     private static String methodBody(String source, String signature) {
         int at = source.indexOf(signature);

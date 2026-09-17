@@ -74,7 +74,7 @@ class TicketExecutorTest {
     @Test
     void abortStopsTheRestAndMarksThemSkipped() {
         FakeClient client = new FakeClient();
-        client.occupied.add("1,64,1");
+        client.notReplaceable.add("1,64,1");   // the op fails at the interaction, after the guard allowed
         Protocol.Ticket t = ticket("{\"id\":\"a\",\"op\":\"world.place\","
                 + "\"params\":{\"x\":1,\"y\":64,\"z\":1,\"block\":\"minecraft:stone\"},\"on_error\":\"abort\"},"
                 + "{\"id\":\"b\",\"op\":\"bench.read\"}");
@@ -84,15 +84,15 @@ class TicketExecutorTest {
 
         assertFalse(r.ok());
         assertFalse(r.ops().get(0).ok());
-        assertEquals("E_EXEC", r.ops().get(0).error().code());
+        assertEquals("E_PRECONDITION", r.ops().get(0).error().code());
         assertTrue(r.ops().get(1).skipped(), "the op after an abort must be skipped");
-        assertTrue(client.placed.isEmpty(), "nothing may be placed into an occupied cell");
+        assertTrue(client.placed.isEmpty(), "nothing may be placed into a cell that cannot be replaced");
     }
 
     @Test
     void continueKeepsExecutingAfterAFailure() {
         FakeClient client = new FakeClient();
-        client.occupied.add("1,64,1");
+        client.notReplaceable.add("1,64,1");
         Protocol.Ticket t = ticket("{\"id\":\"a\",\"op\":\"world.place\","
                 + "\"params\":{\"x\":1,\"y\":64,\"z\":1,\"block\":\"minecraft:stone\"},\"on_error\":\"continue\"},"
                 + "{\"id\":\"b\",\"op\":\"bench.read\"}");

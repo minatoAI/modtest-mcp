@@ -1090,8 +1090,8 @@ class WiredOpsTest {
         }
 
         @Override
-        public boolean containerSyncPending() {
-            return true;
+        public long containerSyncAgeTicks() {
+            return 0L;   // the newest possible reason to distrust the view: inside the window
         }
     }
 
@@ -1352,5 +1352,97 @@ class WiredOpsTest {
 
         assertTrue(out.get("containerSyncPending").getAsBoolean(),
                 "an inventory read inside the sync window must say so: " + out);
+    }
+
+    // ============================================================ P12: the window must converge
+
+    /** A container whose view never settles — what the P12 defect looked like on a real client. */
+    private static final class NeverSettlingClient extends FakeClient {
+        @Override
+        public long containerSyncAgeTicks() {
+            return 0L;   // always "just changed": the age never grows
+        }
+    }
+
+    /** The same, with nothing in the player's hand: the read that P12 was about. */
+    private static NeverSettlingClient neverSettlingWithEmptyHand() {
+        NeverSettlingClient c = new NeverSettlingClient();
+        c.held = "";
+        return c;
+    }
+
+    @Test
+    void p12APermanentlyUnsettledViewNeverReachesThePlainEmptyHandRefusal() {
+        // This is the defect as measured: with a view that never settles, every placement with an empty
+        // hand answers `cannot determine` and `empty-hand` is unreachable — a caller waits forever.
+        Protocol.Receipt r = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), neverSettlingWithEmptyHand());
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertEquals("container-not-synced", only(r).error().detail().get("reason").getAsString(),
+                "the conservative answer is correct — and this test exists to show that it must not be "
+                        + "the only answer that ever arrives");
+        assertFalse(only(r).error().message().contains("no item in the selected slot"),
+                only(r).error().message());
+    }
+
+    @Test
+    void p12TheSyncWindowIsBoundedSoThePlainRefusalBecomesReachable() {
+        // The fix: the window is counted in client ticks, so it always closes. One tick inside it stays
+        // conservative; one tick past it gives the plain, settled refusal.
+        FakeClient inside = new FakeClient();
+        inside.held = "";
+        inside.containerSyncAgeTicks = ClientModel.CONTAINER_SYNC_WINDOW_TICKS - 1;
+
+        Protocol.Receipt during = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), inside);
+        assertEquals("E_PRECONDITION", code(during));
+        assertEquals("container-not-synced", only(during).error().detail().get("reason").getAsString(),
+                during.toString());
+
+        FakeClient after = new FakeClient();
+        after.held = "";
+        after.containerSyncAgeTicks = ClientModel.CONTAINER_SYNC_WINDOW_TICKS;
+
+        Protocol.Receipt settled = run(fail("world.place",
+                "{\"x\":1,\"y\":64,\"z\":2,\"block\":\"minecraft:oak_planks\"}"), after);
+        assertEquals("E_PRECONDITION", code(settled));
+        assertEquals("empty-hand", only(settled).error().detail().get("reason").getAsString(),
+                "once the window has closed the honest `empty-hand` refusal must be reachable: "
+                        + only(settled).error());
+        assertTrue(only(settled).error().message().contains("no item in the selected slot"),
+                only(settled).error().message());
+        assertTrue(after.placed.isEmpty(), "and nothing may be placed");
+    }
+
+    @Test
+    void p12AnAgeOfExactlyTheWindowIsAlreadySettled() {
+        // Boundary pinned: `< window` is conservative, `>= window` is settled. Pinning it here means a
+        // future change to either side of the comparison has to be deliberate.
+        FakeClient client = new FakeClient();
+        client.held = "";
+        client.containerSyncAgeTicks = ClientModel.CONTAINER_SYNC_WINDOW_TICKS;
+
+        Protocol.Receipt r = run(fail("use.item", null), client);
+
+        assertEquals("E_PRECONDITION", code(r));
+        assertEquals("empty-hand", only(r).error().detail().get("reason").getAsString(),
+                only(r).error().toString());
+    }
+
+    @Test
+    void p12ThePlainEmptyHandRefusalAlsoConvergesForTheOtherOpsThatReadTheInventory() {
+        // inv.toss and use.item take the same path, so they must converge with it.
+        FakeClient settled = new FakeClient();
+        settled.held = "";
+        settled.containerSyncAgeTicks = ClientModel.CONTAINER_SYNC_WINDOW_TICKS;
+
+        assertEquals("slot-empty", only(run(fail("inv.toss", "{\"slot\":1,\"count\":1}"), settled))
+                .error().detail().get("reason").getAsString());
+
+        FakeClient unsettled = new NeverSettlingClient();
+        assertEquals("container-not-synced",
+                only(run(fail("inv.toss", "{\"slot\":1,\"count\":1}"), unsettled))
+                        .error().detail().get("reason").getAsString());
     }
 }

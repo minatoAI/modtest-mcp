@@ -83,46 +83,69 @@ public final class MinecraftClientModel implements ClientModel {
      * How long after a join, a world change, or a click/toss this client may keep showing container
      * contents that the authority has already changed (and vice versa).
      *
-     * <p>This exists because of a measured defect (P9): the first {@code inv.toss} after joining
-     * reported "slot 0 is empty" while the item was still there a second later, and an {@code inv.click}
-     * reported {@code verdict:"skipped"} while the click had in fact worked. Both are the same mistake —
-     * treating one early read as a fact. This adapter therefore <b>cannot vouch</b> for its container
-     * view inside the window, and core turns that into "cannot determine" instead of "empty"/"skipped".
+     * <p>This exists because of a measured defect (P9): the first {@code inv.toss} after joining reported
+     * "slot 0 is empty" while the item was still there a second later, and an {@code inv.click} reported
+     * {@code verdict:"skipped"} while the click had in fact worked. Both are the same mistake — treating one
+     * early read as a fact. This adapter therefore <b>cannot vouch</b> for its container view inside the
+     * window, and core turns that into "cannot determine" instead of "empty"/"skipped".
      *
-     * <p>The window is a heuristic (the real condition is "the server's answer has not arrived yet",
-     * which vanilla exposes no flag for); it is set generously rather than tightly, because a false
-     * "cannot determine" costs one extra read while a false "empty" costs a wrong decision.
+     * <p><b>Counted in client ticks, and closable by evidence (P12).</b> The first version counted
+     * wall-clock milliseconds, and on a real client an empty hand was still reported as
+     * {@code container-not-synced} <i>four seconds later</i>: the conservative answer never converged, so
+     * the plain {@code empty-hand} refusal was unreachable and a caller could wait forever. The age is now
+     * measured in ticks the client actually ran (so it always grows while ops can execute), and a
+     * dispatched click/toss closes the window as soon as the open menu's state id moves — the server's own
+     * answer, not a timer.
      */
-    private static final long CONTAINER_SYNC_WINDOW_MS = 3_000L;
-
-    /** When the current level was first seen (join / dimension change), in {@code System.currentTimeMillis()}. */
-    private static long levelFirstSeenMs = -1L;
-    /** The level instance the timestamp above belongs to; identity comparison, so no equals() semantics. */
+    /** Client ticks this adapter has seen; the sync window is counted in these. */
+    private static long clientTicks;
+    /** The tick at which the current level was first seen (join / dimension change). */
+    private static long levelFirstSeenTick = -1L;
+    /** The level instance the tick above belongs to; identity comparison, so no equals() semantics. */
     private static Object stampedLevel;
-    /** When this adapter last dispatched a container click/toss. */
-    private static long lastContainerTouchMs = -1L;
+    /** The tick at which this adapter last dispatched a container click/toss, or -1. */
+    private static long lastContainerActionTick = -1L;
+    /** The menu state id at that moment, so the server's answer is observable as a change. */
+    private static int menuStateIdAtAction = -1;
+
+    /** Called once per client tick by the mod's tick hook ({@code ModtestHarnessMod.onClientTick}). */
+    public static void noteClientTick() {
+        clientTicks++;
+    }
 
     /** Records that a container-affecting action was just dispatched, opening the sync window. */
-    private static void noteContainerTouch() {
-        lastContainerTouchMs = System.currentTimeMillis();
+    private void noteContainerTouch() {
+        lastContainerActionTick = clientTicks;
+        AbstractContainerMenu menu = mc.player == null ? null : mc.player.containerMenu;
+        menuStateIdAtAction = menu == null ? -1 : menu.getStateId();
     }
 
     @Override
-    public boolean containerSyncPending() {
-        long now = System.currentTimeMillis();
+    public long containerSyncAgeTicks() {
         if (mc.player == null || mc.level == null) {
-            return true;   // nothing about the container is observable yet
+            return 0L;   // nothing about the container is observable yet: stay cautious
         }
+        long now = clientTicks;
         if (stampedLevel != mc.level) {
-            // First observation of this level: a join or a dimension change. Treat the moment it is
-            // first *seen* as the start of the window, so the first ops after joining are covered even
-            // though the level object itself may be older.
+            // First observation of this level: a join or a dimension change. The window starts when the
+            // level is first *seen*, so the first ops after joining are covered even though the level
+            // object itself may be older.
             stampedLevel = mc.level;
-            levelFirstSeenMs = now;
+            levelFirstSeenTick = now;
+            lastContainerActionTick = -1L;
         }
-        boolean freshLevel = levelFirstSeenMs < 0 || now - levelFirstSeenMs < CONTAINER_SYNC_WINDOW_MS;
-        boolean freshTouch = lastContainerTouchMs >= 0 && now - lastContainerTouchMs < CONTAINER_SYNC_WINDOW_MS;
-        return freshLevel || freshTouch;
+        long age = now - levelFirstSeenTick;
+        if (lastContainerActionTick >= 0) {
+            AbstractContainerMenu menu = mc.player.containerMenu;
+            boolean answerArrived = menu != null && menu.getStateId() != menuStateIdAtAction;
+            if (answerArrived) {
+                // Evidence, not a timer: the server applied something, so the view is no longer suspect.
+                lastContainerActionTick = -1L;
+            } else {
+                age = Math.min(age, now - lastContainerActionTick);
+            }
+        }
+        return age;
     }
 
     @Override

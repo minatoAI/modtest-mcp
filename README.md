@@ -284,10 +284,13 @@ three rules now apply to every op:
    a positive control did fire), so it was not equivalent to a player placing a block. It now goes
    through the client's real interaction entry (`MultiPlayerGameMode.useItemOn` → the server's own
    placement path). The consequences are enforced instead of hidden: the block **must be the item in
-   the selected slot**, the target must be replaceable and within the player's block reach, and each
-   failure is an honest `E_PRECONDITION` — the block is never conjured into the world. Selecting a
-   hotbar slot likewise now tells the server (`ServerboundSetCarriedItemPacket`), because the server
-   learns the carried slot only from that packet and would otherwise place the wrong item.
+   the selected slot**, the target must be replaceable and **within the player's block reach (about 4.5
+   blocks — move the player first instead of retrying a far target)**, and each failure is an honest
+   `E_PRECONDITION` — the block is never conjured into the world. Selecting a hotbar slot likewise now
+   tells the server (`ServerboundSetCarriedItemPacket`), because the server learns the carried slot only
+   from that packet and would otherwise place the wrong item. Both requirements are also published in the
+   catalogue's per-op `divergence` block and in the MCP tool description, so an agent reads them where it
+   actually looks.
 
 Also in this batch: `use.item{hand:"off"}` reports **that** hand's item in `heldBefore`/`heldAfter`,
 and `state.query{what:["offhand"]}` exposes the off hand, so an off-hand dispatch can be checked from
@@ -328,11 +331,22 @@ the client instead of taken on trust.
   state-writing ops were audited and are not divergent: `input.set` writes the very input state the
   keyboard feeds the game, `inv.click`/`inv.toss` use the vanilla container-click path, `use.item` uses
   the vanilla use path.
-* **World-block occupancy still has no sync signal.** Container contents now refuse with
-  `cannot determine` when the view may be stale, but there is no equivalent signal for world blocks
-  (only containers expose one), so `world.place`'s "cell is occupied" refusal remains a **client-side
-  factual assertion** about a server-authoritative world — left as-is on purpose rather than guessed
-  at. Use `blockObserved` after a placement instead of treating that pre-check as proof of absence.
+* **A "cannot determine" answer is bounded, never permanent.** The container sync window is counted in
+  **client ticks** (20) and also closes as soon as the server's own answer arrives, so the plain
+  refusals (`empty-hand`, `slot-empty`, …) are always reachable. The first version used wall-clock
+  milliseconds and did **not** converge on a real client — an empty hand was still answered
+  `container-not-synced` four seconds later, which left `empty-hand` unreachable (P12).
+* **Replaceability is decided once, from the client's own view.** A target that cannot be replaced is
+  refused with `E_PRECONDITION reason:"target-not-replaceable"`, and a *replaceable* non-air target
+  (tall grass, a snow layer) is allowed, as it is for a player. The older `E_EXEC "cell occupied"`
+  pre-check is gone: it ran before the interaction, hid the honest check and refused targets a player
+  could place into. There is still no synchronisation signal for world blocks, so use `blockObserved`
+  after the fact as the observation.
+* **World changes persist across instances — pick fresh ground each round.** A block placed by an
+  earlier run is still there in the next one, so a fixed target cell becomes "not replaceable" on the
+  second run and a test that reused it looks like a regression when it is only stale ground. Likewise,
+  after `inv.select` let the synchronisation window close (20 client ticks at most) before sending the
+  placement that depends on it.
 * **The off hand is observable now.** `state.query{what:["offhand"]}` reports the off-hand item and
   `use.item{hand:"off"}` reports *that* hand's item in `heldBefore`/`heldAfter`; before this, an
   off-hand use could not be checked from the client at all.

@@ -452,13 +452,29 @@ conventions apply to every op below:
      `skipped` objects is populated), **not** by whether some string occurs in the message. Substring
      matching is what made a correct message look like a failure during review:
      `cannot determine whether slot 1 is empty` legitimately contains the words `is empty`.
-     **Known exception, recorded rather than papered over:** world **block occupancy** has no
-     equivalent synchronisation signal — only container contents do — so `world.place`'s "cell is
-     occupied" refusal (`E_EXEC`) is still a client-side factual assertion about a
-     server-authoritative world. It is deliberately left that way: inventing a sync signal for world
-     blocks would be a guess, and this protocol only claims what the client can witness. Treat that
-     one refusal as **this client's view**, not as the authority's verdict, and read the block back
-     (`blockObserved`) after a placement rather than treating the pre-check as proof of absence.
+     **The conservative answer MUST converge, and it is bounded by ticks (P12).** A "cannot determine"
+     that never ends is not honest, it is a hang: on a real client an empty hand was still answered
+     `reason:"container-not-synced"` four seconds later, so the plain `empty-hand` refusal was
+     unreachable. The state an adapter reports is therefore an **age in client ticks**
+     (`containerSyncAgeTicks`), not a wall-clock duration:
+     * while the age is **below** `CONTAINER_SYNC_WINDOW_TICKS` (20 client ticks), core answers
+       "cannot determine" — inside the window an unread slot or hand is never turned into a fact;
+     * at or above it, the window **has closed** and the plain refusal is reached: `empty-hand`,
+       `slot-empty`, `no-container`, `no-item-in-hand`. This is the form in which `empty-hand` exists —
+       it is *reachable*, just not *immediately*;
+     * an adapter that can see the authority's answer arrive (for `inv.click`/`inv.toss`: the open menu's
+       state id moves) **closes the window immediately**, because that is evidence rather than a timer.
+     Because the age is counted in ticks the client actually ran, it grows whenever an op can execute, so
+     the window always closes. Selecting a slot does **not** open a window (a selection changes neither
+     the container nor the server's view of it).
+     **Known boundary, recorded rather than papered over:** world **block occupancy** has no equivalent
+     synchronisation signal — only container contents do. So for `world.place` there is **one** check, in
+     the adapter, from the block state itself (`canBeReplaced()`): a target that cannot be replaced is
+     refused with `E_PRECONDITION reason:"target-not-replaceable"`, and a *replaceable* non-air target
+     (tall grass, a snow layer) is allowed, as it is for a player. Core no longer pre-checks occupancy
+     (that older check ran first and made the honest one unreachable while wrongly refusing replaceable
+     targets). It is still the **client's own view** of the world, so read the block back
+     (`blockObserved`) after a placement rather than treating the refusal as the authority's verdict.
   2. **A self-reported field MUST NOT exceed what the client can witness.** `world.place`'s `placed` is
      the client's own read-back of its world (`blockObserved` carries the id it observed, `null` when
      the adapter has no block query), never an unconditional `true`, and its verdict is
@@ -497,19 +513,41 @@ KubeJS, protection plugins and anti-cheat see exactly what they see for a right-
 * the target cell **MUST** be replaceable (otherwise `E_PRECONDITION`, `reason:"target-not-replaceable"`);
 * the target **MUST** have a neighbouring block to place against and be within the player's block reach
   (otherwise `E_PRECONDITION`, `reason:"no-support"` / `"out-of-reach"`). A player cannot place a block
-  three hundred metres away, so neither can this op;
-* the cell-occupied pre-check remains a **client-side** factual assertion (see the known limitation in
-  §6.2c) and the receipt still reports the client's **read-back**: `placed` is what this client's world
-  shows (`blockObserved` carries the id it observed, `null` when the adapter has no block query), and the
-  verdict is **`notClientVerifiable`** because the authority decides whether to keep the block. A world
-  effect is never reported `applied`;
+  three hundred metres away, so neither can this op. **This is an agent-workflow requirement, not a
+  footnote: move first.** Placing across a room is refused — an agent that wants to place at a distant
+  cell MUST move the player there (or within reach) before sending the op, rather than retrying the same
+  far target. The reach and the in-hand requirement are also published in the op's `divergence` block in
+  `catalog.json` (the description an agent reads) and in the MCP tool description, precisely so this does
+  not live only in this document;
+* the target cell **MUST** be replaceable, and that decision is made **once**, by the adapter, from the
+  block state (`canBeReplaced()` → `E_PRECONDITION reason:"target-not-replaceable"`). Core does **not**
+  pre-check occupancy: the older `E_EXEC "cell occupied"` check ran before the interaction, which made the
+  honest check unreachable and refused replaceable targets a player could place into (P11 follow-up);
+* the receipt still reports the client's **read-back** (not an occupancy guarantee): `placed` is what this
+  client's world shows (`blockObserved` carries the id it observed, `null` when the adapter has no block
+  query), and the verdict is **`notClientVerifiable`** because the authority decides whether to keep the
+  block. A world effect is never reported `applied`;
 * as with every state read, an empty or unsettled inventory inside the container sync window is not
-  evidence of an empty hand: the refusal is `cannot determine` (§6.2c rule 1).
+  evidence of an empty hand: the refusal is `cannot determine` (§6.2c rule 1) — and it is **bounded**: once
+  the window closes (20 client ticks, or as soon as the server's answer arrives) the plain `empty-hand`
+  refusal is reached, so a caller is never left waiting for a verdict that cannot come.
 
 **Divergence, stated rather than hidden:** a real placement is bounded by reach, by what is in hand, and
 by what the target supports. Scripted runs that used to place far-away blocks must select the matching
 slot and stand within reach — otherwise they are now refused. This is the intended trade: a placement
 that no other mod, plugin or server can observe is not a placement.
+
+**Two operational lessons from the real-machine rounds (they cost runs to learn):**
+
+1. **World changes persist across instances.** A placement from an earlier round is still there — in the
+   same world — when the next instance starts. A fixed target cell therefore becomes "not replaceable" on
+   the second run, and a test that reused it looks like a regression when it is only stale ground. Round
+   targets MUST be chosen on **fresh, empty ground per round** (or the previous run's blocks removed
+   deliberately, and even that is a state change the next round inherits).
+2. **After `inv.select`, let the synchronisation window close before sending the op that depends on it.**
+   The server learns the carried slot from the packet in §6.2e, and the view core reads may still be
+   catching up; an op sent in the same instant can be answered `cannot determine` (bounded, per §6.2c
+   rule 1) even though the selection was correct. Send the selection, then the placement.
 
 ### 6.2e `inv.select` — select a hotbar slot, and tell the server
 

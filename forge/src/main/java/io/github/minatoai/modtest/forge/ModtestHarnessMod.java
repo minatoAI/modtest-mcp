@@ -261,7 +261,13 @@ public final class ModtestHarnessMod {
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
-        if (relay == null || event.phase != TickEvent.Phase.END) {
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
+        // Count real client ticks first: the container synchronisation window is measured in ticks the
+        // client actually ran, so it always converges (P12) — a wall-clock window did not.
+        MinecraftClientModel.noteClientTick();
+        if (relay == null) {
             return;
         }
         long now = System.currentTimeMillis();

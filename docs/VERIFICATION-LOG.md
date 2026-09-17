@@ -392,6 +392,13 @@ minds.
    `reobfJar`. The fix was therefore re-aimed at `reobfJar` (dependency **and** an entry-CRC identity
    assertion against `reobfJar`'s output), and the acceptance now includes the old graph failing loudly.
    **Lesson: name the task that writes the bytes you measure before blaming a step in the graph.**
+   **The reviewer's lesson, recorded as theirs:** when specifying a mechanical assertion, first ask what
+   that assertion looks like **on the bad artifact**. The instruction here was "the jar must contain
+   `modtest.refmap.json` + `modtest.harness.mixins.json`, missing either is red" — and that is red-proof
+   only against one failure mode, because the un-reobfuscated jar contains both files too. Specify the
+   measurement that **discriminates** good from bad (here: SRG references, 0 versus 40/10), not a
+   plausible-looking proxy. This is the same family as the "measuring a different path than the one that
+   runs in production" mistakes earlier in this log.
 
 ---
 

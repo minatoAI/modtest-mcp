@@ -74,8 +74,29 @@ New-Item -ItemType Directory -Force -Path $Evidence | Out-Null
 
 Write-Output ('[psa] dump=' + $ShadersDir + '  files=' + $files.Count)
 
-# ---- manifest + fingerprint (name != artifact: hash what we actually audited) ----
+# ---- manifest + fingerprints (name != artifact: hash what we actually audited) ----
+# TWO fields, because they answer two different questions (task-43):
+#   fingerprintRaw        -- sha256 of the manifest of RAW per-file hashes. Any byte change moves it:
+#                            "was this artifact modified?" Use for provenance/integrity of a dump.
+#                            It is ROUND-SENSITIVE: the .properties files are rewritten every round with a
+#                            new date header, so this value MUST NOT be used for a same-package judgment.
+#   fingerprintNormalized -- the same manifest idea, but each file's hash is taken over the NORMALIZED
+#                            text (normalizeForDigest: date headers removed from *.properties), reusing the
+#                            single PowerShell implementation of the mod's rule (tools/pack-fingerprint.ps1)
+#                            so the harness and the mod cannot disagree again. This is the field for
+#                            "are these two artifacts the same package?".
+# tools/fingerprint-parity.test.ps1 feeds a fixed corpus to this rule and to the SHIPPED Java class and
+# compares them case by case; the two implementations drifting apart is exactly what went wrong on
+# 2026-09-27 (harness said 01555353... / E72BEC56..., the mod said equal).
+$packFingerprintPath = Join-Path $PSScriptRoot 'pack-fingerprint.ps1'
+if (-not (Test-Path -LiteralPath $packFingerprintPath -PathType Leaf)) {
+    Write-Output ('ERROR: tools/pack-fingerprint.ps1 is required for fingerprintNormalized: ' + $packFingerprintPath)
+    exit 2
+}
+. $packFingerprintPath
+
 $manifest = New-Object System.Collections.Generic.List[string]
+$manifestNormalized = New-Object System.Collections.Generic.List[string]
 $texts = @{}
 $totalBytes = 0L
 foreach ($f in $files) {
@@ -83,12 +104,20 @@ foreach ($f in $files) {
     $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
     $manifest.Add(('{0}  {1}  {2}' -f $rel, $f.Length, $sha))
     $totalBytes += $f.Length
-    $texts[$rel] = [System.IO.File]::ReadAllText($f.FullName)
+    $rawText = [System.IO.File]::ReadAllText($f.FullName)
+    $texts[$rel] = $rawText
+    # The normalized hash is taken over the normalized TEXT (UTF-8 bytes), exactly like the mod side.
+    $normalizedText = Get-PackNormalizedText -RelPath $rel -Text $rawText
+    $normalizedSha = (Get-PackSha256Prefix16 -Text $normalizedText)
+    $manifestNormalized.Add(('{0}  {1}' -f $rel, $normalizedSha))
 }
 $manifestPath = Join-Path $Evidence ($Label + '-manifest.txt')
 $manifest | Set-Content -LiteralPath $manifestPath -Encoding UTF8
-$fingerprint = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
-Write-Output ('[psa] totalBytes=' + $totalBytes + '  fingerprint(manifest sha256)=' + $fingerprint)
+$fingerprintRaw = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+$manifestNormalizedPath = Join-Path $Evidence ($Label + '-manifest-normalized.txt')
+$manifestNormalized | Set-Content -LiteralPath $manifestNormalizedPath -Encoding UTF8
+$fingerprintNormalized = (Get-FileHash -LiteralPath $manifestNormalizedPath -Algorithm SHA256).Hash
+Write-Output ('[psa] totalBytes=' + $totalBytes + '  fingerprintRaw=' + $fingerprintRaw + '  fingerprintNormalized=' + $fingerprintNormalized)
 
 # ---- assertion 1: dump non-empty ----
 Assert ($files.Count -gt 0) ('dump 非空(' + $files.Count + ' 个文件)')
@@ -130,8 +159,15 @@ $report = [pscustomobject]@{
     shadersDir       = $ShadersDir
     fileCount        = $files.Count
     totalBytes       = $totalBytes
-    manifestSha256   = $fingerprint
+    # ROUND-SENSITIVE: raw bytes of the audited dump. Any change moves it; NOT a same-package judgment.
+    fingerprintRaw   = $fingerprintRaw
+    # Same-package judgment: date headers of *.properties removed with the mod's own rule.
+    fingerprintNormalized = $fingerprintNormalized
+    # DEPRECATED alias kept for existing readers: it is the RAW value. Archived reports carry this name
+    # with raw semantics, so anything citing them must say so (see the README's raw-fingerprint list).
+    manifestSha256   = $fingerprintRaw
     manifestPath     = $manifestPath
+    manifestNormalizedPath = $manifestNormalizedPath
     includeResidual  = $includeCount
     requirePatterns  = $RequirePattern
     forbidPatterns   = $ForbidPattern

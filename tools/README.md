@@ -435,9 +435,23 @@ whose verdict depends on the still-pending Java side with `pendingJavaSide`, and
 the declaration **in both directions**: it fails if the PowerShell side is not already on the new rule, and
 it fails if the declaration *outlives* the divergence (the marker must be removed once task-50 lands).
 While the declaration stands the divergence is printed as `DIVERGE` with both digests and counted in the
-summary — visible, never silent. Measured: leaving the PS side on the old rule ⇒ **FAIL** (89/93, B6/B12/C1
-rejected); removing the declaration while Java is still old ⇒ **FAIL** (90/96, undeclared divergence). A
-one-sided change is red in **both** directions.
+summary — visible, never silent. **Measured — each number with the configuration that produces it** (quote the configuration, not just the
+count; these are different runs, so the totals differ):
+
+| configuration | command | result |
+|---|---|---|
+| PS new / Java old (**the real, committed state**) | `fingerprint-parity.test.ps1` | **PASS 93/93**, 3 declared divergences |
+| PS **old** / Java old (repo copy of `pack-fingerprint.ps1` with the day field reverted) | `fingerprint-parity.test.ps1 -ImplPath <old-day variant>` | **FAIL 89/93** — B6/B12/C1 rejected by "powershell is already on the NEW rule"; B10/B11/B8/C10/C11/C12 stay green |
+| PS new / Java **new** (peer review shadow-compiled a widened Java side) | `fingerprint-parity.test.ps1` + widened Java | **FAIL 90/93** — "the marker is STALE: remove pendingJavaSide" (3 failures) |
+| markers **deleted** from a corpus COPY, Java still old | `fingerprint-parity.test.ps1 -CorpusPath <corpus with pendingJavaSide removed>` | **FAIL 90/96** — the undeclared divergence is caught by `[1] java and powershell agree` + `[2] java matches the declared expectation` |
+
+The totals differ **by construction**, which is why `93` is the only number for the committed state:
+a marked case contributes **2** checks (PS-must-be-new, Java-must-still-be-old) and skips `[1]`/`[2-java]`;
+the same case with the marker removed contributes **3**. Three marked cases therefore give
+93 - 6 + 9 = **96**, and the 6 failures give **90/96**. The variant corpus has
+sha256 `C48DC09280ED0BF7B9F796F332566CF151231B863618E27992C7CF9C995F713C`, not the committed
+`9E0F6A81…` — a peer review that could not reproduce `90/96` was right to ask: I had quoted the count
+without its configuration.
 
 **Raw-口径 catalog — inclusion criterion (so the count is reproducible): a `*.json` under any evidence directory whose PARSED json has a top-level `manifestSha256` property.** That scan (2026-09-26) yields **25 files**; R6 counted **17** with a narrower grep, i.e. a different criterion — if you recount, state your criterion. Those entries hold the RAW value (round-sensitive; state the口径 when citing them): (round-sensitive; state the
 口径 whenever you cite them): `2026-09-25-numeric-probe\gates` `2BD5C22D…`;

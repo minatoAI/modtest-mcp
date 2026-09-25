@@ -344,6 +344,51 @@ foreach ($case in $cases) {
     }
 }
 
+# ---------------------------------------------------------------- field semantics (the three difference kinds)
+# Acceptance for the two fields needs three comparisons, not one: a header re-stamp must move raw only; a
+# real content change and a change in a NON-.properties file must move BOTH (the rule must not over-reach).
+Write-Output '--- field semantics: raw vs normalized on three kinds of difference ---'
+$auditTool = Join-Path $PSScriptRoot 'patched-shaders-audit.ps1'
+if (-not (Test-Path -LiteralPath $auditTool -PathType Leaf)) {
+    Add-Check 'patched-shaders-audit.ps1 is available for the field-semantics checks' $false ('not found: ' + $auditTool)
+} else {
+    function New-Dump {
+        param([string]$Root, [string]$HeaderDate, [string]$KeyValue, [string]$FshComment)
+        $dir = Join-Path $tempRoot ('dump-' + $Root)
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Set-Content -LiteralPath (Join-Path $dir 'block.properties') -Encoding UTF8 -Value ("#Sat Sep 26 $HeaderDate CST 2026`nkey=$KeyValue`nkey2=value2`n")
+        Set-Content -LiteralPath (Join-Path $dir 'shader.fsh') -Encoding UTF8 -Value ("// $FshComment`nvoid main(){}`n")
+        return $dir
+    }
+    function Invoke-AuditFields {
+        param([string]$DumpDir, [string]$Label)
+        $ev = Join-Path $tempRoot ('ev-' + $Label)
+        New-Item -ItemType Directory -Force -Path $ev | Out-Null
+        $argv = @('-NoProfile', '-File', $auditTool, '-ShadersDir', $DumpDir, '-Evidence', $ev, '-Label', $Label, '-MinFiles', '1')
+        $null = @(& pwsh @argv 2>&1 | ForEach-Object { [string]$_ })
+        $reportPath = Join-Path $ev ($Label + '-report.json')
+        if (-not (Test-Path -LiteralPath $reportPath)) { return $null }
+        $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+        return [pscustomobject]@{ raw = $report.fingerprintRaw; normalized = $report.fingerprintNormalized; alias = $report.manifestSha256 }
+    }
+    $base = New-Dump -Root 'base' -HeaderDate '01:00:00' -KeyValue 'value' -FshComment 'base'
+    $headerOnly = New-Dump -Root 'header' -HeaderDate '02:00:00' -KeyValue 'value' -FshComment 'base'
+    $realChange = New-Dump -Root 'real' -HeaderDate '01:00:00' -KeyValue 'CHANGED' -FshComment 'base'
+    $fshChange = New-Dump -Root 'fsh' -HeaderDate '01:00:00' -KeyValue 'value' -FshComment 'a #Sat Sep 26 03:00:00 CST 2026 style line'
+    $fBase = Invoke-AuditFields -DumpDir $base -Label 'sem-base'
+    $fHeader = Invoke-AuditFields -DumpDir $headerOnly -Label 'sem-header'
+    $fReal = Invoke-AuditFields -DumpDir $realChange -Label 'sem-real'
+    $fFsh = Invoke-AuditFields -DumpDir $fshChange -Label 'sem-fsh'
+    if ($null -eq $fBase -or $null -eq $fHeader -or $null -eq $fReal -or $null -eq $fFsh) {
+        Add-Check 'the audit tool produced both fields for every synthetic dump' $false 'a report was missing'
+    } else {
+        Add-Check 'header re-stamp: raw DIFFERS, normalized is EQUAL' (($fBase.raw -ne $fHeader.raw) -and ($fBase.normalized -eq $fHeader.normalized)) ('raw=' + $fBase.raw.Substring(0, 12) + '/' + $fHeader.raw.Substring(0, 12) + ' norm=' + $fBase.normalized.Substring(0, 12))
+        Add-Check 'real content change: BOTH differ (normalized must not hide it)' (($fBase.raw -ne $fReal.raw) -and ($fBase.normalized -ne $fReal.normalized)) ('norm=' + $fBase.normalized.Substring(0, 12) + '/' + $fReal.normalized.Substring(0, 12))
+        Add-Check 'change in a .fsh only: BOTH differ (the rule must not over-reach past *.properties)' (($fBase.raw -ne $fFsh.raw) -and ($fBase.normalized -ne $fFsh.normalized)) ('norm=' + $fBase.normalized.Substring(0, 12) + '/' + $fFsh.normalized.Substring(0, 12))
+        Add-Check 'the deprecated manifestSha256 alias still reports the RAW value' (($fBase.alias -eq $fBase.raw) -and ($fHeader.alias -ne $fHeader.normalized))
+    }
+}
+
 # ---------------------------------------------------------------- real files end to end
 Write-Output '--- real files: raw must differ, normalized must match ---'
 $realPaths = [ordered]@{

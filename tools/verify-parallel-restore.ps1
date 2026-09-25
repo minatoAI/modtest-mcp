@@ -181,8 +181,14 @@ foreach ($roundDirRaw in $roundDirs) {
         # exist let the reviewer's scenario D through -- a round that restored ONE of three files looked
         # clean. The expected set is therefore derived, not discovered.
         $managed = New-Object System.Collections.Generic.List[string]
+        $managedBefore = @{}
         foreach ($field in $managedShaFields.Keys) {
-            if ((Get-ManifestValue -ManifestPath $manifestPath -Key $field).Length -gt 0) { $managed.Add($managedShaFields[$field]) | Out-Null }
+            $expectedSha = (Get-ManifestValue -ManifestPath $manifestPath -Key $field).Trim().ToUpperInvariant()
+            if ($expectedSha.Length -gt 0) {
+                $rel = $managedShaFields[$field]
+                $managed.Add($rel) | Out-Null
+                $managedBefore[$rel] = $expectedSha
+            }
         }
         $entry.managedFiles = @($managed.ToArray())
         if ($managed.Count -eq 0) {
@@ -203,8 +209,19 @@ foreach ($roundDirRaw in $roundDirs) {
             $backupSha = Get-Sha256 $backupPath
             $liveSha = Get-Sha256 $targetPath
             $same = ($liveSha.Length -gt 0) -and ($liveSha -eq $backupSha)
+            # THREE-WAY check (task-58). Comparing only live-vs-.orig is two-way: a FOREIGN .orig -- one left
+            # behind by another round -- passes as long as live was put back to THAT file's bytes, and then
+            # both sides agree while neither is this round's baseline. The manifest recorded what the file
+            # looked like before THIS round, so the backup must equal it too.
+            $expectedBefore = [string]$managedBefore[$relTarget]
+            $backupIsBaseline = ($expectedBefore.Length -eq 0) -or ($backupSha -eq $expectedBefore)
             $entry.reVerifiedFiles += [pscustomobject]@{
                 file = $relTarget; backupSha256 = $backupSha; liveSha256 = $liveSha; match = $same
+                expectedBeforeSha256 = $expectedBefore; backupIsThisRoundsBaseline = $backupIsBaseline
+            }
+            if (-not $backupIsBaseline) {
+                $entry.problems += ($origName + ' is NOT this round''s pre-round bytes: the backup disagrees with the manifest (a foreign or stale .orig)')
+                $failed.Add($roundDir + ': ' + $origName + ' does not match the manifest BeforeSha256 (foreign .orig)') | Out-Null
             }
             if (-not $same) {
                 $entry.problems += ($relTarget + ' does NOT match its pre-round backup on disk now')
@@ -248,7 +265,7 @@ foreach ($entry in $reports) {
     Write-Output ('       setupDir=' + $entry.setupDir)
     Write-Output ('       manifest=' + $entry.manifestPresent + ' restoreReport=' + $entry.restoreReportPresent + ' ROUND_RESTORE=OK:' + $entry.roundRestoreOk + ' recordedMatchLines=' + $entry.recordedMatchLines + ' managedFiles=' + (@($entry.managedFiles) -join ','))
     foreach ($file in @($entry.reVerifiedFiles)) {
-        Write-Output ('       re-verified ' + $file.file + ' match=' + $file.match + ' backup=' + $file.backupSha256.Substring(0, [Math]::Min(16, $file.backupSha256.Length)) + ' live=' + $file.liveSha256.Substring(0, [Math]::Min(16, $file.liveSha256.Length)))
+        Write-Output ('       re-verified ' + $file.file + ' match=' + $file.match + ' backupIsBaseline=' + $file.backupIsThisRoundsBaseline + ' backup=' + $file.backupSha256.Substring(0, [Math]::Min(16, $file.backupSha256.Length)) + ' live=' + $file.liveSha256.Substring(0, [Math]::Min(16, $file.liveSha256.Length)))
     }
     foreach ($problem in @($entry.problems)) { Write-Output ('       PROBLEM: ' + $problem) }
 }

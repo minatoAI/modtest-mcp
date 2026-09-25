@@ -47,7 +47,7 @@ function New-Slot {
     #   -RunTag <tag>       -> files live in round-setup\<tag>\
     param(
         [string]$Root, [string]$Slot,
-        [int]$ManagedCount = 3, [int]$BackupCount = -1, [switch]$CorruptLive, [switch]$NoReport, [switch]$NoBackups,
+        [int]$ManagedCount = 3, [int]$BackupCount = -1, [switch]$CorruptLive, [switch]$ForeignOrig, [switch]$NoReport, [switch]$NoBackups,
         [switch]$StaleManifestSha, [switch]$DropReportGameDir, [string]$RunTag = ''
     )
     $game = Join-Path $Root ('game-' + $Slot)
@@ -95,6 +95,12 @@ function New-Slot {
         }
         Set-Content -LiteralPath (Join-Path $setup 'restore-report.txt') -Value ($lines.ToArray()) -Encoding UTF8
     }
+    if ($ForeignOrig) {
+        # R7's construction: the .orig is replaced with OTHER bytes and live is made to match it, so a
+        # two-way live-vs-.orig check passes while the manifest says the real baseline was different.
+        Set-Content -LiteralPath (Join-Path $setup 'oculus.properties.orig') -Value "enableDebugOptions=foreign`n" -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=foreign`n" -Encoding UTF8
+    }
     if ($CorruptLive) {
         # Written AFTER the backups: the live file no longer matches its pre-round bytes.
         Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=true`n" -Encoding UTF8
@@ -103,10 +109,11 @@ function New-Slot {
 }
 
 function Invoke-Verify {
-    param([string[]]$Rounds, [string[]]$Expect = @(), [string]$RunTag = '')
+    param([string[]]$Rounds, [string[]]$Expect = @(), [string]$RunTag = '', [string]$Script = '')
+    if ($Script.Length -eq 0) { $Script = $VerifyScript }
     # One comma-separated argument: with `pwsh -File`, a second bare value would bind to the NEXT positional
     # parameter (here -Evidence) instead of to -RoundEvidence, silently checking only the first slot.
-    $argv = @('-NoProfile', '-File', $VerifyScript, '-RoundEvidence', ($Rounds -join ','))
+    $argv = @('-NoProfile', '-File', $Script, '-RoundEvidence', ($Rounds -join ','))
     if ($Expect.Count -gt 0) { $argv += @('-ExpectSlots', ($Expect -join ',')) }
     if ($RunTag.Length -gt 0) { $argv += @('-RunTag', $RunTag) }
     $out = @(& pwsh @argv 2>&1 | ForEach-Object { [string]$_ })
@@ -205,6 +212,22 @@ $rL = Invoke-Verify -Rounds @($goodA, $goodB) -Expect @('A', 'B', 'C')
 Add-Check 'a missing expected slot -> FAIL' (($rL.exit -eq 1) -and ($rL.text -match 'expected slot\(s\) missing: C')) ('exit=' + $rL.exit)
 
 # ---- the archived verdict --------------------------------------------------
+# ---- foreign .orig (task-58): the backup itself must be this round's baseline ----
+Write-Output '--- foreign .orig: the backup disagrees with the manifest ---'
+$evM = Join-Path $tempRoot 'evM'; New-Item -ItemType Directory -Force -Path $evM | Out-Null
+New-Slot -Root $evM -Slot 'A' -ForeignOrig | Out-Null
+$rM = Invoke-Verify -Rounds @($evM)
+Add-Check 'foreign .orig: FAIL -- live-vs-.orig alone cannot see it' (($rM.exit -eq 1) -and ($rM.text -match 'foreign \.orig')) ('exit=' + $rM.exit)
+Add-Check 'and the per-file line reports backupIsBaseline=False' ($rM.text -match 'backupIsBaseline=False')
+# RED CONTROL: neutralize ONLY the three-way check -> the same scenario must go undetected.
+$neutralPath = Join-Path $tempRoot 'verify-no-threeway.ps1'
+$implTextV = [System.IO.File]::ReadAllText($VerifyScript)
+$neutral = $implTextV.Replace('$backupIsBaseline = ($expectedBefore.Length -eq 0) -or ($backupSha -eq $expectedBefore)', '$backupIsBaseline = $true')
+Add-Check 'the neutralized verifier could be built (red control is not vacuous)' ($neutral -ne $implTextV)
+[System.IO.File]::WriteAllText($neutralPath, $neutral, (New-Object System.Text.UTF8Encoding($false)))
+$rN = Invoke-Verify -Rounds @($evM) -Script $neutralPath
+Add-Check 'red control: WITHOUT the three-way check the foreign .orig is NOT detected' ($rN.exit -eq 0) ('exit=' + $rN.exit + ' -- the new check is what catches it')
+
 Write-Output '--- archived verdict ---'
 $evOut = Join-Path $tempRoot 'verdict'
 $argvZ = @('-NoProfile', '-File', $VerifyScript, '-RoundEvidence', ($goodA + ',' + $goodB), '-Evidence', $evOut)

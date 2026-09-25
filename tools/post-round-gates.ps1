@@ -54,6 +54,8 @@ param(
     # Make the restore gate mandatory: without -RoundEvidence this FAILS instead of being skipped. A round
     # gate call should always pass this, so "no evidence" can never pass for "restored".
     [switch]$RequireRestore,
+    # For rounds written with -RunTag, whose round-setup\ holds a <tag>\ subdirectory.
+    [string]$RunTag = '',
     [switch]$SkipRestoreGate
 )
 
@@ -116,22 +118,24 @@ if (-not $SkipGlslang) {
     if ($r.exit -ne 0) { $failed.Add("glslang-check exit=$($r.exit)") }
 }
 
-# ---- gate 3: did the round give the game directory back? (task-40) --------
+# ---- gate 3: did the round give the game directory back? (task-40, fixed in task-46) --------
+# This gate USED TO decide from the report alone: file present + `^ROUND_RESTORE=OK$`. That proves only
+# that some report claims success, and the reviewer's adversarial matrix showed four ways it passed while
+# the game directory was not actually restored: a dirty live file, a leftover report from an earlier round,
+# a bypassed entry point (no setup-manifest at all), and a round that handled one file of three. It also
+# could not see -RunTag rounds at all, because it hardcoded round-setup\.
+#
+# So the gate no longer re-implements "was it restored" -- two implementations of one rule drifting apart is
+# exactly what happened to the package fingerprints (task-43). It CALLS verify-parallel-restore.ps1, whose
+# third stage hashes each live file against its .orig backup, derives the expected file set from the round's
+# own manifest, and requires the report to be bound to that manifest and gameDir.
 if (-not $SkipRestoreGate) {
-    $restoreReport = ''
-    if ($RoundEvidence.Length -gt 0) { $restoreReport = Join-Path $RoundEvidence 'round-setup\restore-report.txt' }
-    $restoreText = ''
-    if ($restoreReport.Length -gt 0 -and (Test-Path -LiteralPath $restoreReport -PathType Leaf)) {
-        $restoreText = [System.IO.File]::ReadAllText($restoreReport)
-    }
+    $verifier = Join-Path $PSScriptRoot 'verify-parallel-restore.ps1'
     $r = [ordered]@{
         name = 'restore'
+        verifier = $verifier
         roundEvidence = $RoundEvidence
-        report = $restoreReport
-        reportSha256 = (Get-Sha256 $restoreReport)
-        present = ($restoreText.Length -gt 0)
-        roundRestoreOk = ($restoreText -match '(?m)^ROUND_RESTORE=OK\s*$')
-        perFileLines = @([regex]::Matches($restoreText, '(?m)^\[restore\] slot=')).Count
+        runTag = $RunTag
         output = @()
     }
     if ($RoundEvidence.Length -eq 0) {
@@ -141,14 +145,22 @@ if (-not $SkipRestoreGate) {
         $r.exit = if ($RequireRestore) { 1 } else { -1 }
         $r.skipped = (-not $RequireRestore)
         $r.reason = 'no -RoundEvidence given: cannot prove the game directory was restored by run-round.ps1'
-    } elseif (-not $r.present) {
+        if ($RequireRestore) { $r.output = @('-RequireRestore was set but no -RoundEvidence was passed.') }
+    } elseif (-not (Test-Path -LiteralPath $verifier -PathType Leaf)) {
         $r.exit = 1
-        $r.reason = 'round-setup\restore-report.txt is missing: this round did not go through run-round.ps1 (which is what restores), or it died before writing the report'
-    } elseif (-not $r.roundRestoreOk) {
-        $r.exit = 1
-        $r.reason = 'restore-report.txt has no ROUND_RESTORE=OK: the game directory was NOT verified back to its pre-round state'
+        $r.reason = ('the independent verifier is missing: ' + $verifier)
     } else {
-        $r.exit = 0
+        $vArgs = @('-NoProfile', '-File', $verifier, '-RoundEvidence', $RoundEvidence)
+        if ($RunTag.Length -gt 0) { $vArgs += @('-RunTag', $RunTag) }
+        $vOut = @(& pwsh @vArgs 2>&1 | ForEach-Object { [string]$_ })
+        $r.exit = $LASTEXITCODE
+        $r.output = $vOut
+        $failureLine = @($vOut | Where-Object { $_ -match '^PARALLEL_RESTORE_FAILED=' })
+        if ($r.exit -eq 0) {
+            $r.reason = 'the verifier confirmed every file the round changed is back at its pre-round bytes'
+        } else {
+            $r.reason = 'the verifier REJECTED this round' + $(if ($failureLine.Count -gt 0) { ': ' + $failureLine[0] } else { '' })
+        }
     }
     $gates['restore'] = $r
     if ($r.exit -gt 0) { $failed.Add('restore gate: ' + $r.reason) }

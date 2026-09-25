@@ -394,6 +394,19 @@ $harnessExit = $LASTEXITCODE
     $restore.Add('slot=' + $script:slotLabel)
     $restore.Add('harnessExit=' + $harnessExit)
     $restore.Add('canonicalScript=' + $PSCommandPath)
+    # Bindings (task-46): without these two lines the report is only a self-declaration -- a leftover report
+    # from an earlier round, or one written by a driver that never ran the setup, would still satisfy "it
+    # says ROUND_RESTORE=OK". The verifier requires the gameDir to match the manifest and the manifest's
+    # sha256 to match, so a report can only speak for the exact manifest bytes of its own round.
+    $restore.Add('gameDir=' + $gameDir)
+    $setupManifestPath = Join-Path $setupDir 'setup-manifest.txt'
+    if (Test-Path -LiteralPath $setupManifestPath -PathType Leaf) {
+        $restore.Add('setupManifestSha256=' + (Get-Sha256 $setupManifestPath))
+    } else {
+        # The setup died before the manifest was written: the restore below still runs, but this report
+        # cannot be bound to a round, and the verifier says so instead of accepting it.
+        Write-Output '[restore] WARNING: no setup-manifest.txt to bind this report to (the setup failed early)'
+    }
 
     Restore-OneFile -Name 'options.txt' -Backup $optionsBackup -Target $optionsPath -ShaBefore $optionsShaBefore -Needed $restoreOptions
     Restore-OneFile -Name 'taclight-client.toml' -Backup $tomlBackup -Target $tomlPath -ShaBefore $tomlShaBefore -Needed $restoreToml

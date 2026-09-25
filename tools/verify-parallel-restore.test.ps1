@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # verify-parallel-restore.test.ps1 -- self-test for verify-parallel-restore.ps1 (offline, no JVM).
 #
-# The tool answers "did every slot of that parallel round give its game directory back?". Its whole value
-# is that it can say NO, so the test spends most of its checks on the failure modes:
-#   * a healthy two-slot round (manifest + report + .orig matching the live files)   -> PASS
-#   * the bypass case: no round-setup\ at all                                        -> FAIL
-#   * a report that does not say ROUND_RESTORE=OK                                    -> FAIL
-#   * a live file that does NOT match its .orig backup (dirty after the round)        -> FAIL
-#   * two rounds claiming the same slot                                               -> FAIL
-#   * -ExpectSlots naming a slot that is not there                                    -> FAIL
-#   * no .orig backup at all: "restored" cannot be re-verified                        -> FAIL
+# The tool answers "did every slot of that parallel round give its game directory back?", and its whole
+# value is that it can say NO. task-46 added the things which exist because "a report SAYS OK" is not
+# evidence: the report must be bound to THIS round's manifest and gameDir, and EVERY file the round's
+# manifest says it changed must be covered (a round that restored one file of three must not look clean).
+# These are the reviewer's adversarial scenarios plus the -RunTag layout.
 #
 # ASCII only. Usage: pwsh tools/verify-parallel-restore.test.ps1 [-KeepTemp]
 # Exit: 0 all checks passed | 1 at least one failed | 2 setup error.
@@ -37,116 +33,182 @@ function Add-Check {
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('verify-parallel-restore-test-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 
+function Get-Sha([string]$Path) { if (Test-Path -LiteralPath $Path -PathType Leaf) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } return '' }
+
 function New-Slot {
-    # A synthetic restored slot: game directory with the three files, a round-setup\ holding the .orig
-    # backups, the manifest (gameDir=) and a restore report. -Corrupt then rewrites one live file so the
-    # independent re-verification has something to catch.
-    param([string]$Root, [string]$Slot, [switch]$Corrupt, [switch]$NoReport, [switch]$NoBackups, [string]$ReportBody = '')
+    # A synthetic round in the REAL on-disk format: a manifest with gameDir= and one before-sha field per
+    # managed file, .orig backups, and a restore report BOUND to the manifest by sha.
+    #   -ManagedCount 1     -> only one of the three changed files was handled (the reviewer's scenario D)
+    #   -CorruptLive        -> the live file no longer matches its backup (scenario B)
+    #   -NoReport           -> scenario E
+    #   -NoBackups          -> the manifest says files changed, but no .orig exists
+    #   -StaleManifestSha   -> the report is bound to a DIFFERENT manifest (leftover evidence)
+    #   -DropReportGameDir  -> the report carries no gameDir= line (unbound)
+    #   -RunTag <tag>       -> files live in round-setup\<tag>\
+    param(
+        [string]$Root, [string]$Slot,
+        [int]$ManagedCount = 3, [int]$BackupCount = -1, [switch]$CorruptLive, [switch]$NoReport, [switch]$NoBackups,
+        [switch]$StaleManifestSha, [switch]$DropReportGameDir, [string]$RunTag = ''
+    )
     $game = Join-Path $Root ('game-' + $Slot)
     $setup = Join-Path $Root 'round-setup'
-    New-Item -ItemType Directory -Force -Path (Join-Path $game 'config'),$setup | Out-Null
+    if ($RunTag.Length -gt 0) { $setup = Join-Path $setup $RunTag }
+    New-Item -ItemType Directory -Force -Path (Join-Path $game 'config'), $setup | Out-Null
     Set-Content -LiteralPath (Join-Path $game 'options.txt') -Value "pauseOnLostFocus:true`n" -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $game 'config\taclight-client.toml') -Value "schema = 1`n" -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=false`n" -Encoding UTF8
-    if (-not $NoBackups) {
-        Copy-Item -LiteralPath (Join-Path $game 'options.txt') -Destination (Join-Path $setup 'options.txt.orig') -Force
-        Copy-Item -LiteralPath (Join-Path $game 'config\taclight-client.toml') -Destination (Join-Path $setup 'taclight-client.toml.orig') -Force
-        Copy-Item -LiteralPath (Join-Path $game 'config\oculus.properties') -Destination (Join-Path $setup 'oculus.properties.orig') -Force
+
+    $managed = @(
+        @{ field = 'optionsBeforeSha256'; rel = 'options.txt'; orig = 'options.txt.orig' },
+        @{ field = 'taclightClientTomlBeforeSha256'; rel = 'config\taclight-client.toml'; orig = 'taclight-client.toml.orig' },
+        @{ field = 'oculusBeforeSha256'; rel = 'config\oculus.properties'; orig = 'oculus.properties.orig' }
+    )
+    if ($BackupCount -lt 0) { $BackupCount = $ManagedCount }
+    $manifestLines = New-Object System.Collections.Generic.List[string]
+    $manifestLines.Add('round=2026-09-26T02:20:00.0000000+08:00') | Out-Null
+    $manifestLines.Add('gameDir=' + $game) | Out-Null
+    $manifestLines.Add('timeoutSec=150') | Out-Null
+    $i = 0
+    foreach ($m in $managed) {
+        if ($i -ge $ManagedCount) { break }
+        $manifestLines.Add($m.field + '=' + (Get-Sha (Join-Path $game $m.rel))) | Out-Null
+        if ((-not $NoBackups) -and ($i -lt $BackupCount)) { Copy-Item -LiteralPath (Join-Path $game $m.rel) -Destination (Join-Path $setup $m.orig) -Force }
+        $i++
     }
-    Set-Content -LiteralPath (Join-Path $setup 'setup-manifest.txt') -Encoding UTF8 -Value @"
-round=2026-09-26T02:20:00.0000000+08:00
-gameDir=$game
-timeoutSec=150
-"@
+    $manifestPath = Join-Path $setup 'setup-manifest.txt'
+    [System.IO.File]::WriteAllLines($manifestPath, $manifestLines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    $manifestSha = Get-Sha $manifestPath
+    if ($StaleManifestSha) { $manifestSha = ('0' * 64) }
+
     if (-not $NoReport) {
-        $body = if ($ReportBody.Length -gt 0) { $ReportBody } else { @"
-slot=$Slot
-harnessExit=0
-ROUND_RESTORE=OK
-[restore] slot=$Slot file=options.txt before=AAA after=AAA match=True
-[restore] slot=$Slot file=taclight-client.toml before=BBB after=BBB match=True
-[restore] slot=$Slot file=oculus.properties before=CCC after=CCC match=True
-"@ }
-        Set-Content -LiteralPath (Join-Path $setup 'restore-report.txt') -Value $body -Encoding UTF8
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add('slot=' + $Slot) | Out-Null
+        if (-not $DropReportGameDir) { $lines.Add('gameDir=' + $game) | Out-Null }
+        $lines.Add('setupManifestSha256=' + $manifestSha) | Out-Null
+        $lines.Add('harnessExit=0') | Out-Null
+        $lines.Add('ROUND_RESTORE=OK') | Out-Null
+        $i = 0
+        foreach ($m in $managed) {
+            if ($i -ge $ManagedCount) { break }
+            $lines.Add('[restore] slot=' + $Slot + ' file=' + $m.rel + ' before=AAA after=AAA match=True') | Out-Null
+            $i++
+        }
+        Set-Content -LiteralPath (Join-Path $setup 'restore-report.txt') -Value ($lines.ToArray()) -Encoding UTF8
     }
-    if ($Corrupt) {
-        # Written AFTER the backups, so the live file no longer matches its pre-round bytes.
+    if ($CorruptLive) {
+        # Written AFTER the backups: the live file no longer matches its pre-round bytes.
         Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=true`n" -Encoding UTF8
     }
     return $game
 }
 
 function Invoke-Verify {
-    param([string[]]$Rounds, [string[]]$Expect = @())
+    param([string[]]$Rounds, [string[]]$Expect = @(), [string]$RunTag = '')
     # One comma-separated argument: with `pwsh -File`, a second bare value would bind to the NEXT positional
     # parameter (here -Evidence) instead of to -RoundEvidence, silently checking only the first slot.
     $argv = @('-NoProfile', '-File', $VerifyScript, '-RoundEvidence', ($Rounds -join ','))
     if ($Expect.Count -gt 0) { $argv += @('-ExpectSlots', ($Expect -join ',')) }
+    if ($RunTag.Length -gt 0) { $argv += @('-RunTag', $RunTag) }
     $out = @(& pwsh @argv 2>&1 | ForEach-Object { [string]$_ })
     return [pscustomobject]@{ exit = $LASTEXITCODE; text = ($out -join "`n") }
 }
 
 Write-Output ('VERIFY-PARALLEL-RESTORE-TEST script=' + $VerifyScript)
 
-# ---- 1. the healthy two-slot round ----------------------------------------
-Write-Output '--- 1. two healthy slots ---'
+# ---- A. the healthy two-slot round (positive control) ---------------------
+Write-Output '--- A. two healthy slots ---'
 $goodA = Join-Path $tempRoot 'evA'; New-Item -ItemType Directory -Force -Path $goodA | Out-Null
 $goodB = Join-Path $tempRoot 'evB'; New-Item -ItemType Directory -Force -Path $goodB | Out-Null
 New-Slot -Root $goodA -Slot 'A' | Out-Null
 New-Slot -Root $goodB -Slot 'B' | Out-Null
-$r1 = Invoke-Verify -Rounds @($goodA, $goodB) -Expect @('A', 'B')
-Add-Check 'two healthy slots -> PASS (exit 0)' (($r1.exit -eq 0) -and ($r1.text -match 'PARALLEL_RESTORE_VERDICT=PASS')) ('exit=' + $r1.exit)
-Add-Check 'both slots are reported' (($r1.text -match 'PARALLEL_RESTORE_SLOTS=A,B') -or ($r1.text -match 'PARALLEL_RESTORE_SLOTS=B,A'))
-Add-Check 'the independent re-verification ran for the files' ($r1.text -match 're-verified options\.txt match=True')
+$rA = Invoke-Verify -Rounds @($goodA, $goodB) -Expect @('A', 'B')
+Add-Check 'A clean: two healthy slots -> PASS (exit 0)' (($rA.exit -eq 0) -and ($rA.text -match 'PARALLEL_RESTORE_VERDICT=PASS')) ('exit=' + $rA.exit)
+Add-Check 'A clean: both slots reported' (($rA.text -match 'PARALLEL_RESTORE_SLOTS=A,B') -or ($rA.text -match 'PARALLEL_RESTORE_SLOTS=B,A'))
+Add-Check 'A clean: the manifest-derived expected set is reported' ($rA.text -match 'managedFiles=options\.txt,config\\taclight-client\.toml,config\\oculus\.properties')
+Add-Check 'A clean: independent re-verification ran' ($rA.text -match 're-verified options\.txt match=True')
 
-# ---- 2. the bypass case: no round-setup\ ----------------------------------
-Write-Output '--- 2. a round that never went through run-round.ps1 ---'
-$bypass = Join-Path $tempRoot 'ev-bypass'; New-Item -ItemType Directory -Force -Path $bypass | Out-Null
-$r2 = Invoke-Verify -Rounds @($bypass)
-Add-Check 'no round-setup\ -> FAIL (exit 1)' (($r2.exit -eq 1) -and ($r2.text -match 'PARALLEL_RESTORE_VERDICT=FAIL')) ('exit=' + $r2.exit)
-Add-Check 'and it names the bypass' ($r2.text -match 'did not go through run-round\.ps1')
+# ---- B. a report that says OK while the live file is dirty -----------------
+Write-Output '--- B. report says OK, live is dirty ---'
+$evB = Join-Path $tempRoot 'evB-dirty'; New-Item -ItemType Directory -Force -Path $evB | Out-Null
+New-Slot -Root $evB -Slot 'A' -CorruptLive | Out-Null
+$rB = Invoke-Verify -Rounds @($evB)
+Add-Check 'B dirty live: FAIL (a report saying OK is not evidence)' (($rB.exit -eq 1) -and ($rB.text -match 'is not back to the pre-round bytes')) ('exit=' + $rB.exit)
+Add-Check 'B dirty live: the re-verification line shows match=False' ($rB.text -match 're-verified .*oculus\.properties match=False')
 
-# ---- 3. a report that does not say ROUND_RESTORE=OK -----------------------
-Write-Output '--- 3. a report without ROUND_RESTORE=OK ---'
-$badReport = Join-Path $tempRoot 'ev-badreport'; New-Item -ItemType Directory -Force -Path $badReport | Out-Null
-New-Slot -Root $badReport -Slot 'A' -ReportBody "slot=A`nharnessExit=0`nROUND_RESTORE=FAIL:oculus.properties`n" | Out-Null
-$r3 = Invoke-Verify -Rounds @($badReport)
-Add-Check 'ROUND_RESTORE=FAIL -> FAIL' (($r3.exit -eq 1) -and ($r3.text -match 'ROUND_RESTORE is not OK')) ('exit=' + $r3.exit)
+# ---- C. a report that says FAIL -------------------------------------------
+Write-Output '--- C. report says FAIL ---'
+$evC = Join-Path $tempRoot 'evC'; New-Item -ItemType Directory -Force -Path $evC | Out-Null
+New-Slot -Root $evC -Slot 'A' | Out-Null
+(Get-Content -LiteralPath (Join-Path $evC 'round-setup\restore-report.txt')) -replace '^ROUND_RESTORE=OK$', 'ROUND_RESTORE=FAIL:oculus.properties' |
+    Set-Content -LiteralPath (Join-Path $evC 'round-setup\restore-report.txt') -Encoding UTF8
+$rC = Invoke-Verify -Rounds @($evC)
+Add-Check 'C report FAIL: FAIL' (($rC.exit -eq 1) -and ($rC.text -match 'ROUND_RESTORE is not OK')) ('exit=' + $rC.exit)
 
-# ---- 4. a live file that does not match its backup ------------------------
-Write-Output '--- 4. a file left dirty on disk ---'
-$dirty = Join-Path $tempRoot 'ev-dirty'; New-Item -ItemType Directory -Force -Path $dirty | Out-Null
-New-Slot -Root $dirty -Slot 'A' -Corrupt | Out-Null
-$r4 = Invoke-Verify -Rounds @($dirty)
-Add-Check 'a live file differing from its .orig -> FAIL, even though the report says OK' (($r4.exit -eq 1) -and ($r4.text -match 'is not back to the pre-round bytes')) ('exit=' + $r4.exit)
-Add-Check 'and the re-verification line shows match=False' ($r4.text -match 're-verified .*oculus\.properties match=False')
+# ---- D. the expected set is not fully covered (task-46) --------------------
+Write-Output '--- D. the manifest lists three changed files but only ONE .orig exists ---'
+$evD = Join-Path $tempRoot 'evD'; New-Item -ItemType Directory -Force -Path $evD | Out-Null
+New-Slot -Root $evD -Slot 'A' -ManagedCount 3 -BackupCount 1 | Out-Null
+$rD = Invoke-Verify -Rounds @($evD)
+Add-Check 'D partial: FAIL -- the expected set must be FULLY covered' (($rD.exit -eq 1) -and ($rD.text -match 'has no \.orig backup \(expected-set coverage\)')) ('exit=' + $rD.exit)
+Add-Check 'D partial: it names a file that was not covered' ($rD.text -match 'config\\taclight-client\.toml has no .*backup')
 
-# ---- 5. two rounds claiming the same slot --------------------------------
-Write-Output '--- 5. two rounds, one slot name ---'
+# ---- E. no report at all ---------------------------------------------------
+Write-Output '--- E. no restore report ---'
+$evE = Join-Path $tempRoot 'evE'; New-Item -ItemType Directory -Force -Path $evE | Out-Null
+New-Slot -Root $evE -Slot 'A' -NoReport | Out-Null
+$rE = Invoke-Verify -Rounds @($evE)
+Add-Check 'E no report: FAIL' (($rE.exit -eq 1) -and ($rE.text -match 'no restore-report\.txt')) ('exit=' + $rE.exit)
+
+# ---- F. a -RunTag round ----------------------------------------------------
+Write-Output '--- F. a round written with -RunTag ---'
+$evF = Join-Path $tempRoot 'evF'; New-Item -ItemType Directory -Force -Path $evF | Out-Null
+New-Slot -Root $evF -Slot 'A' -RunTag 'r1' | Out-Null
+$rFbad = Invoke-Verify -Rounds @($evF)
+Add-Check 'F tagged round WITHOUT -RunTag: FAIL (bare round-setup\ is empty)' (($rFbad.exit -eq 1) -and ($rFbad.text -match 'setup-manifest\.txt: this round did not go through run-round\.ps1')) ('exit=' + $rFbad.exit)
+$rF = Invoke-Verify -Rounds @($evF) -RunTag 'r1'
+Add-Check 'F tagged round WITH -RunTag: PASS (the two features now agree)' (($rF.exit -eq 0) -and ($rF.text -match 'PARALLEL_RESTORE_VERDICT=PASS')) ('exit=' + $rF.exit)
+Add-Check 'F it reports the tagged setup directory' ($rF.text -match 'round-setup\\r1')
+
+# ---- G. no setup-manifest at all (bypass) ---------------------------------
+Write-Output '--- G. bypass: no setup-manifest.txt ---'
+$evG = Join-Path $tempRoot 'evG'; New-Item -ItemType Directory -Force -Path (Join-Path $evG 'round-setup') | Out-Null
+Set-Content -LiteralPath (Join-Path $evG 'round-setup\restore-report.txt') -Value "slot=A`nROUND_RESTORE=OK`n" -Encoding UTF8
+$rG = Invoke-Verify -Rounds @($evG)
+Add-Check 'G bypass: FAIL (never read "no evidence" as "fine")' (($rG.exit -eq 1) -and ($rG.text -match 'did not go through run-round\.ps1')) ('exit=' + $rG.exit)
+
+# ---- bindings: stale evidence and unbound reports (task-46) ---------------
+Write-Output '--- bindings: the report must belong to THIS round ---'
+$evH = Join-Path $tempRoot 'evH'; New-Item -ItemType Directory -Force -Path $evH | Out-Null
+New-Slot -Root $evH -Slot 'A' -StaleManifestSha | Out-Null
+$rH = Invoke-Verify -Rounds @($evH)
+Add-Check 'stale: a report bound to a DIFFERENT manifest FAILs' (($rH.exit -eq 1) -and ($rH.text -match 'stale report \(manifest sha mismatch\)')) ('exit=' + $rH.exit)
+$evI = Join-Path $tempRoot 'evI'; New-Item -ItemType Directory -Force -Path $evI | Out-Null
+New-Slot -Root $evI -Slot 'A' -DropReportGameDir | Out-Null
+$rI = Invoke-Verify -Rounds @($evI)
+Add-Check 'unbound: a report with no gameDir= FAILs' (($rI.exit -eq 1) -and ($rI.text -match 'not bound to a gameDir')) ('exit=' + $rI.exit)
+
+# ---- other invariants ------------------------------------------------------
+Write-Output '--- invariants ---'
+$evJ = Join-Path $tempRoot 'evJ'; New-Item -ItemType Directory -Force -Path $evJ | Out-Null
+New-Slot -Root $evJ -Slot 'A' -NoBackups | Out-Null
+$rJ = Invoke-Verify -Rounds @($evJ)
+Add-Check 'manifest says files changed but no .orig exists -> FAIL' (($rJ.exit -eq 1) -and ($rJ.text -match 'expected-set coverage')) ('exit=' + $rJ.exit)
+
 $dupA = Join-Path $tempRoot 'ev-dupA'; New-Item -ItemType Directory -Force -Path $dupA | Out-Null
 $dupB = Join-Path $tempRoot 'ev-dupB'; New-Item -ItemType Directory -Force -Path $dupB | Out-Null
 New-Slot -Root $dupA -Slot 'A' | Out-Null
 New-Slot -Root $dupB -Slot 'A' | Out-Null
-$r5 = Invoke-Verify -Rounds @($dupA, $dupB)
-Add-Check 'the same slot twice -> FAIL' (($r5.exit -eq 1) -and ($r5.text -match 'two rounds report the same slot')) ('exit=' + $r5.exit)
+$rK = Invoke-Verify -Rounds @($dupA, $dupB)
+Add-Check 'two rounds claiming the same slot -> FAIL' (($rK.exit -eq 1) -and ($rK.text -match 'two rounds report the same slot')) ('exit=' + $rK.exit)
 
-# ---- 6. -ExpectSlots is a set check --------------------------------------
-Write-Output '--- 6. expected slots ---'
-$r6 = Invoke-Verify -Rounds @($goodA, $goodB) -Expect @('A', 'B', 'C')
-Add-Check 'a missing expected slot -> FAIL' (($r6.exit -eq 1) -and ($r6.text -match 'expected slot\(s\) missing: C')) ('exit=' + $r6.exit)
+$rL = Invoke-Verify -Rounds @($goodA, $goodB) -Expect @('A', 'B', 'C')
+Add-Check 'a missing expected slot -> FAIL' (($rL.exit -eq 1) -and ($rL.text -match 'expected slot\(s\) missing: C')) ('exit=' + $rL.exit)
 
-# ---- 7. no backups: cannot re-verify -------------------------------------
-Write-Output '--- 7. nothing to re-verify against ---'
-$noBackups = Join-Path $tempRoot 'ev-nobackups'; New-Item -ItemType Directory -Force -Path $noBackups | Out-Null
-New-Slot -Root $noBackups -Slot 'A' -NoBackups | Out-Null
-$r7 = Invoke-Verify -Rounds @($noBackups)
-Add-Check 'no .orig backup -> FAIL (cannot claim "restored" without something to compare)' (($r7.exit -eq 1) -and ($r7.text -match 'no \*\.orig backup was found')) ('exit=' + $r7.exit)
-
-# ---- 8. the archived verdict ---------------------------------------------
-Write-Output '--- 8. archived verdict ---'
+# ---- the archived verdict --------------------------------------------------
+Write-Output '--- archived verdict ---'
 $evOut = Join-Path $tempRoot 'verdict'
-$argv8 = @('-NoProfile', '-File', $VerifyScript, '-RoundEvidence', ($goodA + ',' + $goodB), '-Evidence', $evOut)
-$out8 = @(& pwsh @argv8 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+$argvZ = @('-NoProfile', '-File', $VerifyScript, '-RoundEvidence', ($goodA + ',' + $goodB), '-Evidence', $evOut)
+$null = @(& pwsh @argvZ 2>&1 | ForEach-Object { [string]$_ })
 $jsonPath = Join-Path $evOut 'parallel-restore-verify.json'
 Add-Check 'the verdict is written where asked' ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $jsonPath))
 $parsed = $null

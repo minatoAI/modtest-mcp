@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# post-round-gates.test.ps1 -- self-test for the RESTORE gate added to post-round-gates.ps1 (task-40).
+# post-round-gates.test.ps1 -- self-test for the RESTORE gate of post-round-gates.ps1 (offline, ~2 s).
 #
-# WHY THIS GATE EXISTS: a round driven straight through run-bounded.ps1 bypasses run-round.ps1's transient
-# setup/restore BY DESIGN, and the result is a silently dirty game directory (measured on the 2026-09-27
-# task-30 parallel run, whose evidence has no round-setup\ at all). Nothing can force a caller to use the
-# entry point after the fact -- but the evidence can be required to prove it was used, which turns a
-# documentation convention into a machine verdict. This test pins that verdict:
-#   * a missing round-setup\restore-report.txt            -> FAIL
-#   * a report without ROUND_RESTORE=OK                   -> FAIL
-#   * a report with ROUND_RESTORE=OK                      -> PASS (with the per-file line count recorded)
-#   * -RequireRestore without -RoundEvidence              -> FAIL (forgetting the flag cannot pass)
-#   * neither flag given                                  -> SKIPPED, shader gates unaffected
+# WHY THIS EXISTS (task-46): the restore gate used to decide from the report alone (file present +
+# `^ROUND_RESTORE=OK$`), which proves only that SOME report claims success. The reviewer's adversarial
+# matrix (R5) showed it passing in four situations where nothing had been restored. The gate now CALLS
+# verify-parallel-restore.ps1, and these are the reviewer's scenarios, kept here so the gate can never
+# quietly go back to trusting a report:
+#   A clean                                        -> PASS  (positive control)
+#   B report says OK but the live file is dirty    -> FAIL  (was a false PASS)
+#   C report says FAIL                            -> FAIL
+#   D three files changed, one .orig              -> FAIL  (was a false PASS)
+#   E no report                                    -> FAIL
+#   F report inside round-setup\<tag>\ (-RunTag)   -> PASS with -RunTag (was a false FAIL)
+#   G no setup-manifest (bypassed run-round.ps1)  -> FAIL  (was a false PASS)
+# The shader gates are switched off so this runs offline and tests ONLY the restore gate (they have their
+# own tests). Real on-disk formats are used: a manifest with gameDir= and one before-sha per managed file,
+# .orig backups, and a report BOUND to the manifest by sha256.
 #
-# The shader gates are switched off (-SkipAudit -SkipGlslang) so this runs offline in about a second and
-# tests ONLY the restore gate; the shader gates have their own tests.
-#
-# ASCII only. Usage: pwsh tools/post-round-gates.test.ps1 [-KeepTemp]
+# ASCII only. Usage: pwsh tools/post-round-gates.test.ps1 [-GatesScript <path>] [-KeepTemp]
 # Exit: 0 all checks passed | 1 at least one failed | 2 setup error.
 
 [CmdletBinding()]
@@ -42,8 +44,56 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('post-round-gates-test-
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 $shaders = Join-Path $tempRoot 'shaders'
 New-Item -ItemType Directory -Force -Path $shaders | Out-Null
-# A dummy file so -ShadersDir is not empty; the shader gates are skipped anyway.
 Set-Content -LiteralPath (Join-Path $shaders 'dummy.fsh') -Value 'void main(){}' -Encoding UTF8
+
+function Get-Sha([string]$Path) { if (Test-Path -LiteralPath $Path -PathType Leaf) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash } return '' }
+
+function New-Round {
+    # A synthetic round in the real on-disk format. -Scenario picks the intended state.
+    param([string]$Scenario, [string]$RunTag = '')
+    $root = Join-Path $tempRoot ('round-' + $Scenario + $(if ($RunTag.Length -gt 0) { '-' + $RunTag } else { '' }))
+    $game = Join-Path $root 'game'
+    $setup = Join-Path $root 'round-setup'
+    if ($RunTag.Length -gt 0) { $setup = Join-Path $setup $RunTag }
+    New-Item -ItemType Directory -Force -Path (Join-Path $game 'config'), $setup | Out-Null
+    Set-Content -LiteralPath (Join-Path $game 'options.txt') -Value "pauseOnLostFocus:true`n" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $game 'config\taclight-client.toml') -Value "schema = 1`n" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=false`n" -Encoding UTF8
+    $managed = @(
+        @{ field = 'optionsBeforeSha256'; rel = 'options.txt'; orig = 'options.txt.orig' },
+        @{ field = 'taclightClientTomlBeforeSha256'; rel = 'config\taclight-client.toml'; orig = 'taclight-client.toml.orig' },
+        @{ field = 'oculusBeforeSha256'; rel = 'config\oculus.properties'; orig = 'oculus.properties.orig' }
+    )
+    $backupCount = if ($Scenario -eq 'D') { 1 } else { 3 }
+    if ($Scenario -ne 'G') {
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add('round=2026-09-26T02:20:00.0000000+08:00') | Out-Null
+        $lines.Add('gameDir=' + $game) | Out-Null
+        $i = 0
+        foreach ($m in $managed) {
+            $lines.Add($m.field + '=' + (Get-Sha (Join-Path $game $m.rel))) | Out-Null
+            if ($i -lt $backupCount) { Copy-Item -LiteralPath (Join-Path $game $m.rel) -Destination (Join-Path $setup $m.orig) -Force }
+            $i++
+        }
+        [System.IO.File]::WriteAllLines((Join-Path $setup 'setup-manifest.txt'), $lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if ($Scenario -ne 'E') {
+        $manifestSha = Get-Sha (Join-Path $setup 'setup-manifest.txt')
+        $body = New-Object System.Collections.Generic.List[string]
+        $body.Add('slot=A') | Out-Null
+        $body.Add('gameDir=' + $game) | Out-Null
+        if ($manifestSha.Length -gt 0) { $body.Add('setupManifestSha256=' + $manifestSha) | Out-Null }
+        $body.Add('harnessExit=4') | Out-Null
+        $body.Add($(if ($Scenario -eq 'C') { 'ROUND_RESTORE=FAIL:oculus.properties' } else { 'ROUND_RESTORE=OK' })) | Out-Null
+        $body.Add('[restore] slot=A file=options.txt before=AAA after=AAA match=True') | Out-Null
+        Set-Content -LiteralPath (Join-Path $setup 'restore-report.txt') -Value ($body.ToArray()) -Encoding UTF8
+    }
+    if ($Scenario -eq 'B') {
+        # Written after the backups: the live file no longer matches its pre-round bytes.
+        Set-Content -LiteralPath (Join-Path $game 'config\oculus.properties') -Value "enableDebugOptions=true`n" -Encoding UTF8
+    }
+    return $root
+}
 
 function Invoke-Gates {
     param([string[]]$Extra)
@@ -54,56 +104,48 @@ function Invoke-Gates {
 
 Write-Output ('POST-ROUND-GATES-TEST script=' + $GatesScript)
 
-# ---- 1. no round evidence at all -> skipped unless required ------------------
+# ---- 1. no round evidence at all -------------------------------------------
 Write-Output '--- 1. without -RoundEvidence ---'
 $r1 = Invoke-Gates -Extra @()
-Add-Check 'no -RoundEvidence, not required -> PASS (restore gate skipped, shader-only callers unaffected)' (($r1.exit -eq 0) -and ($r1.text -match 'GATES_VERDICT=PASS')) ('exit=' + $r1.exit)
+Add-Check 'no -RoundEvidence, not required -> PASS (shader-only callers unaffected)' (($r1.exit -eq 0) -and ($r1.text -match 'GATES_VERDICT=PASS')) ('exit=' + $r1.exit)
 Add-Check 'and the skip is announced, not silent' ($r1.text -match '\[restore-gate\] SKIPPED')
 $r2 = Invoke-Gates -Extra @('-RequireRestore')
 Add-Check '-RequireRestore without -RoundEvidence -> FAIL' (($r2.exit -eq 1) -and ($r2.text -match 'GATES_VERDICT=FAIL')) ('exit=' + $r2.exit)
-Add-Check 'and it says why' ($r2.text -match 'no -RoundEvidence given')
 
-# ---- 2. the round never ran through run-round.ps1 (no restore report) --------
-Write-Output '--- 2. round evidence with no restore report (the bypass case) ---'
-$evBypass = Join-Path $tempRoot 'ev-bypass'
-New-Item -ItemType Directory -Force -Path $evBypass | Out-Null
-$r3 = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $evBypass)
-Add-Check 'a round with no round-setup\restore-report.txt -> FAIL' (($r3.exit -eq 1) -and ($r3.text -match 'GATES_VERDICT=FAIL')) ('exit=' + $r3.exit)
-Add-Check 'and the reason names the missing artifact' ($r3.text -match 'restore-report\.txt is missing')
+# ---- 2. the reviewer's adversarial matrix ---------------------------------
+Write-Output '--- 2. scenarios A-G ---'
+$scenarios = @(
+    @{ id = 'A'; expect = 0; why = 'clean round' },
+    @{ id = 'B'; expect = 1; why = 'report OK but live dirty' },
+    @{ id = 'C'; expect = 1; why = 'report says FAIL' },
+    @{ id = 'D'; expect = 1; why = 'three files changed, one .orig' },
+    @{ id = 'E'; expect = 1; why = 'no report' },
+    @{ id = 'G'; expect = 1; why = 'no setup-manifest (bypass)' }
+)
+foreach ($s in $scenarios) {
+    $round = New-Round -Scenario $s.id
+    $res = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $round)
+    Add-Check ('scenario ' + $s.id + ' (' + $s.why + ') -> exit ' + $s.expect) ($res.exit -eq $s.expect) ('exit=' + $res.exit)
+}
+$rA = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', (Join-Path $tempRoot 'round-A'))
+Add-Check 'A: the gate reports the verifier as the decision maker' ($rA.text -match '\[restore\] exit=0')
+$reportA = Get-Content -LiteralPath (Join-Path $tempRoot 'gates\post-round-gates.json') -Raw | ConvertFrom-Json
+Add-Check 'A: the reason names the verifier, not "the report says OK"' ([string]$reportA.gates.restore.reason -match 'verifier confirmed every file the round changed') ([string]$reportA.gates.restore.reason)
 
-# ---- 3. a report that does NOT say ROUND_RESTORE=OK -------------------------
-Write-Output '--- 3. a report that does not say ROUND_RESTORE=OK ---'
-$evBad = Join-Path $tempRoot 'ev-not-ok'
-New-Item -ItemType Directory -Force -Path (Join-Path $evBad 'round-setup') | Out-Null
-Set-Content -LiteralPath (Join-Path $evBad 'round-setup\restore-report.txt') -Encoding UTF8 -Value @'
-slot=A
-harnessExit=0
-ROUND_RESTORE=FAIL:oculus.properties
-[restore] slot=A file=oculus.properties before=AAA after=BBB match=False
-'@
-$r4 = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $evBad)
-Add-Check 'ROUND_RESTORE=FAIL -> the gate FAILs' (($r4.exit -eq 1) -and ($r4.text -match 'GATES_VERDICT=FAIL')) ('exit=' + $r4.exit)
-Add-Check 'and it points at the missing OK marker' ($r4.text -match 'no ROUND_RESTORE=OK')
+# ---- 3. -RunTag (the incompatibility R5 found) ----------------------------
+Write-Output '--- 3. -RunTag rounds ---'
+$tagged = New-Round -Scenario 'A' -RunTag 'r1'
+$rF1 = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $tagged)
+Add-Check 'F: a tagged round without -RunTag FAILs (nothing in the bare round-setup)' ($rF1.exit -eq 1) ('exit=' + $rF1.exit)
+$rF2 = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $tagged, '-RunTag', 'r1')
+Add-Check 'F: the same round WITH -RunTag r1 PASSes (task-38 and the gate now agree)' (($rF2.exit -eq 0) -and ($rF2.text -match 'GATES_VERDICT=PASS')) ('exit=' + $rF2.exit)
 
-# ---- 4. a properly restored round -> PASS, with the line count recorded -----
-Write-Output '--- 4. a restored round ---'
-$evOk = Join-Path $tempRoot 'ev-ok'
-New-Item -ItemType Directory -Force -Path (Join-Path $evOk 'round-setup') | Out-Null
-Set-Content -LiteralPath (Join-Path $evOk 'round-setup\restore-report.txt') -Encoding UTF8 -Value @'
-slot=A
-harnessExit=4
-ROUND_RESTORE=OK
-[restore] slot=A file=options.txt before=AAA after=AAA match=True
-[restore] slot=A file=taclight-client.toml before=BBB after=BBB match=True
-[restore] slot=A file=oculus.properties before=CCC after=CCC match=True
-'@
-$r5 = Invoke-Gates -Extra @('-RequireRestore', '-RoundEvidence', $evOk)
-Add-Check 'a restored round -> PASS even though the round itself exited 4' (($r5.exit -eq 0) -and ($r5.text -match 'GATES_VERDICT=PASS')) ('exit=' + $r5.exit)
-Add-Check 'it reports the restore gate exit 0' ($r5.text -match '\[restore\] exit=0')
+# ---- 4. the gate report ---------------------------------------------------
+Write-Output '--- 4. the gate report ---'
 $reportPath = Join-Path $tempRoot 'gates\post-round-gates.json'
 $reportJson = $null
 if (Test-Path -LiteralPath $reportPath) { $reportJson = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json }
-Add-Check 'the report records the restore gate with its per-file line count' (($null -ne $reportJson) -and ($null -ne $reportJson.gates.restore) -and ([int]$reportJson.gates.restore.perFileLines -eq 3)) ('lines=' + $(if ($null -ne $reportJson) { [int]$reportJson.gates.restore.perFileLines } else { '<no report>' }))
+Add-Check 'the report records the restore gate and its verifier' (($null -ne $reportJson) -and ($null -ne $reportJson.gates.restore) -and ([string]$reportJson.gates.restore.verifier -match 'verify-parallel-restore\.ps1'))
 Add-Check 'the report records that restore was required' (($null -ne $reportJson) -and ([bool]$reportJson.restoreRequired))
 
 if (-not $KeepTemp) {

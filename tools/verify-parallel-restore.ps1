@@ -32,6 +32,8 @@ param(
     # the extra bare token binds to the NEXT positional parameter instead -- a trap that silently checked
     # only the first slot (measured 2026-09-26).
     [Parameter(Mandatory = $true)][string[]]$RoundEvidence,
+    # Optional: for rounds written with -RunTag, whose files live in round-setup\<tag>\.
+    [string]$RunTag = '',
     # Optional: where to write parallel-restore-verify.json (an archived verdict).
     [string]$Evidence = '',
     # Optional: the slot names you EXPECT. Checked as a set, so a missing or an extra slot is a FAIL.
@@ -47,6 +49,14 @@ $origTargets = [ordered]@{
     'options.txt.orig' = 'options.txt'
     'taclight-client.toml.orig' = 'config\taclight-client.toml'
     'oculus.properties.orig' = 'config\oculus.properties'
+}
+
+# Which manifest field proves run-round.ps1 CHANGED which file (it records a before-sha for every file it
+# touches). This is what makes "expected set" derivable instead of guessed.
+$managedShaFields = [ordered]@{
+    'optionsBeforeSha256'            = 'options.txt'
+    'taclightClientTomlBeforeSha256' = 'config\taclight-client.toml'
+    'oculusBeforeSha256'             = 'config\oculus.properties'
 }
 
 function Get-Sha256([string]$Path) {
@@ -78,6 +88,7 @@ foreach ($roundDirRaw in $roundDirs) {
     $roundDir = $roundDirRaw
     $entry = [ordered]@{
         roundEvidence = $roundDir
+        setupDir = ''
         slot = ''
         gameDir = ''
         manifestPresent = $false
@@ -95,24 +106,33 @@ foreach ($roundDirRaw in $roundDirs) {
     }
     $roundDir = (Resolve-Path -LiteralPath $roundDir).Path
     $entry.roundEvidence = $roundDir
+    # -RunTag rounds keep the same file names inside round-setup\<tag>\ (task-38). Hardcoding
+    # 'round-setup\' made every tagged round unverifiable -- and 6aa016e recommends tagging precisely for
+    # rounds that share one evidence root, so the two features have to agree.
     $setupDir = Join-Path $roundDir 'round-setup'
+    if ($RunTag.Length -gt 0) { $setupDir = Join-Path $setupDir $RunTag }
+    $entry.setupDir = $setupDir
     $manifestPath = Join-Path $setupDir 'setup-manifest.txt'
     $reportPath = Join-Path $setupDir 'restore-report.txt'
 
     # ---- 1. provenance -----------------------------------------------------
     $entry.manifestPresent = Test-Path -LiteralPath $manifestPath -PathType Leaf
     if (-not $entry.manifestPresent) {
-        $entry.problems += 'no round-setup\setup-manifest.txt: this round did not go through run-round.ps1, so it had no transient setup and no teardown (the bypass case)'
-        $failed.Add($roundDir + ': no round-setup\setup-manifest.txt (bypass)') | Out-Null
+        $entry.problems += ('no ' + (Split-Path -Leaf $setupDir) + '\setup-manifest.txt: this round did not go through run-round.ps1, so it had no transient setup and no teardown (the bypass case)')
+        $failed.Add($roundDir + ': no setup-manifest.txt (bypass)') | Out-Null
     }
     $entry.gameDir = Get-ManifestValue -ManifestPath $manifestPath -Key 'gameDir'
+    $entry.manifestSha256 = Get-Sha256 $manifestPath
 
-    # ---- 2. recorded verdict ----------------------------------------------
+    # ---- 2. recorded verdict, BOUND to this manifest ----------------------
+    # "A report says ROUND_RESTORE=OK" is not evidence that anything was restored: a leftover report from an
+    # earlier round, or one written by a driver that never ran the setup, would satisfy it. So the report
+    # must name the SAME gameDir and the SAME setup-manifest bytes as the round we are looking at.
     $entry.restoreReportPresent = Test-Path -LiteralPath $reportPath -PathType Leaf
     $reportText = ''
     if ($entry.restoreReportPresent) { $reportText = [System.IO.File]::ReadAllText($reportPath) }
     else {
-        $entry.problems += 'no round-setup\restore-report.txt: nothing proves the game directory was put back'
+        $entry.problems += ('no ' + (Split-Path -Leaf $setupDir) + '\restore-report.txt: nothing proves the game directory was put back')
         $failed.Add($roundDir + ': no restore-report.txt') | Out-Null
     }
     if ($reportText.Length -gt 0) {
@@ -122,6 +142,28 @@ foreach ($roundDirRaw in $roundDirs) {
         if (-not $entry.roundRestoreOk) {
             $entry.problems += 'restore-report.txt does not say ROUND_RESTORE=OK'
             $failed.Add($roundDir + ': ROUND_RESTORE is not OK') | Out-Null
+        }
+        # binding 1: the report must name the round's game directory
+        $reportGameDir = ''
+        if ($reportText -match '(?m)^gameDir=(.+)$') { $reportGameDir = $Matches[1].Trim() }
+        $entry.reportGameDir = $reportGameDir
+        if ($reportGameDir.Length -eq 0) {
+            $entry.problems += 'the restore report carries no gameDir= line: it is not bound to a round, so it cannot be evidence for THIS one (reports written before task-46 lack it)'
+            $failed.Add($roundDir + ': report is not bound to a gameDir') | Out-Null
+        } elseif ($entry.gameDir.Length -gt 0 -and $reportGameDir -ne $entry.gameDir) {
+            $entry.problems += ('the report names a different game directory than the manifest: ' + $reportGameDir + ' vs ' + $entry.gameDir)
+            $failed.Add($roundDir + ': report/manifest gameDir mismatch') | Out-Null
+        }
+        # binding 2: the report must be bound to the exact setup-manifest bytes (kills STALE evidence)
+        $reportManifestSha = ''
+        if ($reportText -match '(?m)^setupManifestSha256=([0-9A-Fa-f]+)\s*$') { $reportManifestSha = $Matches[1].Trim().ToUpperInvariant() }
+        $entry.reportManifestSha256 = $reportManifestSha
+        if ($reportManifestSha.Length -eq 0) {
+            $entry.problems += 'the restore report carries no setupManifestSha256= line, so it cannot be tied to this round''s manifest (reports written before task-46 lack it)'
+            $failed.Add($roundDir + ': report is not bound to the manifest') | Out-Null
+        } elseif ($entry.manifestSha256.Length -gt 0 -and $reportManifestSha -ne $entry.manifestSha256) {
+            $entry.problems += 'the report was written against a DIFFERENT setup-manifest (stale evidence)'
+            $failed.Add($roundDir + ': stale report (manifest sha mismatch)') | Out-Null
         }
     }
     if ($entry.slot.Length -gt 0) { $slotNames.Add($entry.slot) | Out-Null }
@@ -134,24 +176,48 @@ foreach ($roundDirRaw in $roundDirs) {
         $entry.problems += ('cannot re-verify: the game directory does not exist: ' + $entry.gameDir)
         $failed.Add($roundDir + ': game directory missing') | Out-Null
     } else {
-        foreach ($origName in $origTargets.Keys) {
+        # WHICH files must be covered comes from the round's own manifest: run-round.ps1 records a
+        # before-sha field for every file it changed. Iterating only over the *.orig files that happen to
+        # exist let the reviewer's scenario D through -- a round that restored ONE of three files looked
+        # clean. The expected set is therefore derived, not discovered.
+        $managed = New-Object System.Collections.Generic.List[string]
+        foreach ($field in $managedShaFields.Keys) {
+            if ((Get-ManifestValue -ManifestPath $manifestPath -Key $field).Length -gt 0) { $managed.Add($managedShaFields[$field]) | Out-Null }
+        }
+        $entry.managedFiles = @($managed.ToArray())
+        if ($managed.Count -eq 0) {
+            # -SkipOptionsSetup rounds change nothing, so there is nothing to restore: say so instead of
+            # pretending a vacuous check passed.
+            $entry.problems += 'the manifest lists NO managed file (a -SkipOptionsSetup round changes nothing), so this round had nothing to restore'
+        }
+        foreach ($relTarget in @($managed.ToArray())) {
+            $origName = (Split-Path -Leaf $relTarget) + '.orig'
             $backupPath = Join-Path $setupDir $origName
-            if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) { continue }
-            $targetPath = Join-Path $entry.gameDir $origTargets[$origName]
+            $targetPath = Join-Path $entry.gameDir $relTarget
+            if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                $entry.problems += ($relTarget + ' was changed by the round but has NO ' + $origName + ' backup, so it cannot be re-verified')
+                $failed.Add($roundDir + ': ' + $relTarget + ' has no .orig backup (expected-set coverage)') | Out-Null
+                $entry.reVerifiedFiles += [pscustomobject]@{ file = $relTarget; backupSha256 = ''; liveSha256 = ''; match = $false }
+                continue
+            }
             $backupSha = Get-Sha256 $backupPath
             $liveSha = Get-Sha256 $targetPath
             $same = ($liveSha.Length -gt 0) -and ($liveSha -eq $backupSha)
             $entry.reVerifiedFiles += [pscustomobject]@{
-                file = $origTargets[$origName]; backupSha256 = $backupSha; liveSha256 = $liveSha; match = $same
+                file = $relTarget; backupSha256 = $backupSha; liveSha256 = $liveSha; match = $same
             }
             if (-not $same) {
-                $entry.problems += ($origTargets[$origName] + ' does NOT match its pre-round backup on disk now')
-                $failed.Add($roundDir + ': ' + $origTargets[$origName] + ' is not back to the pre-round bytes') | Out-Null
+                $entry.problems += ($relTarget + ' does NOT match its pre-round backup on disk now')
+                $failed.Add($roundDir + ': ' + $relTarget + ' is not back to the pre-round bytes') | Out-Null
             }
         }
-        if (@($entry.reVerifiedFiles).Count -eq 0) {
-            $entry.problems += 'no *.orig backup was found, so "restored" cannot be re-verified for this round'
-            $failed.Add($roundDir + ': no .orig backups to re-verify against') | Out-Null
+        if ($managed.Count -gt 0) {
+            # Any .orig present that the manifest does not mention is reported, not counted.
+            $extra = @()
+            foreach ($origName in $origTargets.Keys) {
+                if ((Test-Path -LiteralPath (Join-Path $setupDir $origName) -PathType Leaf) -and ($managed -notcontains $origTargets[$origName])) { $extra += $origTargets[$origName] }
+            }
+            if ($extra.Count -gt 0) { $entry.problems += ('note: extra .orig backups not listed in the manifest: ' + ($extra -join ',')) }
         }
     }
     $reports.Add([pscustomobject]$entry) | Out-Null
@@ -179,7 +245,8 @@ if ($ExpectSlots.Count -gt 0) {
 foreach ($entry in $reports) {
     Write-Output ('[slot] ' + $(if ($entry.slot.Length -gt 0) { $entry.slot } else { '<unknown>' }) + '  evidence=' + $entry.roundEvidence)
     Write-Output ('       gameDir=' + $(if ($entry.gameDir.Length -gt 0) { $entry.gameDir } else { '<unknown>' }))
-    Write-Output ('       manifest=' + $entry.manifestPresent + ' restoreReport=' + $entry.restoreReportPresent + ' ROUND_RESTORE=OK:' + $entry.roundRestoreOk + ' recordedMatchLines=' + $entry.recordedMatchLines)
+    Write-Output ('       setupDir=' + $entry.setupDir)
+    Write-Output ('       manifest=' + $entry.manifestPresent + ' restoreReport=' + $entry.restoreReportPresent + ' ROUND_RESTORE=OK:' + $entry.roundRestoreOk + ' recordedMatchLines=' + $entry.recordedMatchLines + ' managedFiles=' + (@($entry.managedFiles) -join ','))
     foreach ($file in @($entry.reVerifiedFiles)) {
         Write-Output ('       re-verified ' + $file.file + ' match=' + $file.match + ' backup=' + $file.backupSha256.Substring(0, [Math]::Min(16, $file.backupSha256.Length)) + ' live=' + $file.liveSha256.Substring(0, [Math]::Min(16, $file.liveSha256.Length)))
     }

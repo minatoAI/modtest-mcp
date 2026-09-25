@@ -33,9 +33,9 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>] [-Slot <name>] [-InstanceSignature <sig>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below. `-Slot`/`-InstanceSignature` are forwarded to the bounded runner (default signature = the gameDir from `launch-args.json`), so a round is scoped to its own instance and parallel slots no longer refuse each other. **Restore is unconditional and reported per slot** (`[restore] slot=… file=… before=… after=… match=…`, `ROUND_RESTORE=OK`), and a restore that cannot be verified exits **6** — see "Round teardown" below |
 | `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (79 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, **per-round outputs never clobber**, **the round restore is unconditional and fails loudly** — all driven through a stub harness whose exit code is configurable, so no JVM is ever started; `-OldRunner` enables the single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
 | `post-round-gates.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.ps1 -ShadersDir <gameDir>\patched_shaders -Evidence <ev>\gates [-Require ...] [-RequireRestore -RoundEvidence <ev>]` → `GATES_VERDICT=PASS\|FAIL` — runs the offline shader gates (injection audit + glslang compile) as one step, **plus a restore gate**: `-RequireRestore -RoundEvidence <ev>` asserts the round's `round-setup\restore-report.txt` exists and says `ROUND_RESTORE=OK`, else FAIL. Without `-RoundEvidence` the restore gate is **skipped and says so** (shader-only callers keep working); with `-RequireRestore` but no evidence it FAILs, so "forgot the flag" cannot pass |
-| `post-round-gates.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.test.ps1` → `POST-ROUND-GATES-TEST PASS (12 checks)` — offline (~1 s, shader gates switched off): the restore gate's four verdicts (skipped/required-without-evidence/missing report/`ROUND_RESTORE=FAIL`) and the recorded per-file line count |
+| `post-round-gates.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.test.ps1` → `POST-ROUND-GATES-TEST PASS (15 checks)` — offline (~1 s, shader gates switched off): the restore gate's four verdicts (skipped/required-without-evidence/missing report/`ROUND_RESTORE=FAIL`) and the recorded per-file line count |
 | `verify-parallel-restore.ps1` | PowerShell 5.1 / 7 | `pwsh tools/verify-parallel-restore.ps1 -RoundEvidence <evA>,<evB> [-ExpectSlots A,B] [-Evidence <dir>]` → `PARALLEL_RESTORE_VERDICT=PASS|FAIL` — one command for "did every slot of that parallel round give its game directory back?": per round it checks **provenance** (`round-setup\setup-manifest.txt` exists ⇒ the round went through `run-round.ps1` at all), the **recorded verdict** (`ROUND_RESTORE=OK` + one `[restore]` line per file), and then **re-verifies independently** by hashing every live game-directory file against its `*.orig` backup **now** (the report says what the round did; this says what the disk looks like). Two rounds claiming the same slot FAIL. `-RoundEvidence` accepts a comma-separated list because a second bare value would bind to the next positional parameter. |
-| `verify-parallel-restore.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/verify-parallel-restore.test.ps1` → `VERIFY-PARALLEL-RESTORE-TEST PASS (13 checks)` — offline: the healthy two-slot case, the bypass case (no `round-setup\`), a report without `ROUND_RESTORE=OK`, a live file that no longer matches its backup, a duplicated slot, a missing `-ExpectSlots` entry, and the "no backup to compare against" case |
+| `verify-parallel-restore.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/verify-parallel-restore.test.ps1` → `VERIFY-PARALLEL-RESTORE-TEST PASS (21 checks)` — offline: the healthy two-slot case, the bypass case (no `round-setup\`), a report without `ROUND_RESTORE=OK`, a live file that no longer matches its backup, a duplicated slot, a missing `-ExpectSlots` entry, and the "no backup to compare against" case |
 | `patched-shaders-audit.ps1` | PowerShell 5.1 / 7 | `pwsh tools/patched-shaders-audit.ps1 -ShadersDir <dump> -Evidence <dir> [-Require ...] [-Forbid ...] [-MinFiles N]` → `VERDICT=PASS|FAIL` — audits the GLSL Iris actually compiled. Emits **two** fingerprints: `fingerprintRaw` (any byte change; **round-sensitive**, never a package-identity judgment) and `fingerprintNormalized` (date headers of `*.properties` removed with the mod's own rule, via `pack-fingerprint.ps1`). `manifestSha256` remains as a deprecated **raw** alias |
 | `pack-fingerprint.ps1` | PowerShell 5.1 / 7 | dot-source it: `. tools/pack-fingerprint.ps1` → `Get-PackTextFingerprint -RelPath <path> -Text <text>` gives `raw` + `normalized`. The **single** PowerShell implementation of the mod's digest rule, so the audit cannot drift from the mod again. Java details handled explicitly: ASCII `[A-Za-z0-9_]`/`[0-9]`, `\R` **including VT/FF**, and Java-style multiline `^` (lone CR / U+0085 / U+2028) instead of .NET's `(?m)` |
 | `fingerprint-corpus.json` | data | The fixed corpus **shared by both implementations**. Every case carries an `expect` derived by reasoning from the rule text (never generated by an implementation), plus `why`/`trap`. Contains real samples (A), terminator/shape cases (B), near-misses (C), and the divergence killers (D: ASCII classes + Java line terminators; E: 5-digit year, VT, FF, NEL) |
@@ -331,6 +331,28 @@ the game directory. That is what happened on the 2026-09-27 task-30 parallel run
 - the bypass is now a **machine-checkable** evidence failure rather than a convention:
   `post-round-gates.ps1 -RequireRestore -RoundEvidence <ev>` FAILs when that round has no
   `round-setup\restore-report.txt` or no `ROUND_RESTORE=OK` in it. For the two-slot hand-off use `tools/verify-parallel-restore.ps1 -RoundEvidence <evA>,<evB> -ExpectSlots A,B`: one command that checks both slots' `ROUND_RESTORE` **and** re-hashes their live files against the `*.orig` backups.
+⚠️ **"A report says `ROUND_RESTORE=OK`" is NOT "the restore was verified"** (task-46). The gate originally
+decided from the report alone — file present plus that one regex — which proves only that *some* report
+claims success. An adversarial matrix showed it passing while nothing had been restored: a dirty live file,
+a leftover report from an earlier round, a bypassed entry point (no `setup-manifest.txt` at all), and a
+round that handled one file of three. Four ways, measured, not hypothesised.
+
+The correct criterion has **three** parts, and `post-round-gates.ps1` no longer re-implements them (two
+implementations of one rule drifting apart is exactly what happened to the package fingerprints): it
+**calls** `verify-parallel-restore.ps1`, which checks —
+
+1. **provenance** — `round-setup\setup-manifest.txt` exists, so the round really went through
+   `run-round.ps1`; "no evidence" is never read as "fine";
+2. **binding** — the report must name the same `gameDir` and carry `setupManifestSha256=` matching the
+   manifest's bytes, so a stale report cannot speak for this round (reports written before task-46 fail
+   this, by design);
+3. **independent re-verification** — every file the manifest says the round changed must have a `.orig`
+   backup **and** the live file must hash equal to it **now**. The expected set is derived from the
+   manifest, so a round that restored one of three files fails.
+
+`-RunTag` rounds: pass the same tag to the verifier/gate —
+`post-round-gates.ps1 -RequireRestore -RoundEvidence <ev> -RunTag r1` (before task-46 both tools
+hard-coded `round-setup\`, so a tagged round could not pass the gate at all).
 
 ### Per-round outputs (task-38)
 
@@ -404,7 +426,7 @@ requires every killer case to go red while ordinary cases stay green.
 port reproduces the Java behaviour exactly, on purpose: fixing it is a decision about the **rule** (both
 sides together), not an accidental divergence. Raised for the record.
 
-**Raw-口径 catalog — archived reports whose `manifestSha256` is the RAW value** (round-sensitive; state the
+**Raw-口径 catalog — inclusion criterion (so the count is reproducible): a `*.json` under any evidence directory whose PARSED json has a top-level `manifestSha256` property.** That scan (2026-09-26) yields **25 files**; R6 counted **17** with a narrower grep, i.e. a different criterion — if you recount, state your criterion. Those entries hold the RAW value (round-sensitive; state the口径 when citing them): (round-sensitive; state the
 口径 whenever you cite them): `2026-09-25-numeric-probe\gates` `2BD5C22D…`;
 `2026-09-25-patched-shaders-audit\*-report.json` (4) `21B39D7A…`; `2026-09-25-perf\gates` `08A0BE76…` and
 `gates-v1-0948` `4177E93F…`; `2026-09-25-round-gates\gates` `7475D7FA…`; `2026-09-25-voxel-box\gates`

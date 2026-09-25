@@ -334,7 +334,12 @@ $foreignSignature = 'modtest-signature-absent-' + [guid]::NewGuid().ToString('N'
 $peerName = if ($null -ne $peer) { $peer.exe } else { 'modtest-no-such-process' }
 $argvUnrelated = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', 'ok',
     '-EvidenceDir', $dirScopeUnrelated, '-PollSeconds', '1',
-    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $foreignSignature)
+    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $foreignSignature,
+    # Same machine-independence guards Invoke-DryScenario uses: a teammate's Gradle JVM appearing during
+    # this 6-second dry run must not be mistaken for our orphan, and CPU/memory recovery is not what
+    # this control is about (that flakiness cost one run: exit 7 with peer=DefenderSessionHelper.exe).
+    '-OrphanProcessNames', $NO_SUCH_PROCESS,
+    '-CpuRecoveryTolerancePct', '1000', '-MemoryRecoveryToleranceMB', '1000000')
 $outUnrelated = @(& pwsh @argvUnrelated 2>&1 | ForEach-Object { [string]$_ })
 $exitUnrelated = $LASTEXITCODE
 $textUnrelated = ($outUnrelated -join "`n")
@@ -352,7 +357,9 @@ New-Item -ItemType Directory -Force -Path $dirScopeSame | Out-Null
 $ourSignature = if ($null -ne $peer) { $peer.exe } else { $dirScopeSame }
 $argvSame = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', 'ok',
     '-EvidenceDir', $dirScopeSame, '-PollSeconds', '1',
-    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $ourSignature)
+    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $ourSignature,
+    '-OrphanProcessNames', $NO_SUCH_PROCESS,
+    '-CpuRecoveryTolerancePct', '1000', '-MemoryRecoveryToleranceMB', '1000000')
 $outSame = @(& pwsh @argvSame 2>&1 | ForEach-Object { [string]$_ })
 $exitSame = $LASTEXITCODE
 $textSame = ($outSame -join "`n")
@@ -384,10 +391,33 @@ if ($slotJsonFiles.Count -gt 0) {
     Add-Check 'scope/evidence records a non-empty slot' (([string]$slotSummary.slot).Length -gt 0) ('slot=' + $slotSummary.slot)
     # Default (no explicit -Slot) must NOT change the evidence filename: run-bounded-<stamp>.json
     Add-Check 'scope/default slot leaves the evidence filename unchanged' ($slotJsonFiles[0].Name -match '^run-bounded-\d{8}-\d{6}\.json$') ($slotJsonFiles[0].Name)
+    # A NON-refusal round must also record what it ran NEXT TO (otherwise the scoping is invisible in a
+    # passing round's evidence, and a reader cannot tell "unrelated JVM" from "my own instance").
+    Add-Check 'scope/NON-refusal evidence records the out-of-scope matches it ran next to' ([int]$slotSummary.blockingOutOfScopeCount -ge 1) ('count=' + $slotSummary.blockingOutOfScopeCount)
+    Add-Check 'scope/those out-of-scope entries carry a command line and a scope tag' (@($slotSummary.blockingOutOfScope | Where-Object { ([string]$_.cmdline).Length -eq 0 -or [string]$_.scope -ne 'out-of-scope' }).Count -eq 0)
+    Add-Check 'scope/NON-refusal evidence records the signature that was enforced' (([string]$slotSummary.instanceSignature) -eq $foreignSignature) ('sig=' + $slotSummary.instanceSignature)
 } else {
     Add-Check 'scope/evidence records a non-empty slot' $false 'no evidence JSON'
     Add-Check 'scope/default slot leaves the evidence filename unchanged' $false 'no evidence JSON'
+    Add-Check 'scope/NON-refusal evidence records the out-of-scope matches it ran next to' $false 'no evidence JSON'
+    Add-Check 'scope/those out-of-scope entries carry a command line and a scope tag' $false 'no evidence JSON'
+    Add-Check 'scope/NON-refusal evidence records the signature that was enforced' $false 'no evidence JSON'
 }
+
+Write-Output '--- window audit is selected by pid, never by title (source shape) ---'
+# Two parallel slots both report "Minecraft* ...", so a window must be picked by the instance's own pid.
+# A dry run has no windowed child, so this is asserted on the source shape rather than at runtime; the
+# runtime path (-VerifyWindow) runs in every real round.
+$runnerSource = Get-Content -LiteralPath $Runner -Raw
+$geometryStart = $runnerSource.IndexOf('function Get-WindowGeometry')
+$geometryEnd = if ($geometryStart -ge 0) { $runnerSource.IndexOf("`nfunction ", $geometryStart + 10) } else { -1 }
+$geometryBody = ''
+if ($geometryStart -ge 0 -and $geometryEnd -gt $geometryStart) { $geometryBody = $runnerSource.Substring($geometryStart, $geometryEnd - $geometryStart) }
+elseif ($geometryStart -ge 0) { $geometryBody = $runnerSource.Substring($geometryStart) }
+Add-Check 'window/Get-WindowGeometry found in the runner source' ($geometryBody.Length -gt 0)
+Add-Check 'window/it records the pid it was asked about' ($geometryBody -match 'pid = \$ProcessId')
+Add-Check 'window/it takes the handle from that pid (not from a title search)' ($geometryBody -match 'handle = \[long\]\$live\.MainWindowHandle')
+Add-Check 'window/it never selects a window by title' (-not ($geometryBody -match 'MainWindowTitle\s+-match'))
 
 # ---------------------------------------------------------------- result
 if (-not $KeepEvidence) {

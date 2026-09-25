@@ -384,7 +384,10 @@ function Stop-ProcessTree {
 }
 
 function Get-WindowGeometry([int]$ProcessId) {
-    # optional window audit; returns physical window/client rect and DPI, or $null
+    # Optional window audit; returns the handle, physical window/client rect and DPI, or $null.
+    # WINDOW SELECTION IS BY PID, NEVER BY TITLE: with parallel slots two instances both report
+    # "Minecraft* ...", so a title match is ambiguous -- the handle is taken from THIS instance's own
+    # pid. `title` is recorded for a human reader only and must not be used to pick a window.
     $signature = @'
 [DllImport("user32.dll")] public static extern bool GetWindowRect(System.IntPtr hWnd, out RECT lpRect);
 [DllImport("user32.dll")] public static extern bool GetClientRect(System.IntPtr hWnd, out RECT lpRect);
@@ -401,6 +404,8 @@ public struct RECT { public int Left; public int Top; public int Right; public i
         [void][ModtestBounded.Win]::GetClientRect($live.MainWindowHandle, [ref]$clientRect)
         $dpi = [ModtestBounded.Win]::GetDpiForWindow($live.MainWindowHandle)
         return [pscustomobject]@{
+            pid = $ProcessId
+            handle = [long]$live.MainWindowHandle
             title = $live.MainWindowTitle
             windowPhysical = ('{0}x{1}' -f ($windowRect.Right - $windowRect.Left), ($windowRect.Bottom - $windowRect.Top))
             clientPhysical = ('{0}x{1}' -f ($clientRect.Right - $clientRect.Left), ($clientRect.Bottom - $clientRect.Top))
@@ -1035,6 +1040,12 @@ $summary = [pscustomobject]@{
     exitCode = $finalExit
     slot = $slotName
     instanceSignature = $effectiveSignature
+    # What this round ran NEXT TO, not just what it refused on: processes that matched
+    # -BlockingProcessNames but carried a different signature (a teammate's Gradle daemon, or another
+    # slot's client) were reported as NOT BLOCKING at guard time. Recording them here is what lets a
+    # reader of this evidence tell "unrelated JVM" from "my own instance".
+    blockingOutOfScope = @($blockingOutOfScope)
+    blockingOutOfScopeCount = @($blockingOutOfScope).Count
     caps = [pscustomobject]@{
         perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC
         roundMaxSec = $HARD_CAP_ROUND_SEC

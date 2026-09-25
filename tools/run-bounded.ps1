@@ -17,8 +17,12 @@
 #     Gradle DAEMON that is shared with other builds on this machine; killing it would break
 #     somebody else's work. -KillProcessTreeExcludePattern (default 'GradleDaemon') is a second belt
 #     for the same reason. Only descendants of OUR pid are ever touched -- never a process sweep.
-#   * before starting: any java/javaw/Minecraft window present -> REFUSE (never kills other people's
-#     processes; it only declines to start)
+#   * before starting: a process matching -BlockingProcessNames AND carrying THIS round's instance
+#     signature (normally the --gameDir value; see -InstanceSignature) -> REFUSE (never kills other
+#     people's processes; it only declines to start). An UNRELATED JVM -- a teammate's Gradle daemon, or
+#     another slot's client in a different gameDir -- is reported as out-of-scope and does NOT block.
+#     With no signature available the guard stays FAIL-CLOSED: any name/title match blocks (this is the
+#     pre-2026-09-27 behaviour, kept for dry runs and for launches with nothing to attribute by).
 #   * after every instance, mandatory post-run audit: this PID is gone, no orphan java/javaw remain
 #     (a pre-launch baseline of matching PIDs is excluded: a round explicitly allowed to run next to
 #     a pre-existing JVM, e.g. a LAN round with its own dedicated server, must not be blamed for it),
@@ -90,6 +94,19 @@ param(
     [string]$EvidenceDir = '',
     [string]$BlockingProcessNames = 'java,javaw',
     [string]$BlockingWindowTitlePattern = 'Minecraft',
+    # SCOPE FOR THE PRE-LAUNCH GUARD (added 2026-09-27). The guard used to refuse whenever ANY process
+    # matched -BlockingProcessNames, so a teammate's Gradle daemon blocked real rounds (measured twice
+    # on 2026-09-25/26) and two isolated instances could never coexist -- precisely the asymmetry the
+    # POST-run audit had already fixed by scoping itself to our own launch signature (see
+    # -LaunchSignature in Test-PostRunAudit). A matched process now blocks only when its command line
+    # contains THIS signature (normally the --gameDir value); otherwise it is reported as out-of-scope
+    # (unrelated JVM / another slot) and does NOT block. Empty means "no signature available" (e.g. a
+    # dry run): the guard then stays FAIL-CLOSED and treats every match as blocking.
+    [string]$InstanceSignature = '',
+    # Human-readable name for this instance slot. Printed as slot=..., recorded in the evidence summary,
+    # and -- only when given explicitly -- appended to the evidence FILENAME so parallel slots can share
+    # one evidence directory. Defaults to the gameDir leaf when one can be derived, else 'default'.
+    [string]$Slot = '',
     [string]$OrphanProcessNames = 'java,javaw',
     [switch]$Windowed,
     [string]$OptionsFile = '',
@@ -176,31 +193,40 @@ function Get-ProcessNameList([string]$Csv) {
 }
 
 function Get-ProcessCommandLineMap {
-    # ONE Win32_Process snapshot -> pid => { cmdline, cmdlineTruncated }. Built once and looked up by pid,
-    # instead of a Get-CimInstance call per match.
+    # ONE Win32_Process snapshot -> pid => { cmdline, cmdlineTruncated, cmdlineFull }. Built once and
+    # looked up by pid, instead of a Get-CimInstance call per match.
+    #   cmdline      : truncated to $TruncateTo, for DISPLAY and for the evidence JSON
+    #   cmdlineFull  : the whole command line, used ONLY for the instance-signature scope decision and
+    #                  never written out -- so the display truncation can never hide the signature
+    #                  (a missed match would be a safety regression, not a cosmetic one).
     param([int]$TruncateTo = 240)
     $map = @{}
     foreach ($row in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
-        $cmdline = ''
+        $full = ''
+        if ($null -ne $row.CommandLine) { $full = [string]$row.CommandLine }
+        $shown = $full
         $truncated = $false
-        if ($null -ne $row.CommandLine) {
-            $cmdline = [string]$row.CommandLine
-            if ($TruncateTo -gt 0 -and $cmdline.Length -gt $TruncateTo) {
-                $cmdline = $cmdline.Substring(0, $TruncateTo)
-                $truncated = $true
-            }
+        if ($TruncateTo -gt 0 -and $shown.Length -gt $TruncateTo) {
+            $shown = $shown.Substring(0, $TruncateTo)
+            $truncated = $true
         }
-        $map[[int]$row.ProcessId] = [pscustomobject]@{ cmdline = $cmdline; cmdlineTruncated = $truncated }
+        $map[[int]$row.ProcessId] = [pscustomobject]@{ cmdline = $shown; cmdlineTruncated = $truncated; cmdlineFull = $full }
     }
     return $map
 }
 
 function Get-BlockingProcesses {
     # -CommandLineMap is optional (an empty map is built on demand), so every existing caller keeps working.
+    # -ScopeSignature (added 2026-09-27) tags each match with scope = 'in-scope' when the process's FULL
+    # command line contains the signature, else 'out-of-scope'. Without a signature every match is
+    # 'unscoped' (fail-closed callers treat those as blocking). The FULL command line is used for the
+    # decision and never leaves this function, so the 240-char display truncation can never cause a
+    # missed match (that would be a safety regression, not a cosmetic one).
     param(
         [System.Collections.Generic.List[string]]$Names,
         [string]$TitlePattern,
-        [hashtable]$CommandLineMap = @{}
+        [hashtable]$CommandLineMap = @{},
+        [string]$ScopeSignature = ''
     )
     if ($CommandLineMap.Count -eq 0) { $CommandLineMap = Get-ProcessCommandLineMap }
     $found = New-Object System.Collections.Generic.List[object]
@@ -223,10 +249,28 @@ function Get-BlockingProcesses {
                 $cmdline = [string]$CommandLineMap[$ownerPid].cmdline
                 $cmdlineTruncated = [bool]$CommandLineMap[$ownerPid].cmdlineTruncated
             }
+            $scope = 'unscoped'
+            $scopeReason = 'no instance signature available: FAIL-CLOSED, every match is treated as blocking'
+            $fullCommandLine = ''
+            if ($CommandLineMap.ContainsKey($ownerPid)) {
+                $fullCommandLine = [string]$CommandLineMap[$ownerPid].cmdlineFull
+            }
+            if ($ScopeSignature.Length -gt 0) {
+                # Case-SENSITIVE .Contains, matching Test-PostRunAudit's LaunchSignature attribution, so
+                # the pre-launch guard and the post-run audit can never disagree about who is "ours".
+                if ($fullCommandLine.Contains($ScopeSignature)) {
+                    $scope = 'in-scope'
+                    $scopeReason = 'command line carries this round''s instance signature'
+                } else {
+                    $scope = 'out-of-scope'
+                    $scopeReason = 'command line does not carry this round''s instance signature (unrelated JVM or another slot)'
+                }
+            }
             $found.Add([pscustomobject]@{
                 pid = $processItem.Id; name = $processItem.ProcessName
                 title = $processItem.MainWindowTitle; reason = $(if ($isTitleMatch) { 'window-title' } else { 'process-name' })
                 cmdline = $cmdline; cmdlineTruncated = $cmdlineTruncated
+                scope = $scope; scopeReason = $scopeReason
             }) | Out-Null
         }
     }
@@ -751,6 +795,7 @@ function Write-RefusalEvidence {
     # writes the same JSON/TXT pair as a normal run, with verdict=REFUSED and the blocking[] array.
     param(
         [object[]]$Blocking,
+        [object[]]$BlockingOutOfScope = @(),
         [string]$EvidenceDirectory
     )
     if ($EvidenceDirectory.Length -eq 0) { return $null }
@@ -759,6 +804,8 @@ function Write-RefusalEvidence {
         dryRunScenario = $(if ($DryRun) { $DryRunScenario } else { '' })
         verdict = 'REFUSED'
         exitCode = $EXIT_REFUSED
+        slot = $slotName
+        instanceSignature = $effectiveSignature
         caps = [pscustomobject]@{
             perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC
             roundMaxSec = $HARD_CAP_ROUND_SEC
@@ -780,7 +827,11 @@ function Write-RefusalEvidence {
         baseline = $baselineSnapshot
         blocking = @($Blocking)
         blockingCount = @($Blocking).Count
-        blockingNote = 'these processes existed BEFORE this round; nothing was launched and nothing was killed'
+        blockingNote = 'these processes carry THIS round''s instance signature and existed BEFORE it; nothing was launched and nothing was killed'
+        # Not silently dropped: these matched -BlockingProcessNames but carry a different signature (a
+        # teammate's Gradle daemon, or another slot's client), so they did NOT block this round.
+        blockingOutOfScope = @($BlockingOutOfScope)
+        blockingOutOfScopeCount = @($BlockingOutOfScope).Count
         instances = @()
         findings = $scriptFindings.ToArray()
     }
@@ -835,11 +886,35 @@ if (-not $DryRun) {
     # counting every new survivor (conservative: possible false red, never a silent miss).
 }
 
+# ---------------------------------------------------------------- instance scope + slot (2026-09-27)
+# The PRE-LAUNCH guard now uses the same idea as the post-run audit: only a process that carries THIS
+# round's instance signature may block us. -InstanceSignature is an explicit override (used by tests and
+# by a caller that knows its own gameDir); otherwise the signature derived from --gameDir above applies.
+$effectiveSignature = $launchSignature
+if ($InstanceSignature.Length -gt 0) { $effectiveSignature = $InstanceSignature }
+
+# Slot: explicit -Slot wins; else the gameDir leaf name; else 'default'. Sanitised for filenames.
+$slotName = $Slot
+if ($slotName.Length -eq 0) {
+    $derivedGameDir = ''
+    for ($i = 0; $i -lt ($launchArgs.Count - 1); $i++) {
+        if ($launchArgs[$i] -eq '--gameDir') { $derivedGameDir = [string]$launchArgs[$i + 1]; break }
+    }
+    if ($derivedGameDir.Length -gt 0) {
+        $slotName = Split-Path -Leaf ($derivedGameDir.TrimEnd('\', '/'))
+    }
+}
+if ($slotName.Length -eq 0) { $slotName = 'default' }
+$slotName = ($slotName -replace '[^A-Za-z0-9._-]', '_')
+$slotExplicit = ($Slot.Length -gt 0)
+# Only an EXPLICIT -Slot changes the evidence filename, so the default naming stays byte-identical.
+$runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if ($slotExplicit) { $runStamp = $runStamp + '-' + $slotName }
+
 $roundStartedAt = Get-Date
 # Resolved HERE (not just before the loop) because a REFUSAL now writes evidence too -- it used to
 # produce no file at all, which is exactly what made a refusal unattributable after the fact.
 $evidenceDirectory = Get-EvidenceDirectory -Requested $EvidenceDir
-$runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $baselineSnapshot = Get-SystemSnapshot
 $baselineSnapshotForAudit = $baselineSnapshot
 # Snapshot which orphan-name-matching processes already exist BEFORE we launch. A round may be
@@ -852,15 +927,26 @@ $procBaselineForAudit = Get-ProcessActivitySnapshot
 #    BOTH refusal branches (the live guard and the dry-run 'refuse' scenario) go through the same report
 #    + evidence helper, so the two paths cannot drift apart. The guard is NOT relaxed in any way: no
 #    command-line exclusion is applied, and exit 3 keeps meaning "declined to start, killed nothing".
-$blocking = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern
-if ((@($blocking).Count -gt 0) -or ($DryRun -and $DryRunScenario -eq 'refuse')) {
-    Show-BlockingReport -Blocking $blocking
-    $refusalPaths = Write-RefusalEvidence -Blocking $blocking -EvidenceDirectory $evidenceDirectory
+$blockingCandidates = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern -ScopeSignature $effectiveSignature
+$blockingInScope = @($blockingCandidates | Where-Object { $_.scope -ne 'out-of-scope' })
+$blockingOutOfScope = @($blockingCandidates | Where-Object { $_.scope -eq 'out-of-scope' })
+foreach ($unrelated in $blockingOutOfScope) {
+    # Report them, never silently drop them: an unrelated JVM is precisely why this round may proceed,
+    # and the reason is what tells a Gradle daemon apart from another slot's client.
+    Write-Output ('NOT BLOCKING: pid={0} name={1} title={2} -- {3}' -f $unrelated.pid, $unrelated.name, $unrelated.title, $unrelated.scopeReason)
+    $unrelatedShown = [string]$unrelated.cmdline
+    if ($unrelatedShown.Length -eq 0) { $unrelatedShown = '<command line unavailable>' }
+    Write-Output ('    cmdline: ' + $unrelatedShown)
+}
+Write-Output ('scope: signature={0} inScope={1} outOfScope={2} slot={3}' -f $(if ($effectiveSignature.Length -gt 0) { $effectiveSignature } else { '<none, FAIL-CLOSED>' }), $blockingInScope.Count, $blockingOutOfScope.Count, $slotName)
+if (($blockingInScope.Count -gt 0) -or ($DryRun -and $DryRunScenario -eq 'refuse')) {
+    Show-BlockingReport -Blocking $blockingInScope
+    $refusalPaths = Write-RefusalEvidence -Blocking $blockingInScope -BlockingOutOfScope $blockingOutOfScope -EvidenceDirectory $evidenceDirectory
     if ($null -ne $refusalPaths) {
         Write-Output ('evidence: {0}' -f $refusalPaths.json)
         Write-Output ('evidence: {0}' -f $refusalPaths.text)
     }
-    Write-Output ('VERDICT=REFUSED EXIT={0}' -f $EXIT_REFUSED)
+    Write-Output ('VERDICT=REFUSED EXIT={0} slot={1}' -f $EXIT_REFUSED, $slotName)
     exit $EXIT_REFUSED
 }
 
@@ -879,7 +965,7 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
         $finalExit = $EXIT_ROUND_BUDGET
         break
     }
-    Write-Output ('--- instance {0}/{1}: launching {2} (cap {3}s, stall {4}s) ---' -f $index, $MaxInstances, $launchExe, $PerInstanceTimeoutSec, $StallSeconds)
+    Write-Output ('--- instance {0}/{1}: launching {2} (cap {3}s, stall {4}s, slot {5}) ---' -f $index, $MaxInstances, $launchExe, $PerInstanceTimeoutSec, $StallSeconds, $slotName)
     $record = Invoke-BoundedInstance -Index $index -Exe $launchExe -ExeArgs $launchArgs -WorkDir $WorkingDirectory `
         -TimeoutSec $PerInstanceTimeoutSec -StallLimitSec $StallSeconds -DryScenario $DryRunScenario `
         -EvidenceDirectory $evidenceDirectory -RunStamp $runStamp -IsDry:$DryRun
@@ -947,6 +1033,8 @@ $summary = [pscustomobject]@{
     dryRunScenario = $(if ($DryRun) { $DryRunScenario } else { '' })
     verdict = $verdict
     exitCode = $finalExit
+    slot = $slotName
+    instanceSignature = $effectiveSignature
     caps = [pscustomobject]@{
         perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC
         roundMaxSec = $HARD_CAP_ROUND_SEC

@@ -17,6 +17,9 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `cropzoom.js` | cross-platform | `node tools/cropzoom.js IN.png OUT.png X0 Y0 X1 Y1 [SCALE]` |
 | `capture-window.ps1` | **Windows only** (user32 + System.Drawing) | `pwsh tools/capture-window.ps1 -Out shot.png [-Title <regex>\|-ProcessId N\|-WindowHandle H] [-Method auto\|printwindow\|rect] [-Json]` — captures a window **without ever activating it** (PrintWindow first; unobstructed-rect screen grab as fallback, with that caveat printed). Reports `CAPTURE_METHOD=`, `CAPTURE_BLACKFRACTION=` and `foregroundUnchanged=True`. **Verified on a real GL window 2026-09-27** (Minecraft 1.20.1 + Forge, window not in the foreground: `printwindow`, 868×571, `blackFraction=0`, foreground unchanged) — so the "GL may come back black" worry is falsified for that setup; a black frame on anything else still exits 4 rather than "fixing" it by stealing focus. See "Never steal the user's window focus" below |
 | `no-focus-steal.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/no-focus-steal.test.ps1 [-ExtraScanPath <file>]` → `NO-FOCUS-STEAL-TEST PASS (N checks)` — scans `tools/**` code for activation / input-synthesis primitives (comments and the README's marked block are exempt); `-ExtraScanPath` runs the negative control |
+| `warm-build-env.ps1` | PowerShell 5.1 / 7 | `pwsh tools/warm-build-env.ps1 -TargetDir <fresh checkout> -SourceTree <warmed tree> [-Check] [-GradleUserHome <dir>] [-RunBuild] [-ExpectJarSha <sha256>]` — makes a fresh checkout buildable, **idempotently**: copies the un-versioned `libs/*.jar`, the three gitignored ForgeGradle mapping intermediates, and runs gradle with a warmed user home **from the target directory**. A missing prerequisite is **reported** (exit 2), never silently skipped; `-Check` changes nothing. See "Parallel builds" below |
+| `warm-build-env.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/warm-build-env.test.ps1` → `WARM-BUILD-ENV-TEST PASS (21 checks)` — offline (synthetic trees, no gradle): fail-loud on each missing prerequisite, `-Check` writes nothing, warm copies exactly what is missing, second run is a no-op |
+| `assert-no-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/assert-no-round.ps1 [-What edit-runner\|gradle-build] [-GradleLock <dir>]` → exit **0 = clear**, **1 = blocked**. Gate for exclusivity-sensitive work: BLOCKS while a real round is running (judged by command line — `BootstrapLauncher`/`forgeclient`/`net.minecraft` — never by "is there any java", since a teammate's Gradle daemon is java but is not a round), and for `-What gradle-build` also while the team gradle lock is held (path from `-GradleLock` or `MODTEST_GRADLE_LOCK`). Run it **as its own command** before the action: a check that does not block is not a check |
 | `analyze-regions.js` | cross-platform (Node ≥ 18) | `node tools/analyze-regions.js A.png B.png [C.png …] [--regions <json\|@file>] [--label NAME] [--json]` — drift-controlled region analysis (per-image region mean luminance / lit≥128, plus adjacent-pair region diffs), because whole-image diffs are dominated by sky/HUD/particle noise. `--regions` overrides the rectangles (this is what the former per-pose **forked copies** were for); the frozen default set reproduces every archived `region-analysis.txt` **line for line** |
 | `analyze-regions.test.js` | cross-platform | `node tools/analyze-regions.test.js [--tool PATH] [--archived-root DIR] [--skip-archived]` (self-test, **30 checks on a default run**: region maths, frozen default preset, `--regions` validation, relative `imgdiff.js` resolution proved with a stub dependency, archived equivalence) |
 | `griddiff.ps1` | **Windows only** (GDI+) | `pwsh tools/griddiff.ps1 -A a.png -B b.png [-Cells 8] [-Threshold 10] [-Json]` |
@@ -171,6 +174,77 @@ every `run-bounded-*.json` glob are unchanged by default.
 (e.g. `pwsh`), the guard matches **itself** and always refuses. `run-bounded.test.ps1` therefore drives
 both scope controls through a **non-harness peer** process.
 
+### Parallel builds (task-29)
+
+A fresh checkout does **not** build out of the box. `tools/warm-build-env.ps1` closes the gap, and the
+closure is measured: **two independent worktrees at the same commit, warmed by the script, produce a
+byte-identical jar.**
+
+```
+git -C <warmed tree> worktree add --detach <fresh> <commit>
+pwsh tools/warm-build-env.ps1 -TargetDir <fresh> -SourceTree <warmed tree> -Check      # inspect only
+pwsh tools/warm-build-env.ps1 -TargetDir <fresh> -SourceTree <warmed tree> -RunBuild   # warm + build
+```
+
+| Missing in a fresh checkout | Size / why |
+|---|---|
+| `libs/freecam-forge-1.2.1+1.20.jar`, `libs/player-animation-lib-forge-1.0.2-rc1+1.20.jar` | 75,389 B / 181,437 B — `libs/*.jar` is gitignored and only 3 of the 5 jars are tracked |
+| `build/createSrgToMcp/output.srg`, `build/extractSrg/output.srg`, `build/createMcpToSrg/output.tsrg` | 20,871,086 / 4,558,114 / 9,129,252 B — all under the gitignored `build/`, and a fresh `createSrgToMcp` does not produce them |
+| a warmed Gradle user home | without `-g` the deobf cache is absent → `Error getting artifact: blank:tacz:1.1.8-hotfix_mapped_official_1.20.1 … from DeobfuscatingRepo` |
+
+⚠️ **The trap that looks like a missing prerequisite**: Gradle takes its **project directory from the
+current working directory**, not from the location of the `gradlew.bat` you invoked (pitfall 8 below).
+Run the fresh directory's wrapper while your shell sits in another project and Gradle builds THAT project:
+`BUILD SUCCESSFUL`, exit 0, no jar where you asked. Always `cd` into the fresh directory first; the
+script does.
+
+**Measured closure — "isolated copies are reproducible"** (2026-09-27, commit `ed48564`; all three built
+with `jar --offline --rerun-tasks --no-daemon -g <warmed tree>/.gradle-user-home`):
+
+| directory | path | bytes | entries | sha256 |
+|---|---|---|---|---|
+| **main checkout** | `<taclight>\build\libs\taclight-0.11.0.jar` | 363,924 | 280 | `b9706833…dc749a34` |
+| isolated #1 | `<iso>\harness-iso-build\build\libs\taclight-0.11.0.jar` | 363,924 | 280 | `b9706833…dc749a34` |
+| isolated #2 | `<iso>\harness-iso-build-2\build\libs\taclight-0.11.0.jar` | 363,924 | 280 | `b9706833…dc749a34` |
+
+Full sha256 (identical for all three, and #1 vs #2 verified **byte-for-byte** equal):
+`b97068337c045cf0f4146a01d7a123f61701b7b1319f68c9243df567dc749a34`
+
+Two **different** directories — the main checkout and an isolated worktree, each with its own eol state
+and its own `build/` — producing the same bytes is the main evidence: isolated builds are reproducible,
+which is what makes parallel builds legitimate. Build logs:
+`docs/evidence/2026-09-27-harness-dev/iso-build-{1,2}.log`.
+
+**Preconditions for that equality** (all four matter): the **same commit**, the **same JDK**
+(`17.0.20.1` here), the **same set of un-versioned `libs/*.jar`** (that is exactly what
+`warm-build-env.ps1` copies), and a **shared warmed Gradle user home**. Change any one and the jars may
+legitimately differ.
+
+**History (why an earlier comparison looked wrong)**: the jar that was in the main tree before this
+measurement was built at 01:14:12 (`3AFB5F88…`, 360,403 B, 279 entries) while HEAD was already `ed48564`
+(01:44:42) — i.e. it was **stale**, not a counter-example. Its difference from the fresh builds is fully
+accounted for by the entries the intervening commits touched: `PackFingerprint.class` (the only class
+`ed48564` changed), `PerfStats.class`, `ClientEvents*.class`, plus the newly added `KeyPersist.class`.
+Lesson: compare jars **per commit**, and check the jar's mtime against HEAD before drawing a conclusion.
+
+**eol independence**: verified earlier in `cf7b9d7` with an LF / CRLF / restored-LF three-state test
+yielding the same sha; the code carrying that property has not been changed since, and the fresh jar's
+`taclight.mixins.json` has **CR = 0**.
+
+**Shared vs independent Gradle user home**
+
+| | Shared (`-g <warmed tree>/.gradle-user-home`) | Independent (`GRADLE_USER_HOME` per checkout) |
+|---|---|---|
+| first build | offline immediately | needs its cache warmed once |
+| disk | one copy | one copy per checkout |
+| contention | Gradle locks inside the home; `--no-daemon` + distinct projects is the practical mitigation | none |
+| use when | you want N checkouts building right now | you want full isolation, or the warm home is read-only |
+
+**Rules**: one `build/` per checkout (never share it); `--no-daemon` for scripted builds; **take
+`docs/.gradle-lock` before any gradle**; and **no gradle while a real round is running** — it is CPU / RAM /
+disk noise the round did not ask for. `assert-no-round.ps1 -What gradle-build` enforces both conditions
+(no real round AND no lock holder) and is meant to be run as its own command before every build.
+
 ## 驱动脚本坑清单（PowerShell / .NET）—— 每条都来自一次真机事故
 
 驱动脚本（通过文件中继 `<gameDir>/taclight-cmds.txt` 发命令、截图、解析日志的那一层）由每一轮的人
@@ -187,6 +261,7 @@ both scope controls through a **non-harness peer** process.
 | 5 | ① 报 `does not contain op_Subtraction`；② 正则**匹配成功但 `$Matches` 是空的** ⇒ 相机坐标解析成 `(0,0,0)`，**整轮探针扫在世界原点、结论无效** | ① `@([int]$cam[0] - 16, …)` 里**逗号优先级低于 `-`**，减法拿到 `Object[]` 操作数；② 对**数组**做 `-match` 返回**过滤后的数组**、**不设置 `$Matches`** | ① 每个表达式加括号：`@(([int]$cam[0]) - 16, ([int]$cam[1]) - 2, …)`；② 先取标量再匹配：`$one = @($lines | Select-Object -Last 1); if ($one -match '…') { $Matches[1] }` | `docs/evidence/2026-09-26-classify/README.md:148-154`（两坑叠加；臂数据未受影响但该轮没有 `!quit`，被 150 s 上限杀掉） |
 | 6 | 报 `找不到"Add"的参数计数为"1"的重载` —— 明明是自己的 `List`，却像被换成了别的东西 | **自己的变量名撞上 PowerShell 自动变量 `$Matches`**：`$matches = New-Object ...List[object]` 之后，循环里任何一次成功的 `-match` 都会把 `$matches` **覆盖成哈希表**（哈希表的 `Add` 要 2 个参数） | **不要用 `$matches` / `$Matches` 当自己的变量名**（`$input` / `$args` / `$error` / `$host` / `$psitem` 同理）；叫 `$candidates`、`$found` 之类 | 本仓 `tools/capture-window.ps1` 首版（2026-09-27，笔者自己踩的；见 `docs/evidence/2026-09-27-harness-dev/README.md`） |
 | 7 | `[System.IO.File]::ReadAllBytes('tools\x.ps1')` 报 `Could not find a part of the path '…\<别的目录>\tools\x.ps1'`，而同一行上 `Get-Content tools\x.ps1` 却正常 | **`cd` 只改 PowerShell 的 provider location，不改 .NET 的 `[Environment]::CurrentDirectory`** ⇒ `[System.IO.*]` 的相对路径按**进程启动目录**解析 | 给 `[System.IO.*]`（以及 `[Parser]::ParseFile` 之类）**一律传绝对路径**：`Join-Path (Get-Location).Path 'tools\x.ps1'` | 同上（2026-09-27；顺带核对出 `parse-check.ps1` **不会**因此假绿：读不到文件会报 `ERRCOUNT=1`） |
+| 8 | **`gradle` 打印 `BUILD SUCCESSFUL`、exit 0，但你要的那个目录里`build/libs` 是空的**（或 `createSrgToMcp` exit=0 却不产出 `output.srg`）；日志里出现的还是**另一个项目**的源文件路径 | **Gradle 的"项目目录"取自当前工作目录，不是 `gradlew.bat` 所在目录** ⇒ 在新目录里调 `<新目录>\gradlew.bat`、而 shell 停在别的项目 ⇒ Gradle 构建的是**那个项目**：成功、exit 0、你要的目录里什么都没有 | **先进入目标目录再调 wrapper**：`Push-Location <目标目录>` → `& .\gradlew.bat …` → `Pop-Location`（人类就 `cd`）。**判据**：日志里出现的是**你要的那个目录**的路径（例如 `…\<新目录>\build\generated\refmap\…`） | 本仓 `tools/warm-build-env.ps1` 首版（2026-09-27，我自己踩的：它编译了工作区仓 `com.spotviz` 的源码，并把 `spotviz-0.1.0.jar` 写进**工作区仓**的 `build\libs`）。⚠️ **口径**：该机制**产生与** `dev-voxel`/R3 记录的"新目录里 jar 不产出、日志被写空"**完全相同的症状** ⇒ 下次遇到**先排查这一条**；但**不得**据此断言那就是他们那次的原因（未核过他们当时的 cwd） |
 
 **通用纪律**（上表 5 条的教训）：
 * 驱动里的**每一条 sink**（`Write-Output` / 裸表达式）都要当成"会进 TSV / 会进返回值"来看待；不确定就

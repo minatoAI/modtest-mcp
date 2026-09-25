@@ -22,6 +22,7 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `parse-check.ps1` | PowerShell 5.1 / 7 | `pwsh tools/parse-check.ps1 -Target script.ps1` → prints `ERRCOUNT=0` |
 | `rcon.ps1` | PowerShell 5.1 / 7 | `pwsh tools/rcon.ps1 -ServerHost <host> -Command "list"` (password via prompt/env) |
 | `run-bounded.ps1` | **Windows only** (process/watchdog/CPU audit) | `pwsh tools/run-bounded.ps1 -FilePath <exe> [-ArgumentList …] [-WorkingDirectory …] [-Windowed] [-OptionsFile run/options.txt] [-MaxInstances 1]` — hard caps **≤6 min/instance** (watchdog `Stop-Process`) and **≤25 min/round**, refuses to start if a `java`/`javaw`/Minecraft window already exists, always audits afterwards (target gone + no orphan `java.exe` + CPU/memory recovered) and writes per-run JSON/TXT metrics; `-DryRun -DryRunScenario ok\|timeout\|stall\|refuse\|orphan` self-tests every path **without starting a JVM** |
+| `run-bounded.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-bounded.test.ps1` → `RUN-BOUNDED-TEST PASS (N checks)` (offline: drives the runner's 5 `-DryRun` scenarios, asserts exit code + audit verdict + the `caps` field semantics; **never starts a JVM**) |
 
 ## Conventions
 
@@ -36,8 +37,14 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 * **Recorder header signature.** `rec-analyze.js` expects the recording's first line to start with
   `#` and match `--header-pattern` (default: `/rec/i`). Pass your recorder's own signature if it
   differs; the default is intentionally generic.
-* **Self-tests are the contract.** `imgdiff.test.js` and `rec-analyze.test.js` must pass before you
-  change anything in this folder.
+* **`caps` field names in `run-bounded` evidence.** `caps.roundBudgetCapSec` is the configured **cap**
+  and `caps.roundBudgetElapsedSec` is the seconds **actually used** (= `roundWallSeconds`). The key
+  `caps.roundBudgetUsedSec` is a **deprecated alias of the cap** (it was misnamed: it never held the
+  usage); it is kept so readers of pre-2026-09-27 evidence keep working. New code must use
+  `roundBudgetCapSec` / `roundBudgetElapsedSec`.
+* **Self-tests are the contract.** `imgdiff.test.js`, `rec-analyze.test.js` and `run-bounded.test.ps1`
+  must pass before you change anything in this folder. A change to a tool whose behaviour is not
+  covered should add a check to the matching self-test **and prove it is red on the old code first**.
 
 ## Adding a tool
 

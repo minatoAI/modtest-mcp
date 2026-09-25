@@ -30,6 +30,11 @@
 #   NOTE ON UNITS: peakCpuPct is the sum over cores (a busy 8-core process can read >100%), and
 #   peakMemoryMB is Win32_Process.WorkingSetSize sampled every poll (not the .NET object's stale
 #   WorkingSet64).
+#   NOTE ON ROUND-BUDGET FIELD NAMES (corrected 2026-09-27): caps.roundBudgetCapSec is the configured
+#   CAP and caps.roundBudgetElapsedSec is the seconds ACTUALLY used (= roundWallSeconds). The old key
+#   caps.roundBudgetUsedSec was misnamed -- it always held the CAP, never the usage -- and is KEPT as
+#   a deprecated alias with the same value, so that readers of pre-2026-09-27 evidence keep working.
+#   New references must use roundBudgetCapSec / roundBudgetElapsedSec.
 #   EvidenceDir default: $env:MODTEST_BOUNDED_EVIDENCE_DIR, else <temp>/modtest-bounded-runs
 #
 # DRY RUN (proves the logic WITHOUT ever starting a JVM)
@@ -539,6 +544,7 @@ function Write-Evidence {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(('RUN-BOUNDED mode={0} scenario={1} verdcit={2}' -f $Summary.mode, $Summary.dryRunScenario, $Summary.verdict)) | Out-Null
     $lines.Add(('caps: perInstance<={0}s round<={1}s stall<={2}s windowed={3} ({4}x{5})' -f $HARD_CAP_PER_INSTANCE_SEC, $HARD_CAP_ROUND_SEC, $Summary.stallSeconds, $Summary.windowed, $WINDOW_WIDTH, $WINDOW_HEIGHT)) | Out-Null
+    $lines.Add(('roundBudget: cap={0}s elapsed={1}s (roundBudgetUsedSec=<deprecated alias of cap> is kept for old readers)' -f $Summary.caps.roundBudgetCapSec, $Summary.caps.roundBudgetElapsedSec)) | Out-Null
     $lines.Add(('roundWallSeconds={0} baselineCpu={1}% baselineAvailMB={2}' -f $Summary.roundWallSeconds, $Summary.baseline.cpuPct, $Summary.baseline.availableMB)) | Out-Null
     foreach ($record in @($Summary.instances)) {
         $lines.Add(('instance#{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB exit={6} kill={7}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.exitCode, $record.killPerformed)) | Out-Null
@@ -686,7 +692,19 @@ $summary = [pscustomobject]@{
     dryRunScenario = $(if ($DryRun) { $DryRunScenario } else { '' })
     verdict = $verdict
     exitCode = $finalExit
-    caps = [pscustomobject]@{ perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC; roundMaxSec = $HARD_CAP_ROUND_SEC; perInstanceUsedSec = $PerInstanceTimeoutSec; roundBudgetUsedSec = $RoundBudgetSec; stallSeconds = $StallSeconds }
+    caps = [pscustomobject]@{
+        perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC
+        roundMaxSec = $HARD_CAP_ROUND_SEC
+        perInstanceUsedSec = $PerInstanceTimeoutSec
+        # Round-budget field semantics -- see the "NOTE ON ROUND-BUDGET FIELD NAMES" in the header.
+        # roundBudgetCapSec / roundBudgetElapsedSec are the correct names (cap vs actual usage);
+        # roundBudgetUsedSec is a DEPRECATED alias of the CAP, kept only so pre-2026-09-27 evidence
+        # readers do not break. Do not use it in new code.
+        roundBudgetCapSec = $RoundBudgetSec
+        roundBudgetElapsedSec = $roundWallSeconds
+        roundBudgetUsedSec = $RoundBudgetSec
+        stallSeconds = $StallSeconds
+    }
     windowed = [bool]$Windowed
     window = ('{0}x{1}' -f $WINDOW_WIDTH, $WINDOW_HEIGHT)
     command = $launchExe

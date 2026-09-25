@@ -9,18 +9,25 @@
 //      (with its dependency), and fails when relocated ALONE. The archived copies instead required
 //      'E:/.../modtest-mcp/tools/imgdiff.js' by absolute path (asserted statically below), i.e. they
 //      only worked on the machine that wrote them;
-//   E. ARCHIVED EQUIVALENCE (needs --archived-root / MODTEST_ARCHIVED_EVIDENCE_ROOT, else SKIPPED and
-//      reported as skipped -- never as a pass): replaying the canonical tool over the archived PNGs
-//      reproduces the archived reports LINE FOR LINE, both for the default preset and for the forked
-//      pose preset -- which is what makes replacing 7 copies + 1 fork safe.
+//   E. ARCHIVED EQUIVALENCE (the most valuable check here): replaying the canonical tool over the
+//      archived PNGs reproduces the archived reports LINE FOR LINE, both for the default preset and for
+//      the forked pose preset -- which is what makes replacing 7 copies + 1 fork safe. The archived root
+//      is resolved from --archived-root, then MODTEST_ARCHIVED_EVIDENCE_ROOT, then a CONTENT-VALIDATED
+//      auto-discovery of sibling checkouts.
+//      FAIL-CLOSED (2026-09-27, R3 review): this section used to be SKIPPED -- silently -- when the root
+//      was not configured, while tools/README quoted the full-configuration 30/30. Now an unresolved or
+//      incomplete archive is a FAIL with an actionable hint, and waiving it takes the EXPLICIT
+//      --skip-archived switch. Intentional observable change: a bare `node tools/analyze-regions.test.js`
+//      with no archive available used to pass and now fails until you provide the archive or waive it.
 //
 // It is a DIFFERENTIAL test: --tool points it at any candidate (default: the sibling canonical), so the
 // very same checks can be run against an archived copy to show them going red. The candidate is only
 // require()d after a child-process probe confirms it is library-shaped; an archived copy executes its
 // CLI at load time and would otherwise process.exit() inside this test.
 //
-// Usage: node tools/analyze-regions.test.js [--tool PATH] [--archived-root DIR] [--keep-temp]
-// Exit: 0 all executed checks passed | 1 at least one failed.
+// Usage: node tools/analyze-regions.test.js [--tool PATH] [--archived-root DIR] [--skip-archived]
+//        [--keep-temp]
+// Exit: 0 all executed checks passed | 1 at least one failed | 2 setup error.
 
 'use strict';
 
@@ -30,17 +37,41 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { encodePng } = require(path.join(__dirname, 'imgdiff.js'));
 
+// The report that proves a candidate directory really is the archived evidence tree we mean.
+const ARCHIVED_MARKER = path.join('2026-09-26-default-day', 'r1-day', 'region-analysis.txt');
+
 let toolPath = path.join(__dirname, 'analyze-regions.js');
-let archivedRoot = process.env.MODTEST_ARCHIVED_EVIDENCE_ROOT || '';
+let archivedRoot = '';
+let rootSource = 'none';
+let skipArchived = false;
 let keepTemp = false;
 {
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--tool') toolPath = argv[++i];
-    else if (argv[i] === '--archived-root') archivedRoot = argv[++i];
+    else if (argv[i] === '--archived-root') { archivedRoot = argv[++i]; rootSource = 'parameter'; }
+    else if (argv[i] === '--skip-archived') skipArchived = true;
     else if (argv[i] === '--keep-temp') keepTemp = true;
     else { console.error('unknown option: ' + argv[i]); process.exit(2); }
   }
+}
+if (!archivedRoot && process.env.MODTEST_ARCHIVED_EVIDENCE_ROOT) {
+  archivedRoot = process.env.MODTEST_ARCHIVED_EVIDENCE_ROOT;
+  rootSource = 'MODTEST_ARCHIVED_EVIDENCE_ROOT';
+}
+if (!archivedRoot && !skipArchived) {
+  // Sibling checkouts of this repository, accepted only if they contain the marker report. Zero or
+  // several matches stay unresolved -- ambiguity must not be guessed away.
+  const checkoutParent = path.dirname(path.dirname(__dirname));
+  const matches = [];
+  let entries = [];
+  try { entries = fs.readdirSync(checkoutParent, { withFileTypes: true }); } catch (e) { entries = []; }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(checkoutParent, entry.name, 'docs', 'evidence');
+    if (fs.existsSync(path.join(candidate, ARCHIVED_MARKER))) matches.push(candidate);
+  }
+  if (matches.length === 1) { archivedRoot = matches[0]; rootSource = 'auto-discovery'; }
 }
 const TOOL = path.resolve(toolPath);
 if (!fs.existsSync(TOOL)) { console.error('ANALYZE-REGIONS-TEST SETUP-ERROR: tool not found: ' + TOOL); process.exit(2); }
@@ -76,6 +107,7 @@ function probeExports(candidate) {
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'analyze-regions-test-'));
 console.log('ANALYZE-REGIONS-TEST tool=' + TOOL);
+console.log('ANALYZE-REGIONS-TEST archivedRoot=' + (archivedRoot || '<unresolved>') + ' (source=' + rootSource + ')');
 
 const probe = probeExports(TOOL);
 const isLibrary = probe.ok && probe.names.includes('regionStats') && probe.names.includes('regionDiff');
@@ -242,7 +274,9 @@ const POSE_REGIONS = {
 
 function equivalenceCase(label, dir, reportName, regionsArg) {
   const reportPath = path.join(archivedRoot, dir, reportName);
-  if (!fs.existsSync(reportPath)) { skip(label, 'archived report not found: ' + reportPath); return; }
+  // FAIL, not skip: this function only runs once a root has been resolved, and an incomplete archive
+  // must not quietly reduce the evidence (that is the whole point of the fail-closed change).
+  if (!fs.existsSync(reportPath)) { check(label, false, 'archived report not found: ' + reportPath); return; }
   const expected = lines(fs.readFileSync(reportPath, 'utf8'));
   // The report itself is the ordering authority: those runs fed the PNGs in capture-time order, which
   // is NOT always name order (rC-fluid lists nocc_1 before cc_2; rB-lag lists lag45-3 before lag0-4).
@@ -251,7 +285,7 @@ function equivalenceCase(label, dir, reportName, regionsArg) {
     const m = /^(\S+\.png) {2}/.exec(line);
     if (m && !ordered.includes(m[1])) ordered.push(m[1]);
   }
-  if (ordered.length < 2) { skip(label, 'could not read an image order from ' + reportPath); return; }
+  if (ordered.length < 2) { check(label, false, 'could not read an image order from ' + reportPath); return; }
   const missing = ordered.filter(f => !fs.existsSync(path.join(archivedRoot, dir, f)));
   if (missing.length > 0) { check(label, false, 'archived PNGs missing: ' + missing.join(',')); return; }
   const args = [TOOL].concat(ordered.map(f => path.join(archivedRoot, dir, f)));
@@ -266,10 +300,15 @@ function equivalenceCase(label, dir, reportName, regionsArg) {
   check(label, firstDiff === -1, firstDiff === -1 ? '' : `line ${firstDiff + 1}: got '${actual[firstDiff]}' want '${expected[firstDiff]}'`);
 }
 
-if (!archivedRoot) {
-  skip('archived equivalence (default + pose preset)', 'pass --archived-root DIR (or set MODTEST_ARCHIVED_EVIDENCE_ROOT)');
+if (skipArchived) {
+  skip('archived equivalence (default + pose preset)', 'waived on purpose with --skip-archived');
+} else if (!archivedRoot) {
+  // FAIL-CLOSED (see the header): an unresolved root must not silently drop the strongest evidence.
+  check('archived evidence root resolved (the equivalence replay must run)', false,
+    'not resolved via --archived-root/env/auto-discovery; pass --archived-root DIR, set '
+    + 'MODTEST_ARCHIVED_EVIDENCE_ROOT, or waive on purpose with --skip-archived');
 } else if (!fs.existsSync(archivedRoot)) {
-  check('archived root exists', false, archivedRoot);
+  check('configured archived evidence root exists', false, archivedRoot);
 } else if (!isLibrary) {
   // A flat script has no --regions/--json and would treat them as image filenames; replaying the
   // archived reports against it proves nothing (and feeds it nonsense arguments). The reds for such a
@@ -288,7 +327,7 @@ if (!archivedRoot) {
     check('archived copy required imgdiff.js by MACHINE-ABSOLUTE path (what this change removes)',
       /require\('[A-Za-z]:\//.test(archivedCode));
   } else {
-    skip('archived copy absolute-require evidence', 'not found: ' + archivedSample);
+    check('archived copy absolute-require evidence available', false, 'not found: ' + archivedSample);
   }
 }
 

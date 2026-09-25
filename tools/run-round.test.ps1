@@ -15,17 +15,26 @@
 #       by the move: nothing was rewritten, deleted or turned into a forwarder).
 #
 # The archived copies live in the workspace evidence tree, which is NOT part of this repository, so the
-# root is a PARAMETER (or $env:MODTEST_ARCHIVED_EVIDENCE_ROOT) -- no machine path is hardcoded here
-# either. Without it, section (D) reports SKIPPED (and says so; a skipped check is never a pass).
+# root is resolved from (in order): -ArchivedEvidenceRoot, $env:MODTEST_ARCHIVED_EVIDENCE_ROOT, then a
+# content-validated AUTO-DISCOVERY of sibling checkouts (a sibling directory whose docs/evidence holds
+# the marker report the equivalence replay needs). No machine path is hardcoded here.
+#
+# FAIL-CLOSED ON THE PROVENANCE CHECK (2026-09-27, R3 review): the archived-copy checks are the most
+# valuable part of this test, and they used to be SKIPPED -- silently -- whenever the root was not
+# configured; the 19/19 quoted in tools/README was a full-configuration number. Now an unresolved root
+# is a FAIL with an actionable hint, and waiving it takes the EXPLICIT -SkipArchivedEquivalence switch.
+# This is an intentional observable change: `pwsh tools/run-round.test.ps1` with no archive available
+# used to pass, and now fails until you either provide the archive or waive the checks on purpose.
 #
 # ASCII only. Usage:
-#   pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-KeepTemp]
+#   pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-KeepTemp]
 # Exit: 0 all executed checks passed | 1 at least one failed | 2 setup error.
 
 [CmdletBinding()]
 param(
     [string]$RoundRunner = '',
     [string]$ArchivedEvidenceRoot = '',
+    [switch]$SkipArchivedEquivalence,
     [switch]$KeepTemp
 )
 
@@ -38,8 +47,26 @@ if (-not (Test-Path -LiteralPath $RoundRunner -PathType Leaf)) {
 }
 $RoundRunner = (Resolve-Path -LiteralPath $RoundRunner).Path
 $ToolsDir = Split-Path -Parent $RoundRunner
-if ($ArchivedEvidenceRoot.Length -eq 0 -and $env:MODTEST_ARCHIVED_EVIDENCE_ROOT) {
+
+# The report that proves a candidate root really is the archived evidence tree we mean.
+$ArchivedMarker = Join-Path '2026-09-26-default-day' (Join-Path 'r1-day' 'region-analysis.txt')
+$ArchivedRootSource = 'none'
+if ($ArchivedEvidenceRoot.Length -gt 0) {
+    $ArchivedRootSource = 'parameter'
+} elseif ($env:MODTEST_ARCHIVED_EVIDENCE_ROOT) {
     $ArchivedEvidenceRoot = $env:MODTEST_ARCHIVED_EVIDENCE_ROOT
+    $ArchivedRootSource = 'MODTEST_ARCHIVED_EVIDENCE_ROOT'
+} else {
+    # Sibling checkouts of this repository, accepted only if they contain the marker report. Zero or
+    # several matches stay unresolved (ambiguity must not be guessed away).
+    $ArchivedRootSource = 'auto-discovery'
+    $checkoutParent = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $matches = New-Object System.Collections.Generic.List[string]
+    foreach ($sibling in @(Get-ChildItem -LiteralPath $checkoutParent -Directory -ErrorAction SilentlyContinue)) {
+        $candidate = Join-Path $sibling.FullName 'docs\evidence'
+        if (Test-Path -LiteralPath (Join-Path $candidate $ArchivedMarker)) { $matches.Add($candidate) | Out-Null }
+    }
+    if ($matches.Count -eq 1) { $ArchivedEvidenceRoot = $matches[0] } else { $ArchivedEvidenceRoot = '' }
 }
 $script:Total = 0
 $script:Passed = 0
@@ -84,6 +111,7 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('run-round-test-' + (Ge
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 
 Write-Output ('RUN-ROUND-TEST runner=' + $RoundRunner)
+Write-Output ('RUN-ROUND-TEST archivedRoot=' + $(if ($ArchivedEvidenceRoot.Length -gt 0) { $ArchivedEvidenceRoot } else { '<unresolved>' }) + ' (source=' + $ArchivedRootSource + ')')
 
 # ---------------------------------------------------------------- (A) canonical file shape
 Write-Output '--- A. canonical file shape ---'
@@ -109,8 +137,18 @@ $archivedDirs = @()
 if ($ArchivedEvidenceRoot.Length -gt 0 -and (Test-Path -LiteralPath $ArchivedEvidenceRoot -PathType Container)) {
     $archivedDirs = @(Get-ChildItem -LiteralPath $ArchivedEvidenceRoot -Recurse -File -Filter 'run-round.ps1' -ErrorAction SilentlyContinue | ForEach-Object { Split-Path -Parent $_.FullName } | Select-Object -Unique)
 }
-if ($archivedDirs.Count -eq 0) {
-    Add-Skip 'archived copies: CLI superset + provenance' 'pass -ArchivedEvidenceRoot (or set MODTEST_ARCHIVED_EVIDENCE_ROOT)'
+if ($SkipArchivedEquivalence) {
+    Add-Skip 'archived copies: CLI superset + provenance' 'waived on purpose with -SkipArchivedEquivalence'
+} elseif ($ArchivedEvidenceRoot.Length -eq 0) {
+    # FAIL-CLOSED (see the header): an unresolved root must not silently downgrade the provenance check.
+    Add-Check 'archived evidence root resolved (provenance checks must run)' $false `
+        ('not resolved via parameter/env/auto-discovery; pass -ArchivedEvidenceRoot <dir>, set ' +
+         'MODTEST_ARCHIVED_EVIDENCE_ROOT, or waive on purpose with -SkipArchivedEquivalence')
+} elseif (-not (Test-Path -LiteralPath $ArchivedEvidenceRoot -PathType Container)) {
+    $configuredDetail = $ArchivedEvidenceRoot
+    Add-Check 'configured archived evidence root exists' $false ('not a directory: ' + $configuredDetail)
+} elseif ($archivedDirs.Count -eq 0) {
+    Add-Check 'archived copies present under the configured root' $false ('no run-round.ps1 found under ' + $ArchivedEvidenceRoot)
 } else {
     $canonicalParams = @(Get-ParamNames -Path $RoundRunner)
     $copies = @(Get-ChildItem -LiteralPath $ArchivedEvidenceRoot -Recurse -File -Filter 'run-round.ps1' -ErrorAction SilentlyContinue)

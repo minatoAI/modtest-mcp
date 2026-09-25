@@ -67,6 +67,11 @@ param(
     [switch]$Windowed,
     [string]$OptionsFile = '',
     [switch]$VerifyWindow,
+    # Opt-in: after the instance ends, put the OS cursor back where it was before the round. In-world
+    # Minecraft grabs the cursor (GLFW_CURSOR_DISABLED -> ClipCursor + recentre on Windows), so the
+    # round otherwise leaves the pointer parked at the window centre. Guarded so a background round
+    # never fights an operator who is using the mouse (see Restore-CursorPosition).
+    [switch]$RestoreCursor,
     [double]$CpuRecoveryTolerancePct = 20.0,
     [int]$MemoryRecoveryToleranceMB = 512,
     # If another process grew by >= this much private memory, or burned >= this many CPU seconds,
@@ -212,6 +217,48 @@ public struct RECT { public int Left; public int Top; public int Right; public i
     } catch { return $null }
 }
 
+function Get-CursorPosition {
+    # Reads the OS cursor position. NOTE: this is NOT an input channel -- nothing here ever moves the
+    # cursor before or during a round. It exists only so an opt-in (-RestoreCursor) post-run step can
+    # undo a side effect the GAME itself causes: in-world Minecraft grabs the cursor
+    # (GLFW_CURSOR_DISABLED), and on Windows GLFW implements that with ClipCursor() on the window's
+    # client rect plus recentring, so after the round the cursor is left at the window centre.
+    # Measured 2026-09-25 (docs/evidence/2026-09-25-mouse-grab): clip rect 853,453,1706,986 == the
+    # 1280x800 game window's client area on a 2560x1440 screen, and it is released when the game exits.
+    $signature = @'
+[DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+public struct POINT { public int X; public int Y; }
+'@
+    try { Add-Type -Namespace ModtestBounded -Name Cursor -MemberDefinition $signature -ErrorAction SilentlyContinue } catch { }
+    try {
+        $p = New-Object ModtestBounded.Cursor+POINT
+        if ([ModtestBounded.Cursor]::GetCursorPos([ref]$p)) { return [pscustomobject]@{ x = $p.X; y = $p.Y } }
+    } catch { }
+    return $null
+}
+
+function Restore-CursorPosition([object]$Saved) {
+    # Opt-in. Guard: only restore when the cursor still sits near the screen centre, i.e. where the
+    # game left it. If the operator has been using the mouse since the game exited, we do NOT fight
+    # them -- a background round must never yank the pointer out from under the user.
+    if ($null -eq $Saved) { return 'skipped (no saved position)' }
+    try {
+        $now = Get-CursorPosition
+        if ($null -eq $now) { return 'skipped (cannot read cursor)' }
+        $cx = [int]([ModtestBounded.Cursor]::GetSystemMetrics(0) / 2)
+        $cy = [int]([ModtestBounded.Cursor]::GetSystemMetrics(1) / 2)
+        $dx = [math]::Abs($now.x - $cx)
+        $dy = [math]::Abs($now.y - $cy)
+        if ($dx -gt 100 -or $dy -gt 100) {
+            return ('skipped (cursor at {0},{1}, {2}px from screen centre -- looks user-moved)' -f $now.x, $now.y, [int][math]::Max($dx, $dy))
+        }
+        [void][ModtestBounded.Cursor]::SetCursorPos($Saved.x, $Saved.y)
+        return ('restored {0},{1} -> {2},{3}' -f $now.x, $now.y, $Saved.x, $Saved.y)
+    } catch { return ('restore failed: ' + $_.Exception.Message) }
+}
+
 function Assert-OptionsWindowed([string]$Path) {
     # hard rule: windowed 1280x800, fullscreen forbidden
     if ($Path.Length -eq 0) { return }
@@ -263,6 +310,7 @@ function Invoke-BoundedInstance {
     $launchParams = @{ FilePath = $Exe; ArgumentList = $effectiveArgs; PassThru = $true; RedirectStandardOutput = $outFile; RedirectStandardError = $errFile }
     if ($WorkDir.Length -gt 0) { $launchParams['WorkingDirectory'] = $WorkDir }
     $childProcess = $null
+    $cursorBefore = if ($RestoreCursor) { Get-CursorPosition } else { $null }
     try {
         $childProcess = Start-Process @launchParams
     } catch {
@@ -330,11 +378,12 @@ function Invoke-BoundedInstance {
     }
     $geometry = $null
     if ($VerifyWindow) { $geometry = Get-WindowGeometry -ProcessId $childPid }
+    $cursorRestore = if ($RestoreCursor) { Restore-CursorPosition -Saved $cursorBefore } else { $null }
     return [pscustomobject]@{
         index = $Index; pid = $childPid; outcome = $outcome; killReason = $killReason
         killPerformed = $killPerformed; wallSeconds = $wallSeconds
         peakCpuPct = [math]::Round($peakCpuPct, 1); peakMemoryMB = [math]::Round($peakMemoryMB, 1)
-        exitCode = $exitCode; window = $geometry; startedAt = $startedAt.ToString('s')
+        exitCode = $exitCode; window = $geometry; cursorRestore = $cursorRestore; startedAt = $startedAt.ToString('s')
         stdoutFile = $outFile; stderrFile = $errFile
         effectiveArgs = $effectiveArgs
     }

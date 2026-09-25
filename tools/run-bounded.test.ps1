@@ -161,6 +161,9 @@ if ($null -ne $runOk.json) {
     if (Test-Path -LiteralPath $textFile) { $textBody = Get-Content -LiteralPath $textFile -Raw }
     Add-Check 'ok/txt summary states roundBudget cap+elapsed' ($textBody -match 'roundBudget: cap=' -and $textBody -match 'elapsed=')
     Add-Check 'ok/txt summary still states the hard caps' ($textBody -match 'caps: perInstance<=')
+    # Write-Evidence reads $Summary.stallSeconds; the summary only ever set caps.stallSeconds, so every
+    # archived TXT printed "stall<=s" with an empty value until 2026-09-27.
+    Add-Check 'ok/txt summary states the real stall cap (was an empty value before)' ($textBody -match 'stall<=45s') ('text=' + (($textBody -split "`r?`n") | Where-Object { $_ -match '^caps:' }))
 } else {
     Add-Check 'ok/summary parsed' $false 'no run-bounded-*.json in the evidence dir'
 }
@@ -190,17 +193,56 @@ if ($null -ne $runStall.json) {
 }
 
 # ---------------------------------------------------------------- 4. refuse (pre-existing process)
+# The refusal is the ONE place where the harness tells a human "I will not run", and until 2026-09-27 it
+# printed only pid/name/title and wrote NO evidence at all -- so three real refusals (all caused by
+# somebody else's Gradle daemon) were unattributable from the archive. These checks pin the fix, and
+# they were RED on the previous runner (no evidence file, no blocking[], no command line).
 Write-Output '--- scenario refuse ---'
 $directoryRefuse = Join-Path $testRoot 'refuse'
 New-Item -ItemType Directory -Force -Path $directoryRefuse | Out-Null
+# -BlockingWindowTitlePattern '' keeps this scenario deterministic: only the process-name channel may
+# match, so a stray browser tab whose title contains "Minecraft" cannot change the outcome.
 $argvRefuse = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', 'refuse',
-    '-EvidenceDir', $directoryRefuse, '-PollSeconds', '1', '-BlockingProcessNames', 'pwsh')
+    '-EvidenceDir', $directoryRefuse, '-PollSeconds', '1', '-BlockingProcessNames', 'pwsh',
+    '-BlockingWindowTitlePattern', '')
 $stdoutRefuse = @(& pwsh @argvRefuse 2>&1 | ForEach-Object { [string]$_ })
 $exitRefuse = $LASTEXITCODE
-Add-Check 'refuse/exit=3 (refused, nothing launched)' ($exitRefuse -eq 3) ('exit=' + $exitRefuse)
-Add-Check 'refuse/says REFUSING TO START' ((($stdoutRefuse -join "`n") -match 'REFUSING TO START'))
-$refuseJson = @(Get-ChildItem -LiteralPath $directoryRefuse -File -Filter 'run-bounded-*.json' -ErrorAction SilentlyContinue)
-Add-Check 'refuse/no evidence written (it exits before the harness starts)' ($refuseJson.Count -eq 0) ('count=' + $refuseJson.Count)
+$outRefuse = ($stdoutRefuse -join "`n")
+Add-Check 'refuse/exit=3 (still a refusal)' ($exitRefuse -eq 3) ('exit=' + $exitRefuse)
+Add-Check 'refuse/says REFUSING TO START' ($outRefuse -match 'REFUSING TO START')
+$refuseInstances = @(Get-ChildItem -LiteralPath $directoryRefuse -File -Filter '*-instance*-out.txt' -ErrorAction SilentlyContinue)
+Add-Check 'refuse/nothing was launched (no instance out/err files)' ($refuseInstances.Count -eq 0) ('count=' + $refuseInstances.Count)
+Add-Check 'refuse/stdout shows a COMMAND LINE, not just name/title' ($outRefuse -match '(?i)cmdline:')
+Add-Check 'refuse/stdout states nothing was launched and nothing was killed' ($outRefuse -match '(?i)NOTHING was launched and NOTHING was killed')
+Add-Check 'refuse/stdout states the blockers pre-date this round' ($outRefuse -match '(?i)from BEFORE this round')
+
+$refuseJsonFiles = @(Get-ChildItem -LiteralPath $directoryRefuse -File -Filter 'run-bounded-*.json' -ErrorAction SilentlyContinue)
+# INTENTIONAL OBSERVABLE CHANGE (approved 2026-09-27): this assertion used to read
+# "refuse/no evidence written" and pass because a refusal produced no file at all.
+Add-Check 'refuse/WRITES an evidence JSON (used to write nothing)' ($refuseJsonFiles.Count -gt 0) ('count=' + $refuseJsonFiles.Count)
+if ($refuseJsonFiles.Count -gt 0) {
+    $refusal = Get-Content -LiteralPath $refuseJsonFiles[0].FullName -Raw | ConvertFrom-Json
+    Add-Check 'refuse/evidence records verdict=REFUSED and exitCode=3' (([string]$refusal.verdict -eq 'REFUSED') -and ([int]$refusal.exitCode -eq 3)) ('verdict=' + $refusal.verdict + ' exitCode=' + $refusal.exitCode)
+    $blocking = @($refusal.blocking)
+    Add-Check 'refuse/evidence carries a non-empty blocking[]' ($blocking.Count -gt 0) ('count=' + $blocking.Count)
+    if ($blocking.Count -gt 0) {
+        $noCmdline = @($blocking | Where-Object { -not ($_.PSObject.Properties['cmdline']) -or ([string]$_.cmdline).Length -eq 0 })
+        Add-Check 'refuse/every blocking[] entry carries a command-line summary' ($noCmdline.Count -eq 0) ('entries without cmdline=' + $noCmdline.Count)
+        $noPid = @($blocking | Where-Object { [int]$_.pid -le 0 })
+        Add-Check 'refuse/every blocking[] entry carries a pid' ($noPid.Count -eq 0) ('without pid=' + $noPid.Count)
+        Add-Check 'refuse/evidence notes the blockers pre-date this round' ([string]$refusal.blockingNote -match '(?i)existed BEFORE') ('note=' + $refusal.blockingNote)
+    } else {
+        Add-Check 'refuse/every blocking[] entry carries a command-line summary' $false 'blocking[] is empty'
+        Add-Check 'refuse/every blocking[] entry carries a pid' $false 'blocking[] is empty'
+        Add-Check 'refuse/evidence notes the blockers pre-date this round' $false 'blocking[] is empty'
+    }
+} else {
+    Add-Check 'refuse/evidence records verdict=REFUSED and exitCode=3' $false 'no evidence JSON written'
+    Add-Check 'refuse/evidence carries a non-empty blocking[]' $false 'no evidence JSON written'
+    Add-Check 'refuse/every blocking[] entry carries a command-line summary' $false 'no evidence JSON written'
+    Add-Check 'refuse/every blocking[] entry carries a pid' $false 'no evidence JSON written'
+    Add-Check 'refuse/evidence notes the blockers pre-date this round' $false 'no evidence JSON written'
+}
 
 # ---------------------------------------------------------------- 5. orphan (fault injection)
 Write-Output '--- scenario orphan ---'

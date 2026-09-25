@@ -29,9 +29,9 @@
 #     nobody uses)
 #
 # EXIT CODES
-#   0 ok | 2 bad parameters (cap above the hard limit) | 3 refused (blocking process present)
-#   4 instance hit the 6-min cap (killed) | 5 instance stalled (killed) | 6 round budget exceeded
-#   7 post-run audit failed | 8 could not launch
+#   0 ok | 2 bad parameters (cap above the hard limit) | 3 refused (blocking process present; writes
+#   evidence with blocking[]) | 4 instance hit the 6-min cap (killed) | 5 instance stalled (killed)
+#   | 6 round budget exceeded | 7 post-run audit failed | 8 could not launch
 #
 # EVIDENCE (machine-readable; the run summary is the interface)
 #   <EvidenceDir>/run-bounded-<yyyyMMdd-HHmmss>.json   full summary + per-instance metrics
@@ -46,6 +46,12 @@
 #   caps.roundBudgetUsedSec was misnamed -- it always held the CAP, never the usage -- and is KEPT as
 #   a deprecated alias with the same value, so that readers of pre-2026-09-27 evidence keep working.
 #   New references must use roundBudgetCapSec / roundBudgetElapsedSec.
+#   NOTE ON A REFUSAL (added 2026-09-27): a refusal (exit 3) NOW ALSO WRITES this evidence summary, with
+#   verdict=REFUSED, exitCode=3 and a `blocking[]` array. Each entry carries pid / name / title / reason
+#   AND a truncated COMMAND LINE, because "a java process exists" is not attributable on a shared
+#   machine -- all three refusals recorded on 2026-09-25/26 were somebody else's Gradle daemon. An entry
+#   never means the harness touched it: a refusal only declines to start, and says so explicitly.
+#   This is an intentional observable change: previously a refusal produced no file at all.
 #   EvidenceDir default: $env:MODTEST_BOUNDED_EVIDENCE_DIR, else <temp>/modtest-bounded-runs
 #
 # DRY RUN (proves the logic WITHOUT ever starting a JVM)
@@ -169,8 +175,34 @@ function Get-ProcessNameList([string]$Csv) {
     return $names
 }
 
+function Get-ProcessCommandLineMap {
+    # ONE Win32_Process snapshot -> pid => { cmdline, cmdlineTruncated }. Built once and looked up by pid,
+    # instead of a Get-CimInstance call per match.
+    param([int]$TruncateTo = 240)
+    $map = @{}
+    foreach ($row in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $cmdline = ''
+        $truncated = $false
+        if ($null -ne $row.CommandLine) {
+            $cmdline = [string]$row.CommandLine
+            if ($TruncateTo -gt 0 -and $cmdline.Length -gt $TruncateTo) {
+                $cmdline = $cmdline.Substring(0, $TruncateTo)
+                $truncated = $true
+            }
+        }
+        $map[[int]$row.ProcessId] = [pscustomobject]@{ cmdline = $cmdline; cmdlineTruncated = $truncated }
+    }
+    return $map
+}
+
 function Get-BlockingProcesses {
-    param([System.Collections.Generic.List[string]]$Names, [string]$TitlePattern)
+    # -CommandLineMap is optional (an empty map is built on demand), so every existing caller keeps working.
+    param(
+        [System.Collections.Generic.List[string]]$Names,
+        [string]$TitlePattern,
+        [hashtable]$CommandLineMap = @{}
+    )
+    if ($CommandLineMap.Count -eq 0) { $CommandLineMap = Get-ProcessCommandLineMap }
     $found = New-Object System.Collections.Generic.List[object]
     foreach ($processItem in @(Get-Process -ErrorAction SilentlyContinue)) {
         $isNameMatch = $false
@@ -181,9 +213,20 @@ function Get-BlockingProcesses {
         $isTitleMatch = $false
         if ($TitlePattern.Length -gt 0 -and $processItem.MainWindowTitle -match $TitlePattern) { $isTitleMatch = $true }
         if ($isNameMatch -or $isTitleMatch) {
+            # The COMMAND LINE is what lets an operator tell a teammate's build JVM from a real game
+            # client. Without it a refusal is unattributable: on 2026-09-25/26 three rounds were blocked
+            # and the witness had to look the culprit up by hand to find out it was a Gradle daemon.
+            $cmdline = ''
+            $cmdlineTruncated = $false
+            $ownerPid = [int]$processItem.Id
+            if ($CommandLineMap.ContainsKey($ownerPid)) {
+                $cmdline = [string]$CommandLineMap[$ownerPid].cmdline
+                $cmdlineTruncated = [bool]$CommandLineMap[$ownerPid].cmdlineTruncated
+            }
             $found.Add([pscustomobject]@{
                 pid = $processItem.Id; name = $processItem.ProcessName
                 title = $processItem.MainWindowTitle; reason = $(if ($isTitleMatch) { 'window-title' } else { 'process-name' })
+                cmdline = $cmdline; cmdlineTruncated = $cmdlineTruncated
             }) | Out-Null
         }
     }
@@ -681,6 +724,71 @@ function Write-Evidence {
     return [pscustomobject]@{ json = $jsonPath; text = $textPath }
 }
 
+function Show-BlockingReport {
+    # Human-readable attribution for a refusal. Shared by BOTH refusal branches (the live guard and the
+    # dry-run 'refuse' scenario) so they can never drift apart.
+    # The per-process line keeps its pre-2026-09-27 shape ("REFUSING TO START: pid=.. name=.. title=..
+    # (reason)") so existing greps still match; the command line is added as an indented continuation.
+    param([object[]]$Blocking)
+    $count = @($Blocking).Count
+    if ($count -eq 0) {
+        Write-Output 'REFUSING TO START: (dry-run scenario refuse) no process matched -BlockingProcessNames on this machine; the refusal path itself is what is being exercised.'
+    }
+    foreach ($blocked in @($Blocking)) {
+        Write-Output ('REFUSING TO START: pid={0} name={1} title={2} ({3})' -f $blocked.pid, $blocked.name, $blocked.title, $blocked.reason)
+        $shownCmdline = [string]$blocked.cmdline
+        if ($shownCmdline.Length -eq 0) { $shownCmdline = '<command line unavailable>' }
+        elseif ($blocked.cmdlineTruncated) { $shownCmdline = $shownCmdline + ' ...(truncated)' }
+        Write-Output ('    cmdline: ' + $shownCmdline)
+    }
+    Write-Output ('REFUSING TO START: an existing client process is present ({0} pre-existing process(es), all of them from BEFORE this round); this harness never kills other processes.' -f $count)
+    Write-Output '  the command line above is what tells a teammate''s build JVM apart from a real game client'
+    Write-Output '  NOTHING was launched and NOTHING was killed; rerun once the listed process(es) are gone.'
+}
+
+function Write-RefusalEvidence {
+    # A refusal used to produce NO evidence at all, which made it unattributable after the fact. It now
+    # writes the same JSON/TXT pair as a normal run, with verdict=REFUSED and the blocking[] array.
+    param(
+        [object[]]$Blocking,
+        [string]$EvidenceDirectory
+    )
+    if ($EvidenceDirectory.Length -eq 0) { return $null }
+    $summary = [pscustomobject]@{
+        mode = $mode
+        dryRunScenario = $(if ($DryRun) { $DryRunScenario } else { '' })
+        verdict = 'REFUSED'
+        exitCode = $EXIT_REFUSED
+        caps = [pscustomobject]@{
+            perInstanceMaxSec = $HARD_CAP_PER_INSTANCE_SEC
+            roundMaxSec = $HARD_CAP_ROUND_SEC
+            perInstanceUsedSec = $PerInstanceTimeoutSec
+            roundBudgetCapSec = $RoundBudgetSec
+            roundBudgetElapsedSec = 0.0
+            roundBudgetUsedSec = $RoundBudgetSec
+            stallSeconds = $StallSeconds
+        }
+        windowed = [bool]$Windowed
+        window = ('{0}x{1}' -f $WINDOW_WIDTH, $WINDOW_HEIGHT)
+        command = $launchExe
+        commandArgs = @($launchArgs)
+        startedAt = $roundStartedAt.ToString('s')
+        roundWallSeconds = [math]::Round(((Get-Date) - $roundStartedAt).TotalSeconds, 2)
+        # Write-Evidence reads $Summary.stallSeconds (the TXT caps line); without this the line printed
+        # "stall<=s" with an empty value -- see the same field in the normal summary below.
+        stallSeconds = $StallSeconds
+        baseline = $baselineSnapshot
+        blocking = @($Blocking)
+        blockingCount = @($Blocking).Count
+        blockingNote = 'these processes existed BEFORE this round; nothing was launched and nothing was killed'
+        instances = @()
+        findings = $scriptFindings.ToArray()
+    }
+    $paths = Write-Evidence -Summary $summary -Directory $EvidenceDirectory
+    if ($Json) { Write-Output ($summary | ConvertTo-Json -Depth 8) }
+    return $paths
+}
+
 # ---------------------------------------------------------------------------- main
 if ($PerInstanceTimeoutSec -gt $HARD_CAP_PER_INSTANCE_SEC) {
     Write-Output ('ERROR: -PerInstanceTimeoutSec {0} exceeds the 6-minute hard cap ({1}s)' -f $PerInstanceTimeoutSec, $HARD_CAP_PER_INSTANCE_SEC)
@@ -728,6 +836,10 @@ if (-not $DryRun) {
 }
 
 $roundStartedAt = Get-Date
+# Resolved HERE (not just before the loop) because a REFUSAL now writes evidence too -- it used to
+# produce no file at all, which is exactly what made a refusal unattributable after the fact.
+$evidenceDirectory = Get-EvidenceDirectory -Requested $EvidenceDir
+$runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $baselineSnapshot = Get-SystemSnapshot
 $baselineSnapshotForAudit = $baselineSnapshot
 # Snapshot which orphan-name-matching processes already exist BEFORE we launch. A round may be
@@ -736,19 +848,19 @@ $baselineSnapshotForAudit = $baselineSnapshot
 $baselineOrphanPids = @(Get-BlockingProcesses -Names $orphanNameList -TitlePattern $BlockingWindowTitlePattern | ForEach-Object { [int]$_.pid })
 $procBaselineForAudit = Get-ProcessActivitySnapshot
 
-# 3) refuse to start when a client process is already there -- refuse only, never kill
+# 3) refuse to start when a client process is already there -- refuse only, never kill.
+#    BOTH refusal branches (the live guard and the dry-run 'refuse' scenario) go through the same report
+#    + evidence helper, so the two paths cannot drift apart. The guard is NOT relaxed in any way: no
+#    command-line exclusion is applied, and exit 3 keeps meaning "declined to start, killed nothing".
 $blocking = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern
-if (@($blocking).Count -gt 0 -and -not ($DryRun -and $DryRunScenario -eq 'refuse')) {
-    foreach ($blocked in $blocking) {
-        Write-Output ('REFUSING TO START: pid={0} name={1} title={2} ({3})' -f $blocked.pid, $blocked.name, $blocked.title, $blocked.reason)
+if ((@($blocking).Count -gt 0) -or ($DryRun -and $DryRunScenario -eq 'refuse')) {
+    Show-BlockingReport -Blocking $blocking
+    $refusalPaths = Write-RefusalEvidence -Blocking $blocking -EvidenceDirectory $evidenceDirectory
+    if ($null -ne $refusalPaths) {
+        Write-Output ('evidence: {0}' -f $refusalPaths.json)
+        Write-Output ('evidence: {0}' -f $refusalPaths.text)
     }
-    Write-Output 'REFUSING TO START: an existing client process is present; this harness never kills other processes.'
-    exit $EXIT_REFUSED
-}
-if ($DryRun -and $DryRunScenario -eq 'refuse') {
-    $blocking = Get-BlockingProcesses -Names $blockingNameList -TitlePattern $BlockingWindowTitlePattern
-    foreach ($blocked in $blocking) { Write-Output ('REFUSING TO START: pid={0} name={1} title={2} ({3})' -f $blocked.pid, $blocked.name, $blocked.title, $blocked.reason) }
-    Write-Output 'REFUSING TO START: pre-existing process matched -BlockingProcessNames; nothing was launched and nothing was killed.'
+    Write-Output ('VERDICT=REFUSED EXIT={0}' -f $EXIT_REFUSED)
     exit $EXIT_REFUSED
 }
 
@@ -758,8 +870,6 @@ if ($OptionsFile.Length -gt 0) {
 
 $finalExit = $EXIT_OK
 $verdict = 'PASS'
-$evidenceDirectory = Get-EvidenceDirectory -Requested $EvidenceDir
-$runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 for ($index = 1; $index -le $MaxInstances; $index++) {
     $roundElapsedSec = ((Get-Date) - $roundStartedAt).TotalSeconds
     # 2) whole-round wall clock budget: refuse to start an instance that cannot fit
@@ -856,6 +966,9 @@ $summary = [pscustomobject]@{
     commandArgs = $(if ($instanceRecords.Count -gt 0) { $instanceRecords[0].effectiveArgs } else { $launchArgs })
     startedAt = $roundStartedAt.ToString('s')
     roundWallSeconds = $roundWallSeconds
+    # Read by Write-Evidence for the TXT caps line. It was missing until 2026-09-27, so every archived
+    # TXT printed "stall<=s" with an empty value (see e.g. run-bounded-20260917-060518.txt).
+    stallSeconds = $StallSeconds
     baseline = $baselineSnapshot
     instances = $instanceRecords.ToArray()
     findings = $scriptFindings.ToArray()

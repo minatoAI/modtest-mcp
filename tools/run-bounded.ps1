@@ -571,7 +571,9 @@ function Test-PostRunAudit {
             if ($cmdLine.Contains($LaunchSignature)) { $oursList.Add($candidate) | Out-Null } else { $unattributed += $candidate }
         }
         # NOTE: @(<List[object]>) throws System.ArgumentException 'Argument types do not match' in
-        # PowerShell; always go through .ToArray() (see the PS 5.1 note in docs/agent-harness).
+        # PowerShell; always go through .ToArray(). (The fuller PowerShell 5.1 notes this used to point
+        # at -- docs/agent-harness -- live in the WORKSPACE repository, not in this one; the pitfall
+        # itself is stated right here so this file needs no external document.)
         $ours = $oursList.ToArray()
     } else {
         $ours = @($newSinceLaunch)

@@ -9,6 +9,14 @@
 #   * one instance  <= 360 s  (6 min, startup+exit included)   -> -PerInstanceTimeoutSec  (default 330)
 #   * whole round   <= 1500 s (25 min, accumulated)            -> -RoundBudgetSec         (default 1500)
 #   * watchdog kills the instance itself (Stop-Process -Force) on deadline OR on stall
+#     OPT-IN EXTRA: -KillProcessTree also kills the instance's DESCENDANTS (nearest-first walk over
+#     Win32_Process.ParentProcessId). This exists because a WRAPPER launch defeats a single-pid kill:
+#     measured 2026-09-25, the watchdog killed `renderdoccmd.exe` while the game JVM -- its
+#     GRANDCHILD -- survived as an orphan (docs/evidence/2026-09-25-renderdoc/README.md 3.2). It is
+#     opt-in, NOT default, because on a `gradlew.bat` launch the descendant chain runs through a
+#     Gradle DAEMON that is shared with other builds on this machine; killing it would break
+#     somebody else's work. -KillProcessTreeExcludePattern (default 'GradleDaemon') is a second belt
+#     for the same reason. Only descendants of OUR pid are ever touched -- never a process sweep.
 #   * before starting: any java/javaw/Minecraft window present -> REFUSE (never kills other people's
 #     processes; it only declines to start)
 #   * after every instance, mandatory post-run audit: this PID is gone, no orphan java/javaw remain
@@ -16,6 +24,9 @@
 #     a pre-existing JVM, e.g. a LAN round with its own dedicated server, must not be blamed for it),
 #     and system CPU / available memory have come back to the pre-round baseline
 #   * any cap breach or failed audit => stop the whole round immediately with a non-zero exit code
+#   * DISCOVERABILITY: when an audit fails with a surviving process, the run says so and records
+#     audit.leftoverHint, pointing at -KillProcessTree (an opt-in nobody discovers is an opt-in
+#     nobody uses)
 #
 # EXIT CODES
 #   0 ok | 2 bad parameters (cap above the hard limit) | 3 refused (blocking process present)
@@ -38,7 +49,7 @@
 #   EvidenceDir default: $env:MODTEST_BOUNDED_EVIDENCE_DIR, else <temp>/modtest-bounded-runs
 #
 # DRY RUN (proves the logic WITHOUT ever starting a JVM)
-#   -DryRun -DryRunScenario ok|timeout|stall|refuse|orphan
+#   -DryRun -DryRunScenario ok|timeout|stall|refuse|orphan|tree
 #     The harness substitutes a harmless non-JVM child (the current PowerShell host running a
 #     sleep). It refuses to run at all if that child resolves to a java* executable.
 #     ok      -> child exits by itself, audit passes, exit 0
@@ -47,11 +58,16 @@
 #     refuse  -> -BlockingProcessNames picks up an existing process; nothing is launched, exit 3
 #     orphan  -> FAULT INJECTION: the watchdog deliberately does not kill, so the post-run audit
 #                must catch the still-live child (exit 7) and then clean up only that child
+#     tree    -> the child spawns a GRANDCHILD and prints `GRANDCHILD_PID=<n>` on stdout, then sleeps
+#                until the watchdog kills it. WITH -KillProcessTree the grandchild is dead afterwards;
+#                WITHOUT it the grandchild survives -- which is exactly the old (wrapper-launch)
+#                failure, and is what run-bounded.test.ps1 uses as the negative control.
 #
 # USAGE
 #   pwsh tools/run-bounded.ps1 -FilePath ./gradlew.bat -ArgumentList ':forge:runClient' `
 #        -WorkingDirectory ../modtest-mcp -Windowed -OptionsFile ./run/options.txt -VerifyWindow
 #   pwsh tools/run-bounded.ps1 -DryRun -DryRunScenario timeout -PerInstanceTimeoutSec 6 -Json
+#   pwsh tools/run-bounded.ps1 -FilePath <wrapper.exe> -ArgumentList ... -KillProcessTree
 #
 # ASCII only (PowerShell 5.1 + no BOM); no single-letter lowercase variables. Validate with
 # `pwsh tools/parse-check.ps1 -Target tools/run-bounded.ps1` -> ERRCOUNT=0.
@@ -77,6 +93,16 @@ param(
     # round otherwise leaves the pointer parked at the window centre. Guarded so a background round
     # never fights an operator who is using the mouse (see Restore-CursorPosition).
     [switch]$RestoreCursor,
+    # Opt-in: when the watchdog has to kill the instance, also kill the instance's DESCENDANTS. Needed
+    # when -FilePath is a WRAPPER (renderdoccmd.exe, *.bat shims) rather than the java executable
+    # itself: a single-pid kill then leaves the real client alive as an orphan (measured 2026-09-25,
+    # docs/evidence/2026-09-25-renderdoc/README.md 3.2). Default OFF on purpose -- on a gradlew.bat
+    # launch the descendant chain passes through a Gradle DAEMON shared with other builds, and killing
+    # that would break somebody else's work. Only descendants of our own pid are ever considered.
+    [switch]$KillProcessTree,
+    # ...and never kill a descendant whose command line matches this regex. Second belt for the
+    # Gradle-daemon hazard above; applied only when -KillProcessTree is set.
+    [string]$KillProcessTreeExcludePattern = 'GradleDaemon',
     [double]$CpuRecoveryTolerancePct = 20.0,
     [int]$MemoryRecoveryToleranceMB = 512,
     # If another process grew by >= this much private memory, or burned >= this many CPU seconds,
@@ -86,7 +112,7 @@ param(
     [int]$PollSeconds = 1,
     [switch]$Json,
     [switch]$DryRun,
-    [ValidateSet('ok', 'timeout', 'stall', 'refuse', 'orphan')]
+    [ValidateSet('ok', 'timeout', 'stall', 'refuse', 'orphan', 'tree')]
     [string]$DryRunScenario = 'ok'
 )
 
@@ -196,6 +222,80 @@ function Get-ProcessSample([System.Diagnostics.Process]$ProcessObject) {
     return [pscustomobject]@{ cpuSeconds = $cpuSeconds; workingSetMB = $workingSetMB }
 }
 
+function Get-DescendantProcesses {
+    # Every process whose ancestor chain reaches $RootProcessId, NEAREST generation first.
+    # Built from ONE Win32_Process snapshot via ParentProcessId; read-only, touches nothing.
+    # NOTE: ParentProcessId is the creator recorded at process creation and is NOT rewritten when the
+    # creator exits, which is why this still works for attributing a survivor to the wrapper we killed.
+    param([int]$RootProcessId)
+    $ordered = New-Object System.Collections.Generic.List[object]
+    $rows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)
+    if ($rows.Count -eq 0) { return $ordered }
+    $byParent = @{}
+    foreach ($row in $rows) {
+        $parentId = [int]$row.ParentProcessId
+        if (-not $byParent.ContainsKey($parentId)) { $byParent[$parentId] = New-Object System.Collections.Generic.List[object] }
+        $byParent[$parentId].Add($row) | Out-Null
+    }
+    $seen = New-Object System.Collections.Generic.HashSet[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootProcessId)
+    while ($queue.Count -gt 0) {
+        $currentId = $queue.Dequeue()
+        if (-not $byParent.ContainsKey($currentId)) { continue }
+        foreach ($child in $byParent[$currentId]) {
+            $childId = [int]$child.ProcessId
+            if ($seen.Add($childId)) {
+                $ordered.Add($child) | Out-Null
+                $queue.Enqueue($childId)
+            }
+        }
+    }
+    return $ordered
+}
+
+function Stop-ProcessTree {
+    # Kill the DESCENDANTS of $RootProcessId (the root itself is left to the caller). Deepest-first, so
+    # a parent's own shutdown cannot reparent a child into an orphan before we reach it.
+    # SAFETY: only descendants of our pid are ever considered (never a machine-wide sweep), the current
+    # harness process is explicitly excluded, and any descendant whose command line matches
+    # $ExcludePattern is skipped and REPORTED rather than killed.
+    param(
+        [int]$RootProcessId,
+        [string]$ExcludePattern = '',
+        [int[]]$ExcludeProcessIds = @()
+    )
+    $killed = New-Object System.Collections.Generic.List[string]
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $descendants = @(Get-DescendantProcesses -RootProcessId $RootProcessId)
+    [array]::Reverse($descendants)
+    foreach ($proc in $descendants) {
+        $procId = [int]$proc.ProcessId
+        $procName = [string]$proc.Name
+        $cmdLine = ''
+        if ($null -ne $proc.CommandLine) { $cmdLine = [string]$proc.CommandLine }
+        if ($ExcludeProcessIds -contains $procId) {
+            $skipped.Add(('pid={0} name={1} (excluded: protected pid)' -f $procId, $procName)) | Out-Null
+            continue
+        }
+        if ($ExcludePattern.Length -gt 0 -and $cmdLine -match $ExcludePattern) {
+            $skipped.Add(('pid={0} name={1} (excluded: command line matches {2})' -f $procId, $procName, $ExcludePattern)) | Out-Null
+            continue
+        }
+        try {
+            Stop-Process -Id $procId -Force -ErrorAction Stop
+            $killed.Add(('pid={0} name={1}' -f $procId, $procName)) | Out-Null
+        } catch {
+            $skipped.Add(('pid={0} name={1} (kill failed: {2})' -f $procId, $procName, $_.Exception.Message)) | Out-Null
+        }
+    }
+    return [pscustomobject]@{
+        descendantCount = $descendants.Count
+        killed = $killed.ToArray()
+        skipped = $skipped.ToArray()
+    }
+}
+
 function Get-WindowGeometry([int]$ProcessId) {
     # optional window audit; returns physical window/client rect and DPI, or $null
     $signature = @'
@@ -278,6 +378,17 @@ function Get-DryRunChild {
     # a harmless NON-JVM child used only by -DryRun: the current PowerShell host sleeping
     $hostExe = (Get-Process -Id $PID).Path
     if ($hostExe -match '(?i)javaw?\.exe$') { throw 'dry-run child resolved to a java executable; refusing (dry runs must not start a JVM)' }
+    if ($DryRunScenario -eq 'tree') {
+        # The child spawns a GRANDCHILD (a detached sleeper) and prints its pid on stdout as
+        # GRANDCHILD_PID=<n>, then sleeps long enough for the watchdog to kill it. With
+        # -KillProcessTree the grandchild dies with the watchdog kill; without the switch it survives
+        # -- that IS the old wrapper-launch failure (renderdoc README 3.2), and it is what
+        # run-bounded.test.ps1 asserts in both directions.
+        $grandchildSpec = "-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 90"
+        $childCommand = "`$grandchild = Start-Process -FilePath '{0}' -ArgumentList @('{1}') -PassThru; Write-Output ('GRANDCHILD_PID=' + `$grandchild.Id); Start-Sleep -Seconds 120" -f $hostExe, $grandchildSpec
+        $treeArgs = @('-NoProfile', '-NonInteractive', '-Command', $childCommand)
+        return [pscustomobject]@{ exe = $hostExe; args = $treeArgs; note = 'dry-run tree child (PowerShell sleeping + one grandchild sleeper, NOT a JVM)' }
+    }
     if ($DryRunScenario -eq 'timeout') { $sleepSeconds = 120 }
     elseif ($DryRunScenario -eq 'stall') { $sleepSeconds = 120 }
     elseif ($DryRunScenario -eq 'orphan') { $sleepSeconds = 30 }
@@ -373,7 +484,16 @@ function Invoke-BoundedInstance {
     }
     $wallSeconds = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
     $killPerformed = $false
+    $treeKill = $null
     if ($outcome -eq 'timeout-killed' -or $outcome -eq 'stall-killed') {
+        # OPT-IN (-KillProcessTree): take the descendants FIRST, while our own pid is still alive, so the
+        # ancestry is unambiguous; then the root itself. A wrapper launch (renderdoccmd.exe, *.bat shims)
+        # otherwise leaves the real client alive -- see the HARD CAPS note in the header.
+        if ($KillProcessTree) {
+            $treeKill = Stop-ProcessTree -RootProcessId $childPid -ExcludePattern $KillProcessTreeExcludePattern -ExcludeProcessIds @($PID)
+            foreach ($killedItem in @($treeKill.killed)) { Add-Finding ('kill tree: killed {0}' -f $killedItem) }
+            foreach ($skippedItem in @($treeKill.skipped)) { Add-Finding ('kill tree: skipped {0}' -f $skippedItem) }
+        }
         try {
             Stop-Process -Id $childPid -Force -ErrorAction Stop
             $killPerformed = $true
@@ -389,6 +509,7 @@ function Invoke-BoundedInstance {
         killPerformed = $killPerformed; wallSeconds = $wallSeconds
         peakCpuPct = [math]::Round($peakCpuPct, 1); peakMemoryMB = [math]::Round($peakMemoryMB, 1)
         exitCode = $exitCode; window = $geometry; cursorRestore = $cursorRestore; startedAt = $startedAt.ToString('s')
+        treeKill = $treeKill
         stdoutFile = $outFile; stderrFile = $errFile
         effectiveArgs = $effectiveArgs
     }
@@ -667,11 +788,33 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Write-Output ('  audit: target[{0}] orphans={1} preexistingExcluded={2} unattributedExcluded={3} foreignMemGrowthMB={4} foreignCpuSec={5} cpuRecovered={6} memRecovered={7} ok={8}' -f $audit.targetCheck, $audit.orphanCount, $audit.preexistingExcluded, $audit.unattributedExcluded, $audit.foreignMemGrowthMB, $audit.foreignCpuSec, $audit.cpuRecovered, $audit.memoryRecovered, $audit.ok)
     foreach ($problem in @($audit.problems)) { Write-Output ('  problem: {0}' -f $problem) }
     foreach ($advisory in @($audit.advisories)) { Write-Output ('  note: {0}' -f $advisory) }
+    # DISCOVERABILITY: an opt-in nobody knows about is an opt-in nobody uses. Whenever the audit saw a
+    # process survive (the target itself, or an orphan-name match), say what to do about it -- and put
+    # the same sentence in the evidence JSON, which is the interface.
+    $leftoversDetected = ((-not $audit.targetGone) -or ($audit.orphanCount -gt 0))
+    $leftoverHint = ''
+    if ($leftoversDetected -and -not $KillProcessTree) {
+        $leftoverHint = 'this round left process(es) behind; next round add -KillProcessTree so the instance''s whole process tree is killed (a wrapper launch leaves the real client alive otherwise)'
+    } elseif ($leftoversDetected -and $KillProcessTree) {
+        $leftoverHint = 'this round left process(es) behind even though -KillProcessTree was set; a descendant is probably outside our pid''s ancestry (a detached Gradle daemon, or a re-parented child) -- check it by hand'
+    }
+    if ($leftoverHint.Length -gt 0) {
+        Write-Output ('  hint: {0}' -f $leftoverHint)
+        Add-Finding ('leftover hint: {0}' -f $leftoverHint)
+    }
+    $audit | Add-Member -NotePropertyName leftoversDetected -NotePropertyValue $leftoversDetected -Force
+    $audit | Add-Member -NotePropertyName leftoverHint -NotePropertyValue $leftoverHint -Force
     if ($record.outcome -eq 'timeout-killed') { $verdict = 'FAIL:instance-timeout'; $finalExit = $EXIT_INSTANCE_TIMEOUT }
     elseif ($record.outcome -eq 'stall-killed') { $verdict = 'FAIL:instance-stall'; $finalExit = $EXIT_INSTANCE_STALL }
     if (-not $audit.ok) {
         # clean up only OUR pid (never a general process sweep), then report the failure
         if ($record.pid -gt 0 -and (Test-ProcessAlive -ProcessId $record.pid)) {
+            if ($KillProcessTree) {
+                # the root is still alive, so the ancestry is still unambiguous: take the descendants too
+                $cleanupTree = Stop-ProcessTree -RootProcessId $record.pid -ExcludePattern $KillProcessTreeExcludePattern -ExcludeProcessIds @($PID)
+                foreach ($killedItem in @($cleanupTree.killed)) { Write-Output ('  cleanup: killed descendant {0}' -f $killedItem) }
+                foreach ($skippedItem in @($cleanupTree.skipped)) { Write-Output ('  cleanup: skipped descendant {0}' -f $skippedItem) }
+            }
             try { Stop-Process -Id $record.pid -Force -ErrorAction Stop; Write-Output ('  cleanup: killed our own leftover pid {0}' -f $record.pid) } catch { Write-Output ('  cleanup FAILED for pid {0}: {1}' -f $record.pid, $_.Exception.Message) }
         }
         if ($verdict -eq 'PASS') { $verdict = 'FAIL:post-run-audit' }

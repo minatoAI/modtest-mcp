@@ -105,6 +105,23 @@ function Test-HasProperty {
     return ($null -ne $Object.PSObject.Properties[$Name])
 }
 
+function Get-GrandchildPid {
+    # The `tree` dry-run child prints GRANDCHILD_PID=<n> on ITS stdout, which the runner redirects to
+    # the per-instance out file (recorded as instances[0].stdoutFile).
+    param([object]$Run)
+    if ($null -eq $Run.json) { return -1 }
+    $outPath = [string]$Run.json.instances[0].stdoutFile
+    if ($outPath.Length -eq 0 -or -not (Test-Path -LiteralPath $outPath)) { return -1 }
+    $body = Get-Content -LiteralPath $outPath -Raw
+    if ($body -match 'GRANDCHILD_PID=(\d+)') { return [int]$Matches[1] }
+    return -1
+}
+
+function Test-ProcessAlive([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    return ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue))
+}
+
 Write-Output ('RUN-BOUNDED-TEST runner=' + $Runner)
 Write-Output ('RUN-BOUNDED-TEST evidenceRoot=' + $testRoot)
 
@@ -196,9 +213,52 @@ if ($null -ne $runOrphan.json) {
     Add-Check 'orphan/audit.targetGone=false (the alive-but-reported-exited child was caught)' ([bool]$audit.targetGone -eq $false)
     $problemsText = (@($audit.problems) -join ' | ')
     Add-Check 'orphan/audit names the surviving target pid' ($problemsText -match 'still alive') ('problems=' + $problemsText)
+    Add-Check 'orphan/audit.leftoversDetected=true' ([bool]$audit.leftoversDetected)
+    Add-Check 'orphan/audit.leftoverHint points at -KillProcessTree' ((Test-HasProperty $audit 'leftoverHint') -and ([string]$audit.leftoverHint -match '-KillProcessTree')) ('hint=' + $audit.leftoverHint)
+    Add-Check 'orphan/stdout prints the hint (discoverability)' ($runOrphan.stdout -match 'hint:')
 } else {
     Add-Check 'orphan/summary parsed' $false 'no run-bounded-*.json in the evidence dir'
 }
+
+# ---------------------------------------------------------------- 6. tree (descendant kill)
+# The negative control for -KillProcessTree, in both directions and WITHOUT a game client:
+#   (a) no switch  -> the grandchild the child spawned SURVIVES  == the old wrapper-launch failure
+#                     (measured for real on 2026-09-25 with renderdoccmd.exe; renderdoc README 3.2)
+#   (b) -KillProcessTree -> the same grandchild is DEAD and the kill is recorded in the evidence
+Write-Output '--- scenario tree, WITHOUT -KillProcessTree (expect the grandchild to survive) ---'
+$runTreeOld = Invoke-DryScenario -Scenario 'tree' -ExtraArgs @('-PerInstanceTimeoutSec', '6')
+$grandchildOld = Get-GrandchildPid -Run $runTreeOld
+Add-Check 'tree/child printed GRANDCHILD_PID' ($grandchildOld -gt 0)
+Add-Check 'tree/WITHOUT the switch the grandchild survives (the old wrapper-launch failure)' (Test-ProcessAlive -ProcessId $grandchildOld) ('pid=' + $grandchildOld)
+
+# clean up the survivor we deliberately created (only the pid we spawned, then prove it is gone)
+if (Test-ProcessAlive -ProcessId $grandchildOld) {
+    try { Stop-Process -Id $grandchildOld -Force -ErrorAction Stop } catch { }
+    Start-Sleep -Milliseconds 500
+}
+Add-Check 'tree/survivor cleaned up by the test itself' (-not (Test-ProcessAlive -ProcessId $grandchildOld)) ('pid=' + $grandchildOld)
+
+Write-Output '--- scenario tree, WITH -KillProcessTree (expect the grandchild to die) ---'
+$runTreeNew = Invoke-DryScenario -Scenario 'tree' -ExtraArgs @('-PerInstanceTimeoutSec', '6', '-KillProcessTree')
+$grandchildNew = Get-GrandchildPid -Run $runTreeNew
+Add-Check 'tree/child printed GRANDCHILD_PID (2nd run)' ($grandchildNew -gt 0)
+# NOT vacuous: require that a grandchild really existed AND is gone. Without the "> 0" conjunct this
+# check would pass on any runner that never created a grandchild at all (a false green).
+Add-Check 'tree/WITH the switch the grandchild is dead' (($grandchildNew -gt 0) -and (-not (Test-ProcessAlive -ProcessId $grandchildNew))) ('pid=' + $grandchildNew)
+Add-Check 'tree/exit=4 (the instance still hit the per-instance cap)' ($runTreeNew.exit -eq 4) ('exit=' + $runTreeNew.exit)
+if ($null -ne $runTreeNew.json) {
+    $treeKill = $runTreeNew.json.instances[0].treeKill
+    Add-Check 'tree/treeKill recorded in the evidence' ((Test-HasProperty $runTreeNew.json.instances[0] 'treeKill') -and ($null -ne $treeKill))
+    if ($null -ne $treeKill) {
+        Add-Check 'tree/treeKill.descendantCount>=1' ([int]$treeKill.descendantCount -ge 1) ('count=' + $treeKill.descendantCount)
+        Add-Check 'tree/treeKill.killed names the grandchild pid' ((@($treeKill.killed) -join ' | ') -match ('pid=' + $grandchildNew)) ('killed=' + (@($treeKill.killed) -join ' | '))
+    }
+    Add-Check 'tree/finding records the tree kill' ((@($runTreeNew.json.findings) -join ' | ') -match 'kill tree: killed')
+} else {
+    Add-Check 'tree/summary parsed' $false 'no run-bounded-*.json in the evidence dir'
+}
+# never leave a stray sleeper behind even if an assertion above failed
+if (Test-ProcessAlive -ProcessId $grandchildNew) { try { Stop-Process -Id $grandchildNew -Force -ErrorAction Stop } catch { } }
 
 # ---------------------------------------------------------------- result
 if (-not $KeepEvidence) {

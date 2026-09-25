@@ -34,6 +34,8 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (79 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, **per-round outputs never clobber**, **the round restore is unconditional and fails loudly** — all driven through a stub harness whose exit code is configurable, so no JVM is ever started; `-OldRunner` enables the single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
 | `post-round-gates.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.ps1 -ShadersDir <gameDir>\patched_shaders -Evidence <ev>\gates [-Require ...] [-RequireRestore -RoundEvidence <ev>]` → `GATES_VERDICT=PASS\|FAIL` — runs the offline shader gates (injection audit + glslang compile) as one step, **plus a restore gate**: `-RequireRestore -RoundEvidence <ev>` asserts the round's `round-setup\restore-report.txt` exists and says `ROUND_RESTORE=OK`, else FAIL. Without `-RoundEvidence` the restore gate is **skipped and says so** (shader-only callers keep working); with `-RequireRestore` but no evidence it FAILs, so "forgot the flag" cannot pass |
 | `post-round-gates.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.test.ps1` → `POST-ROUND-GATES-TEST PASS (12 checks)` — offline (~1 s, shader gates switched off): the restore gate's four verdicts (skipped/required-without-evidence/missing report/`ROUND_RESTORE=FAIL`) and the recorded per-file line count |
+| `verify-parallel-restore.ps1` | PowerShell 5.1 / 7 | `pwsh tools/verify-parallel-restore.ps1 -RoundEvidence <evA>,<evB> [-ExpectSlots A,B] [-Evidence <dir>]` → `PARALLEL_RESTORE_VERDICT=PASS|FAIL` — one command for "did every slot of that parallel round give its game directory back?": per round it checks **provenance** (`round-setup\setup-manifest.txt` exists ⇒ the round went through `run-round.ps1` at all), the **recorded verdict** (`ROUND_RESTORE=OK` + one `[restore]` line per file), and then **re-verifies independently** by hashing every live game-directory file against its `*.orig` backup **now** (the report says what the round did; this says what the disk looks like). Two rounds claiming the same slot FAIL. `-RoundEvidence` accepts a comma-separated list because a second bare value would bind to the next positional parameter. |
+| `verify-parallel-restore.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/verify-parallel-restore.test.ps1` → `VERIFY-PARALLEL-RESTORE-TEST PASS (13 checks)` — offline: the healthy two-slot case, the bypass case (no `round-setup\`), a report without `ROUND_RESTORE=OK`, a live file that no longer matches its backup, a duplicated slot, a missing `-ExpectSlots` entry, and the "no backup to compare against" case |
 
 ## Conventions
 
@@ -324,7 +326,7 @@ the game directory. That is what happened on the 2026-09-27 task-30 parallel run
   `run-round.ps1 -Evidence <ev>\B -Slot B -InstanceSignature <gameDirB>` (task-39 forwards both);
 - the bypass is now a **machine-checkable** evidence failure rather than a convention:
   `post-round-gates.ps1 -RequireRestore -RoundEvidence <ev>` FAILs when that round has no
-  `round-setup\restore-report.txt` or no `ROUND_RESTORE=OK` in it.
+  `round-setup\restore-report.txt` or no `ROUND_RESTORE=OK` in it. For the two-slot hand-off use `tools/verify-parallel-restore.ps1 -RoundEvidence <evA>,<evB> -ExpectSlots A,B`: one command that checks both slots' `ROUND_RESTORE` **and** re-hashes their live files against the `*.orig` backups.
 
 ### Per-round outputs (task-38)
 
@@ -342,9 +344,22 @@ verdict became permanently unreferenceable** (measured on `2026-09-27-a2-doublei
    and prints one `conflict:` line per file, plus how to proceed. It writes nothing in that case, so a
    previous round's evidence stays byte-identical. A reused `-RunTag` is refused the same way, and a tag
    that is not a plain directory name (path separators, `.`, `..`) is rejected.
-4. **An untagged single round stays byte-identical to what earlier rounds produced** — only a tagged
-   round adds a `runTag=` line to its manifest. `run-round.test.ps1 -OldRunner <pre-change script>`
-   proves this by running both versions and comparing the outputs field by field.
+4. **An untagged single round keeps the same evidence LAYOUT and file names** — `round-setup\` with the
+   same six names, and no per-tag subdirectory. That is the strongest honest claim: the **preflight stdout
+   is NOT byte-identical**, because this change added `[round] instanceSignature=… slot=…` and one more key
+   to the `harnessArgv` JSON (13,344 → 13,589 characters when R4 measured it on 2026-09-26).
+   `run-round.test.ps1 -OldRunner <pre-change script>` compares the two versions field by field instead of
+   pretending the bytes are unchanged.
+
+   ⚠️ **Intentional behaviour change worth knowing**: re-running the SAME evidence root used to overwrite
+   (the common "retry after a failure" habit) and now **exits 2**. Either give each attempt its own
+   `-Evidence` subdirectory or pass `-RunTag`. Covered **at runtime without a JVM**: the clobber check runs
+   *before* the java guard, and the F group asserts exactly this case —
+   `F1 a SECOND round in the same evidence root REFUSES (exit 2) -- the retry-after-failure case`,
+   `F2 …FAIL:outputs-exist`,
+   `F3 …names EACH existing output`, `F4 …says how to proceed`, `F5 …byte-identical after the refusal`
+   (the "previous round" is built as files, so nothing has to launch). Observed directly: on a run with a
+   java process present the D group SKIPPED while F1–F10 all PASSED.
 
 ⚠️ **The archived `run-round.ps1` copies under `docs/evidence/**` are FROZEN HISTORY** — they are the
 bytes that actually ran. Do not edit them, and do not back-fill this change into them. The live copy is

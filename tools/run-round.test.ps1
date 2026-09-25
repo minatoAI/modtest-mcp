@@ -507,7 +507,7 @@ foreach ($fixtureName in @('residue-before.txt', 'setup-manifest.txt', 'restore-
 }
 $shasFixture = Get-TreeShas -Directory $setupF
 $f1 = Invoke-Round -Script $RoundRunner -EvidenceDir $evF
-Add-Check 'F1 existing outputs make an untagged round REFUSE (exit 2)' ($f1.exit -eq 2) ('exit=' + $f1.exit)
+Add-Check 'F1 a SECOND round in the same evidence root REFUSES (exit 2) -- the retry-after-failure case' ($f1.exit -eq 2) ('exit=' + $f1.exit)
 Add-Check 'F2 it reports ROUND_PREFLIGHT=FAIL:outputs-exist' ($f1.stdout -match 'ROUND_PREFLIGHT=FAIL:outputs-exist')
 Add-Check 'F3 it names EACH existing output' (($f1.stdout -match 'conflict: .*residue-before\.txt') -and ($f1.stdout -match 'conflict: .*setup-manifest\.txt') -and ($f1.stdout -match 'conflict: .*restore-report\.txt'))
 Add-Check 'F4 it says how to proceed (-RunTag or a subdirectory)' (($f1.stdout -match '\-RunTag') -and ($f1.stdout -match 'subdirectory'))

@@ -73,15 +73,22 @@ function Add-Check {
 
 function Invoke-DryScenario {
     # Runs one -DryRun scenario in its own evidence directory and returns exit code + parsed summary.
-    param([string]$Scenario, [string[]]$ExtraArgs = @())
-    $directory = Join-Path $testRoot $Scenario
+    # -DirectoryName lets a caller run the SAME scenario twice without sharing an evidence directory
+    # (the scenario name itself must stay in the runner's ValidateSet). -BlockingNames / -OrphanNames let
+    # a scenario observe real peer processes; routing them through here avoids passing the same parameter
+    # twice, which PowerShell refuses to bind at all.
+    param([string]$Scenario, [string[]]$ExtraArgs = @(), [string]$DirectoryName = '', [string]$BlockingNames = '', [string]$OrphanNames = '')
+    $dirName = if ($DirectoryName.Length -gt 0) { $DirectoryName } else { $Scenario }
+    $directory = Join-Path $testRoot $dirName
+    $effectiveBlockingNames = if ($BlockingNames.Length -gt 0) { $BlockingNames } else { $NO_SUCH_PROCESS }
+    $effectiveOrphanNames = if ($OrphanNames.Length -gt 0) { $OrphanNames } else { $NO_SUCH_PROCESS }
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     $argv = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', $Scenario,
         '-EvidenceDir', $directory, '-PollSeconds', '1',
         # machine independence: never REFUSE because somebody else's JVM is up, and never judge
         # CPU/memory recovery on a shared machine.
-        '-BlockingProcessNames', $NO_SUCH_PROCESS, '-BlockingWindowTitlePattern', '',
-        '-OrphanProcessNames', $NO_SUCH_PROCESS,
+        '-BlockingProcessNames', $effectiveBlockingNames, '-BlockingWindowTitlePattern', '',
+        '-OrphanProcessNames', $effectiveOrphanNames,
         '-CpuRecoveryTolerancePct', '1000', '-MemoryRecoveryToleranceMB', '1000000')
     $argv += $ExtraArgs
     $stdout = @(& pwsh @argv 2>&1 | ForEach-Object { [string]$_ })
@@ -418,6 +425,105 @@ Add-Check 'window/Get-WindowGeometry found in the runner source' ($geometryBody.
 Add-Check 'window/it records the pid it was asked about' ($geometryBody -match 'pid = \$ProcessId')
 Add-Check 'window/it takes the handle from that pid (not from a title search)' ($geometryBody -match 'handle = \[long\]\$live\.MainWindowHandle')
 Add-Check 'window/it never selects a window by title' (-not ($geometryBody -match 'MainWindowTitle\s+-match'))
+
+# ---------------------------------------------------------------- 9. prefix sibling slots (task-39)
+# The real two-slot run (task-30) exposed this: slot A's directory
+#   ...\versions\1.20.1-Forge        (A)
+#   ...\versions\1.20.1-Forge-B      (B)   <- B's path STARTS WITH A's
+# The scope decision used to be a SUBSTRING test, so with A's signature the guard counted B as ours
+# (inScope=2, outOfScope=0) and the post-run audit attributed B's LIVE client to A - giving A a FALSE
+# FAIL:post-run-audit (exit 7) even though A's own instance had exited cleanly (kill=False).
+# Renaming the slot does not help -- B still starts with A -- so the match has to be EXACT: the parsed
+# --gameDir values must be equal. These controls use real peer processes whose command lines carry
+# --gameDir values; they are started HIDDEN, so no window appears and focus is never stolen.
+Write-Output '--- prefix sibling slots must not be attributed to each other (task-39) ---'
+$powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$slotA = Join-Path $testRoot 'slots\1.20.1-Forge'
+$slotB = Join-Path $testRoot 'slots\1.20.1-Forge-B'
+$slotPeerSleeper = Join-Path $testRoot 'slot-peer-sleeper.ps1'
+$slotPeerLauncher = Join-Path $testRoot 'slot-peer-launcher.ps1'
+Set-Content -LiteralPath $slotPeerSleeper -Value 'Start-Sleep -Seconds 90' -Encoding UTF8
+Set-Content -LiteralPath $slotPeerLauncher -Encoding UTF8 -Value @'
+param([string]$Exe, [string]$Sleeper, [string]$GameDir, [int]$DelaySeconds = 3)
+Start-Sleep -Seconds $DelaySeconds
+if (Test-Path -LiteralPath $Exe) {
+    Start-Process -FilePath $Exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Sleeper, '--gameDir', $GameDir) | Out-Null
+}
+'@
+function Start-SlotPeer {
+    # A hidden Windows PowerShell process carrying `--gameDir <path>`: it stands in for another slot's
+    # java client without starting a JVM. Its name is `powershell` while the harness runs as `pwsh`, so
+    # the harness can never match its own command line (the self-match trap documented in the README).
+    param([string]$GameDir)
+    if (-not (Test-Path -LiteralPath $powershellExe)) { return $null }
+    return Start-Process -FilePath $powershellExe -WindowStyle Hidden -PassThru -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $slotPeerSleeper, '--gameDir', $GameDir)
+}
+function Stop-SlotPeerByGameDir([string]$GameDir) {
+    foreach ($peer in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)) {
+        if ([string]$peer.CommandLine -like ('*--gameDir*' + $GameDir + '*')) {
+            try { Stop-Process -Id ([int]$peer.ProcessId) -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+}
+$peerB = $null
+$peerA = $null
+try {
+    if (-not (Test-Path -LiteralPath $powershellExe)) {
+        Add-Check 'prefix sibling/a hidden peer process can be started' $false ('not found: ' + $powershellExe)
+    } else {
+        # ---- T1: only the SIBLING (B) is up. A's signature must not claim it, so the round proceeds.
+        $peerB = Start-SlotPeer -GameDir $slotB
+        Start-Sleep -Seconds 3
+        $runT1 = Invoke-DryScenario -Scenario 'ok' -DirectoryName 'scope-prefix-unrelated' -BlockingNames 'powershell' -OrphanNames 'powershell' -ExtraArgs @(
+            '-InstanceSignature', $slotA)
+        Add-Check 'prefix sibling/T1 a prefix-sibling slot does NOT block (exit 0)' ($runT1.exit -eq 0) ('exit=' + $runT1.exit)
+        Add-Check 'prefix sibling/T1 scope line records inScope=0 with outOfScope>=1' ($runT1.stdout -match 'inScope=0 outOfScope=[1-9]') (($runT1.stdout -split "`n") | Where-Object { $_ -match 'scope:' })
+        Add-Check 'prefix sibling/T1 no refusal was printed' (-not ($runT1.stdout -match 'REFUSING TO START'))
+        Add-Check 'prefix sibling/T1 the round then ran normally (verdict PASS)' ($runT1.stdout -match 'VERDICT=PASS')
+
+        # ---- T2: our OWN slot (A) is up as well. It must still block, and B must stay out-of-scope.
+        $peerA = Start-SlotPeer -GameDir $slotA
+        Start-Sleep -Seconds 3
+        $runT2 = Invoke-DryScenario -Scenario 'ok' -DirectoryName 'scope-prefix-same' -BlockingNames 'powershell' -OrphanNames 'powershell' -ExtraArgs @(
+            '-InstanceSignature', $slotA)
+        Add-Check 'prefix sibling/T2 the SAME slot is still refused (exit 3)' ($runT2.exit -eq 3) ('exit=' + $runT2.exit)
+        Add-Check 'prefix sibling/T2 inScope is exactly 1 (our slot) and B is out-of-scope' ($runT2.stdout -match 'inScope=1 outOfScope=[1-9]') (($runT2.stdout -split "`n") | Where-Object { $_ -match 'scope:' })
+        Add-Check 'prefix sibling/T2 the refusal names an in-scope pid' ($runT2.stdout -match 'REFUSING TO START: pid=')
+        Add-Check 'prefix sibling/T2 the sibling is reported as NOT BLOCKING' ($runT2.stdout -match 'NOT BLOCKING:')
+    }
+} finally {
+    foreach ($peer in @($peerB, $peerA)) {
+        if ($null -ne $peer) { try { if (-not $peer.HasExited) { Stop-Process -Id $peer.Id -Force -ErrorAction SilentlyContinue } } catch { } }
+    }
+    Stop-SlotPeerByGameDir $slotA
+    Stop-SlotPeerByGameDir $slotB
+}
+
+# ---- T3: the POST-RUN AUDIT must not report the sibling slot's client as our orphan. The sibling has to
+# appear AFTER the baseline snapshot, so a detached launcher starts it a few seconds into the round.
+if (-not (Test-Path -LiteralPath $powershellExe)) {
+    Add-Check 'prefix sibling/T3 (skipped: no powershell.exe)' $false 'powershell.exe not found'
+} else {
+    try {
+        $launcher = Start-Process -FilePath (Get-Process -Id $PID).Path -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-NoProfile', '-File', $slotPeerLauncher, $powershellExe, $slotPeerSleeper, $slotB, '3')
+        $runT3 = Invoke-DryScenario -Scenario 'ok' -DirectoryName 'scope-prefix-audit' -OrphanNames 'powershell' -ExtraArgs @(
+            '-InstanceSignature', $slotA, '-PerInstanceTimeoutSec', '20')
+        Add-Check 'prefix sibling/T3 the round still PASSes (no false post-run-audit FAIL)' (($runT3.exit -eq 0) -and ($runT3.stdout -match 'VERDICT=PASS')) ('exit=' + $runT3.exit)
+        $t3audit = $null
+        if ($null -ne $runT3.json) { $t3audit = $runT3.json.instances[0].audit }
+        # Anti-vacuity: the sibling MUST have been seen by the audit as a new foreign process (if the
+        # launcher was too slow, unattributedExcluded stays 0 and this check fails rather than passing
+        # for the wrong reason).
+        Add-Check 'prefix sibling/T3 the sibling WAS seen and excluded as foreign (unattributedExcluded=1)' (($null -ne $t3audit) -and ([int]$t3audit.unattributedExcluded -eq 1)) ('unattributed=' + $(if ($null -ne $t3audit) { [int]$t3audit.unattributedExcluded } else { '<no audit>' }))
+        Add-Check 'prefix sibling/T3 it was NOT counted as our orphan' (($null -ne $t3audit) -and ([int]$t3audit.orphanCount -eq 0)) ('orphans=' + $(if ($null -ne $t3audit) { [int]$t3audit.orphanCount } else { '<no audit>' }))
+        Add-Check 'prefix sibling/T3 audit.ok stays true' (($null -ne $t3audit) -and ([bool]$t3audit.ok))
+    } finally {
+        try { if ($null -ne $launcher -and -not $launcher.HasExited) { Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue } } catch { }
+        Stop-SlotPeerByGameDir $slotB
+    }
+}
 
 # ---------------------------------------------------------------- result
 if (-not $KeepEvidence) {

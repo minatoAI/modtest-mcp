@@ -88,7 +88,14 @@ param(
     # stays byte-identical to what earlier rounds produced. When set, those files go into
     # round-setup\<tag>\ instead -- which is how two rounds share one -Evidence root without
     # overwriting each other. See the clobber check below for why this is not just tidiness.
-    [string]$RunTag = ''
+    [string]$RunTag = '',
+    # Forwarded to run-bounded.ps1 so the round is scoped to ITS OWN instance (task-39 defect 2). Without
+    # this passthrough the DOCUMENTED entry point could not be used in parallel at all: the bounded
+    # runner's guard stayed FAIL-CLOSED and refused with "java/javaw already running" (exit 5) as soon as
+    # another slot's client was up. The instance signature defaults to the gameDir parsed out of
+    # launch-args.json; -Slot only names the slot (banner + evidence filename when explicitly given).
+    [string]$Slot = '',
+    [string]$InstanceSignature = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -170,12 +177,21 @@ $harnessParameters = @{
     VerifyWindow               = $true
     BlockingWindowTitlePattern = $BlockingWindowTitlePattern
 }
+# Scope this round to ITS OWN instance so parallel slots never refuse each other (task-39 defect 2). The
+# default is the gameDir from launch-args.json -- the value run-bounded.ps1 would derive from --gameDir
+# anyway, but passed EXPLICITLY so the documented entry point and the built-in guard cannot drift apart.
+# -Slot is forwarded only when given, so default evidence file names stay byte-identical.
+$effectiveInstanceSignature = $InstanceSignature
+if ($effectiveInstanceSignature.Length -eq 0) { $effectiveInstanceSignature = $gameDir }
+$harnessParameters['InstanceSignature'] = $effectiveInstanceSignature
+if ($Slot.Length -gt 0) { $harnessParameters['Slot'] = $Slot }
 if ($RestoreCursor) { $harnessParameters['RestoreCursor'] = $true }
 
 Write-Output ('[round] java={0}' -f $launch.java)
 Write-Output ('[round] gameDir={0} args={1} timeoutSec={2}' -f $gameDir, $argumentList.Count, $TimeoutSec)
 Write-Output ('[round] harnessPath=' + $HarnessPath)
 Write-Output ('[round] harnessExists=' + $harnessExists)
+Write-Output ('[round] instanceSignature=' + $effectiveInstanceSignature + ' slot=' + $(if ($Slot.Length -gt 0) { $Slot } else { '<default: gameDir leaf>' }))
 
 if ($PreflightOnly) {
     # READ-ONLY: no residue cleanup, no options.txt / toml / oculus edits, no process launched.

@@ -282,7 +282,8 @@ $stubHarness = Join-Path $tempRoot 'stub-harness-bounded.ps1'
 param(
     [string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [string]$OptionsFile,
     [int]$PerInstanceTimeoutSec, [int]$MaxInstances, [string]$EvidenceDir,
-    [switch]$Windowed, [switch]$VerifyWindow, [string]$BlockingWindowTitlePattern, [switch]$RestoreCursor
+    [switch]$Windowed, [switch]$VerifyWindow, [string]$BlockingWindowTitlePattern, [switch]$RestoreCursor,
+    [string]$Slot, [string]$InstanceSignature
 )
 Write-Output 'STUB-HARNESS: nothing launched'
 exit 0
@@ -441,6 +442,81 @@ if ($OldRunner.Length -eq 0) {
     Add-Check 'D6 every stable manifest field has the same value' (($stableOld.Count -gt 0) -and ($mismatch.Count -eq 0)) ('differing=' + ($mismatch -join ','))
     Add-Check 'D6 no per-tag subdirectory is created without -RunTag' (-not (Test-Path -LiteralPath (Join-Path $evNew 'round-setup\t1')))
 }
+
+# ---------------------------------------------------------------- (F) clobber rules, deterministically
+Write-Output '--- F. output-clobber rules (file fixtures, so they run even on a busy machine) ---'
+# The D group proves these rules with REAL rounds, which needs a machine with no java/javaw (run-round.ps1
+# rightly refuses to start otherwise). These checks build the same situations out of files instead, so the
+# refusal rules are verified on EVERY run: the more important a property, the less it should depend on
+# luck with a shared machine. Ordering matters and is what makes this possible -- the clobber check runs
+# BEFORE the java guard, so a refusal here is deterministic.
+$evF = Join-Path $tempRoot 'ev-fixture'
+New-FakeEvidence -Directory $evF -GameDirectory (Join-Path $tempRoot 'game-fixture')
+New-FakeGameDir -Directory (Join-Path $tempRoot 'game-fixture')
+$setupF = Join-Path $evF 'round-setup'
+New-Item -ItemType Directory -Force -Path $setupF | Out-Null
+foreach ($fixtureName in @('residue-before.txt', 'setup-manifest.txt', 'restore-report.txt')) {
+    Set-Content -LiteralPath (Join-Path $setupF $fixtureName) -Value ('previous-round fixture: ' + $fixtureName) -Encoding UTF8
+}
+$shasFixture = Get-TreeShas -Directory $setupF
+$f1 = Invoke-Round -Script $RoundRunner -EvidenceDir $evF
+Add-Check 'F1 existing outputs make an untagged round REFUSE (exit 2)' ($f1.exit -eq 2) ('exit=' + $f1.exit)
+Add-Check 'F2 it reports ROUND_PREFLIGHT=FAIL:outputs-exist' ($f1.stdout -match 'ROUND_PREFLIGHT=FAIL:outputs-exist')
+Add-Check 'F3 it names EACH existing output' (($f1.stdout -match 'conflict: .*residue-before\.txt') -and ($f1.stdout -match 'conflict: .*setup-manifest\.txt') -and ($f1.stdout -match 'conflict: .*restore-report\.txt'))
+Add-Check 'F4 it says how to proceed (-RunTag or a subdirectory)' (($f1.stdout -match '\-RunTag') -and ($f1.stdout -match 'subdirectory'))
+$shasAfterF1 = Get-TreeShas -Directory $setupF
+Add-Check 'F5 the existing outputs are byte-identical after the refusal' (($shasFixture.Count -eq $shasAfterF1.Count) -and (@($shasFixture.Keys | Where-Object { $shasAfterF1[$_] -ne $shasFixture[$_] }).Count -eq 0)) ('files=' + $shasFixture.Count)
+# A tag directory that already exists is refused even when EMPTY: a reused tag means a reused name.
+New-Item -ItemType Directory -Force -Path (Join-Path $setupF 't1') | Out-Null
+$f2 = Invoke-Round -Script $RoundRunner -EvidenceDir $evF -ExtraArgs @('-RunTag', 't1')
+Add-Check 'F6 an existing -RunTag directory is refused (exit 2, no silent reuse)' (($f2.exit -eq 2) -and ($f2.stdout -match 'ROUND_PREFLIGHT=FAIL:run-tag-exists')) ('exit=' + $f2.exit)
+$f3 = Invoke-Round -Script $RoundRunner -EvidenceDir $evF -ExtraArgs @('-RunTag', '..\escape')
+Add-Check 'F7 a path-like -RunTag is rejected before anything is written' (($f3.exit -eq 2) -and ($f3.stdout -match 'ROUND_PREFLIGHT=FAIL:bad-run-tag')) ('exit=' + $f3.exit)
+Add-Check 'F8 the rejected tag wrote nothing outside the evidence root' (-not (Test-Path -LiteralPath (Join-Path $evF 'escape')))
+# Preflight must WARN about the same condition while staying read-only and keeping its exit codes.
+$shasBeforePreflight = Get-TreeShas -Directory $setupF
+$f4 = @(& pwsh -NoProfile -File $RoundRunner -Evidence $evF -PreflightOnly -HarnessPath $stubHarness 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+$exitF4 = $LASTEXITCODE
+Add-Check 'F9 preflight still exits 0 and warns that a real round would refuse' (($exitF4 -eq 0) -and ($f4 -match 'a real round would REFUSE')) ('exit=' + $exitF4)
+$shasAfterPreflight = Get-TreeShas -Directory $setupF
+Add-Check 'F10 preflight changed nothing under round-setup\' (($shasBeforePreflight.Count -eq $shasAfterPreflight.Count) -and (@($shasBeforePreflight.Keys | Where-Object { $shasAfterPreflight[$_] -ne $shasBeforePreflight[$_] }).Count -eq 0))
+
+# ---------------------------------------------------------------- (E) parallel scope passthrough
+Write-Output '--- E. -Slot / -InstanceSignature reach the bounded runner ---'
+# task-39 defect 2: the ability to scope a round to its own instance existed in run-bounded.ps1, but the
+# DOCUMENTED entry point did not pass it on, so a second slot was refused by the FAIL-CLOSED guard
+# ("java/javaw already running", exit 5). These checks pin the passthrough; preflight is read-only, so
+# they run anywhere and the JSON it prints is the harness argv that a real round would use.
+$evE = Join-Path $tempRoot 'ev-passthrough'
+$gameDirE = Join-Path $tempRoot 'slots\1.20.1-Forge-B'
+New-FakeEvidence -Directory $evE -GameDirectory $gameDirE
+$argvE = @('-NoProfile', '-File', $RoundRunner, '-Evidence', $evE, '-PreflightOnly', '-HarnessPath', $overrideStub)
+$outE = @(& pwsh @argvE 2>&1 | ForEach-Object { [string]$_ })
+$exitE = $LASTEXITCODE
+$textE = $outE -join "`n"
+$argvJsonDefault = ''
+if ($textE -match '(?m)^\[round\] harnessArgv=(.+)$') { $argvJsonDefault = $Matches[1].Trim() }
+# Assert on the PARSED argv, not on a regex over the raw JSON: the JSON escapes backslashes, which made
+# a naive path match fail even though the value was correct.
+$parsedDefault = $null
+if ($argvJsonDefault.Length -gt 0) { try { $parsedDefault = $argvJsonDefault | ConvertFrom-Json } catch { $parsedDefault = $null } }
+Add-Check 'E1 preflight with the new parameters still exits 0 (read-only)' ($exitE -eq 0) ('exit=' + $exitE)
+Add-Check 'E2 without -Slot the signature defaults to the gameDir from launch-args.json' (($null -ne $parsedDefault) -and ([string]$parsedDefault.InstanceSignature -eq $gameDirE)) ('sig=' + $(if ($null -ne $parsedDefault) { [string]$parsedDefault.InstanceSignature } else { '<unparsed>' }))
+Add-Check 'E3 no Slot is forwarded when -Slot is absent (default evidence names unchanged)' (($null -ne $parsedDefault) -and ($null -eq $parsedDefault.PSObject.Properties['Slot']))
+
+$argvE2 = @('-NoProfile', '-File', $RoundRunner, '-Evidence', $evE, '-PreflightOnly', '-HarnessPath', $overrideStub, '-Slot', 'B', '-InstanceSignature', 'CUSTOM-SIG')
+$outE2 = @(& pwsh @argvE2 2>&1 | ForEach-Object { [string]$_ })
+$exitE2 = $LASTEXITCODE
+$textE2 = $outE2 -join "`n"
+$argvJsonSlot = ''
+if ($textE2 -match '(?m)^\[round\] harnessArgv=(.+)$') { $argvJsonSlot = $Matches[1].Trim() }
+$parsedSlot = $null
+if ($argvJsonSlot.Length -gt 0) { try { $parsedSlot = $argvJsonSlot | ConvertFrom-Json } catch { $parsedSlot = $null } }
+Add-Check 'E4 preflight with -Slot/-InstanceSignature still exits 0' ($exitE2 -eq 0) ('exit=' + $exitE2)
+Add-Check 'E5 -Slot is forwarded to the bounded runner' (($null -ne $parsedSlot) -and ([string]$parsedSlot.Slot -eq 'B')) ('slot=' + $(if ($null -ne $parsedSlot) { [string]$parsedSlot.Slot } else { '<unparsed>' }))
+Add-Check 'E6 an explicit -InstanceSignature overrides the gameDir default' (($null -ne $parsedSlot) -and ([string]$parsedSlot.InstanceSignature -eq 'CUSTOM-SIG')) ('sig=' + $(if ($null -ne $parsedSlot) { [string]$parsedSlot.InstanceSignature } else { '<unparsed>' }))
+Add-Check 'E7 the round banner reports the effective signature and slot' ($textE2 -match '\[round\] instanceSignature=CUSTOM-SIG slot=B')
+Add-Check 'E8 preflight still writes nothing' (-not (Test-Path -LiteralPath (Join-Path $evE 'round-setup')))
 
 # ---------------------------------------------------------------- result
 if (-not $KeepTemp) {

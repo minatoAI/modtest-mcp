@@ -215,13 +215,96 @@ function Get-ProcessCommandLineMap {
     return $map
 }
 
+function ConvertTo-CommandLineTokens([string]$CommandLine) {
+    # Minimal Windows argv splitter: whitespace separated, "double quoted" runs kept together, quotes
+    # stripped. It does not have to be a perfect CRT parser -- it only has to be good enough to compare
+    # WHOLE arguments (see Test-InstanceScopeMatch). What matters is that it is never used to justify a
+    # substring match, because a prefix is exactly what made a sibling slot look like our own instance.
+    $tokens = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrEmpty($CommandLine)) { return $tokens }
+    $current = New-Object System.Text.StringBuilder
+    $inQuotes = $false
+    $hasContent = $false
+    for ($i = 0; $i -lt $CommandLine.Length; $i++) {
+        $ch = $CommandLine[$i]
+        if ($ch -eq '"') { $inQuotes = -not $inQuotes; $hasContent = $true; continue }
+        if ((-not $inQuotes) -and (($ch -eq ' ') -or ($ch -eq "`t"))) {
+            if ($hasContent) { [void]$tokens.Add($current.ToString()); [void]$current.Clear(); $hasContent = $false }
+            continue
+        }
+        [void]$current.Append($ch)
+        $hasContent = $true
+    }
+    if ($hasContent) { [void]$tokens.Add($current.ToString()) }
+    return $tokens
+}
+
+function Get-CommandLineArgumentValue([System.Collections.Generic.List[string]]$Tokens, [string]$Name) {
+    # Supports both `--gameDir <value>` and `--gameDir=<value>`.
+    for ($i = 0; $i -lt $Tokens.Count; $i++) {
+        $token = $Tokens[$i]
+        if ($token -ieq $Name) {
+            if ($i + 1 -lt $Tokens.Count) { return [string]$Tokens[$i + 1] }
+            return ''
+        }
+        if ($token -like ($Name + '=*')) { return $token.Substring($Name.Length + 1) }
+    }
+    return ''
+}
+
+function Get-NormalizedPath([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    return ($Value.Trim().TrimEnd('\', '/') -replace '/', '\')
+}
+
+function Test-InstanceScopeMatch {
+    # THE single scope decision, shared by the pre-launch guard and the post-run orphan audit, so the two
+    # can never disagree about who is "ours".
+    #
+    # 2026-09-27 (task-39): this used to be a case-SENSITIVE SUBSTRING test. With sibling slots whose
+    # directories are prefixes of one another -- ...\versions\1.20.1-Forge (A) and
+    # ...\versions\1.20.1-Forge-B (B) -- that made B look like A: the guard printed inScope=2, and the
+    # audit attributed B's LIVE client to A, producing a FALSE FAIL:post-run-audit (exit 7) for a round
+    # whose own instance had exited cleanly. Renaming the slot does not help, because B's path still
+    # starts with A's; the match has to be EXACT:
+    #   1. the authoritative rule: compare our signature with the candidate's PARSED --gameDir value
+    #      (exact, path-normalised, case-insensitive as the filesystem is);
+    #   2. a bounded fallback for non-path signatures (e.g. -InstanceSignature <exe name>): equality with
+    #      a whole argument, or with an argument's file name. Never a prefix, never a substring.
+    param([string]$CommandLine, [string]$Signature)
+    if ([string]::IsNullOrEmpty($Signature)) { return [pscustomobject]@{ inScope = $false; reason = 'no instance signature' } }
+    $tokens = ConvertTo-CommandLineTokens -CommandLine $CommandLine
+    if ($tokens.Count -eq 0) { return [pscustomobject]@{ inScope = $false; reason = 'no readable command line to compare with' } }
+    $wantPath = Get-NormalizedPath $Signature
+    $candidateGameDir = Get-CommandLineArgumentValue -Tokens $tokens -Name '--gameDir'
+    if ($candidateGameDir.Length -gt 0) {
+        $candidatePath = Get-NormalizedPath $candidateGameDir
+        if ($candidatePath -ieq $wantPath) {
+            return [pscustomobject]@{ inScope = $true; reason = 'same --gameDir as this round (exact match)' }
+        }
+        return [pscustomobject]@{ inScope = $false; reason = ('different --gameDir (candidate=' + $candidatePath + ')') }
+    }
+    foreach ($token in $tokens) {
+        if ((Get-NormalizedPath $token) -ieq $wantPath) {
+            return [pscustomobject]@{ inScope = $true; reason = 'a whole argument equals the instance signature (exact match)' }
+        }
+        $leaf = ''
+        try { $leaf = [System.IO.Path]::GetFileName($token.TrimEnd('\', '/')) } catch { $leaf = '' }
+        if ($leaf.Length -gt 0 -and $leaf -ieq $Signature.Trim()) {
+            return [pscustomobject]@{ inScope = $true; reason = 'an argument file name equals the instance signature (exact match)' }
+        }
+    }
+    return [pscustomobject]@{ inScope = $false; reason = 'no --gameDir and no whole argument equal to the instance signature' }
+}
+
 function Get-BlockingProcesses {
     # -CommandLineMap is optional (an empty map is built on demand), so every existing caller keeps working.
-    # -ScopeSignature (added 2026-09-27) tags each match with scope = 'in-scope' when the process's FULL
-    # command line contains the signature, else 'out-of-scope'. Without a signature every match is
-    # 'unscoped' (fail-closed callers treat those as blocking). The FULL command line is used for the
-    # decision and never leaves this function, so the 240-char display truncation can never cause a
-    # missed match (that would be a safety regression, not a cosmetic one).
+    # -ScopeSignature (added 2026-09-27, exact since task-39) tags each match with scope = 'in-scope'
+    # when the process is OUR instance by the exact rule in Test-InstanceScopeMatch (its parsed --gameDir
+    # equals our signature), else 'out-of-scope'. Without a signature every match is 'unscoped'
+    # (fail-closed callers treat those as blocking). The FULL command line is used for the decision and
+    # never leaves this function, so the 240-char display truncation can never cause a missed match
+    # (that would be a safety regression, not a cosmetic one).
     param(
         [System.Collections.Generic.List[string]]$Names,
         [string]$TitlePattern,
@@ -256,15 +339,16 @@ function Get-BlockingProcesses {
                 $fullCommandLine = [string]$CommandLineMap[$ownerPid].cmdlineFull
             }
             if ($ScopeSignature.Length -gt 0) {
-                # Case-SENSITIVE .Contains, matching Test-PostRunAudit's LaunchSignature attribution, so
-                # the pre-launch guard and the post-run audit can never disagree about who is "ours".
-                if ($fullCommandLine.Contains($ScopeSignature)) {
+                # ONE exact-match rule, shared with the post-run audit (Test-InstanceScopeMatch). It used
+                # to be a substring test, which made a sibling slot whose directory is a PREFIX of ours
+                # look like our own instance (task-39: inScope=2 for two slots A and A-B).
+                $scopeVerdict = Test-InstanceScopeMatch -CommandLine $fullCommandLine -Signature $ScopeSignature
+                if ($scopeVerdict.inScope) {
                     $scope = 'in-scope'
-                    $scopeReason = 'command line carries this round''s instance signature'
                 } else {
                     $scope = 'out-of-scope'
-                    $scopeReason = 'command line does not carry this round''s instance signature (unrelated JVM or another slot)'
                 }
+                $scopeReason = $scopeVerdict.reason
             }
             $found.Add([pscustomobject]@{
                 pid = $processItem.Id; name = $processItem.ProcessName
@@ -633,10 +717,11 @@ function Test-PostRunAudit {
         # They are not "our" leftovers: a round may intentionally run alongside a pre-existing JVM
         # (e.g. a LAN round with its own dedicated server). Only NEW survivors are orphans.
         [int[]]$BaselineProcessIds = @(),
-        # A distinctive substring of OUR launch command line (normally the --gameDir value). On a
-        # shared machine another teammate's build JVM can appear *during* our round and survive it;
-        # without attribution it would be reported as our orphan and the audit would be a false red.
-        # When empty (e.g. dry runs) no attribution filtering happens.
+        # Our own instance signature (normally the parsed --gameDir value). On a shared machine another
+        # teammate's build JVM, or ANOTHER SLOT whose directory is a prefix of ours, can appear *during*
+        # our round and survive it; without attribution it would be reported as our orphan and the audit
+        # would be a false red. Attribution is EXACT -- see Test-InstanceScopeMatch for why a substring
+        # (or prefix) test is wrong here. When empty (e.g. dry runs) no attribution filtering happens.
         [string]$LaunchSignature = '',
         # Per-process activity before/after the instance (see Get-ProcessActivitySnapshot). A CPU or
         # memory non-recovery is only an advisory note when somebody else's process clearly worked or
@@ -660,7 +745,11 @@ function Test-PostRunAudit {
             $cmdLine = ''
             $ci = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f [int]$candidate.pid) -ErrorAction SilentlyContinue
             if ($null -ne $ci -and $null -ne $ci.CommandLine) { $cmdLine = [string]$ci.CommandLine }
-            if ($cmdLine.Contains($LaunchSignature)) { $oursList.Add($candidate) | Out-Null } else { $unattributed += $candidate }
+            # SAME exact rule as the pre-launch guard (Test-InstanceScopeMatch). With the old substring
+            # test, a sibling slot whose directory is a prefix of ours was attributed to us, and its live
+            # client was reported as OUR orphan -- a false FAIL:post-run-audit (task-39).
+            $auditVerdict = Test-InstanceScopeMatch -CommandLine $cmdLine -Signature $LaunchSignature
+            if ($auditVerdict.inScope) { $oursList.Add($candidate) | Out-Null } else { $unattributed += $candidate }
         }
         # NOTE: @(<List[object]>) throws System.ArgumentException 'Argument types do not match' in
         # PowerShell; always go through .ToArray(). (The fuller PowerShell 5.1 notes this used to point
@@ -892,9 +981,11 @@ if (-not $DryRun) {
 }
 
 # ---------------------------------------------------------------- instance scope + slot (2026-09-27)
-# The PRE-LAUNCH guard now uses the same idea as the post-run audit: only a process that carries THIS
-# round's instance signature may block us. -InstanceSignature is an explicit override (used by tests and
-# by a caller that knows its own gameDir); otherwise the signature derived from --gameDir above applies.
+# The PRE-LAUNCH guard and the POST-RUN audit both use this ONE value and ONE exact rule
+# (Test-InstanceScopeMatch): a process belongs to this round only when its parsed --gameDir equals the
+# signature exactly. Passing the same value to the audit matters -- before task-39 the guard honoured
+# -InstanceSignature while the audit silently used the derived signature, so the two could disagree about
+# who was "ours" (and with a substring rule they could also both be wrong in the same prefix case).
 $effectiveSignature = $launchSignature
 if ($InstanceSignature.Length -gt 0) { $effectiveSignature = $InstanceSignature }
 
@@ -984,7 +1075,7 @@ for ($index = 1; $index -le $MaxInstances; $index++) {
     Start-Sleep -Seconds $PollSeconds
     $afterSnapshot = Get-SystemSnapshot
     $audit = Test-PostRunAudit -Record $record -OrphanNames $orphanNameList -TitlePattern $BlockingWindowTitlePattern `
-        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids -LaunchSignature $launchSignature -ProcBaseline $procBaselineForAudit -ProcAfter (Get-ProcessActivitySnapshot)
+        -BaselineSnapshot $baselineSnapshotForAudit -AfterSnapshot $afterSnapshot -BaselineProcessIds $baselineOrphanPids -LaunchSignature $effectiveSignature -ProcBaseline $procBaselineForAudit -ProcAfter (Get-ProcessActivitySnapshot)
     $record | Add-Member -NotePropertyName audit -NotePropertyValue $audit -Force
     $instanceRecords.Add($record) | Out-Null
     Write-Output ('instance #{0} pid={1} outcome={2} wall={3}s peakCpu={4}% peakMem={5}MB kill={6}' -f $record.index, $record.pid, $record.outcome, $record.wallSeconds, $record.peakCpuPct, $record.peakMemoryMB, $record.killPerformed)

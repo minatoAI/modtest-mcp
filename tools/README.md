@@ -28,10 +28,10 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `clusterprobe.ps1` | **Windows only** (GDI+) | `pwsh tools/clusterprobe.ps1 -Image img.png [-Color green] [-Json]` |
 | `parse-check.ps1` | PowerShell 5.1 / 7 | `pwsh tools/parse-check.ps1 -Target script.ps1` → prints `ERRCOUNT=0` |
 | `rcon.ps1` | PowerShell 5.1 / 7 | `pwsh tools/rcon.ps1 -ServerHost <host> -Command "list"` (password via prompt/env) |
-| `run-bounded.ps1` | **Windows only** (process/watchdog/CPU audit) | `pwsh tools/run-bounded.ps1 -FilePath <exe> [-ArgumentList …] [-WorkingDirectory …] [-Windowed] [-OptionsFile run/options.txt] [-MaxInstances 1] [-Slot <name>] [-InstanceSignature <s>]` — hard caps **≤6 min/instance** (watchdog `Stop-Process`) and **≤25 min/round**, **refuses to start only if a process carrying THIS round's instance signature is already present** (a teammate's Gradle daemon or another slot is reported `NOT BLOCKING:` and ignored; no signature ⇒ FAIL-CLOSED as before — see "Running several instances in parallel"), always audits afterwards (target gone + no orphan `java.exe` + CPU/memory recovered) and writes per-run JSON/TXT metrics; `-DryRun -DryRunScenario ok\|timeout\|stall\|refuse\|orphan\|tree` self-tests every path **without starting a JVM**. **A REFUSAL (exit 3) now writes evidence too** — until 2026-09-27 it produced no file at all, which made refusals unattributable after the fact; the JSON now carries `verdict=REFUSED` plus a `blocking[]` array whose entries hold pid / name / title / reason / **scope** and a truncated **command line**, plus `blockingOutOfScope[]` for the matches that were ignored, because on a shared machine "a java process exists" cannot tell a teammate's build JVM from a real game client (all three refusals recorded 2026-09-25/26 were somebody else's Gradle daemon). It remains a refusal only: **nothing is launched, nothing is killed**, and no command-line exclusion was added. **Wrapper launches need `-KillProcessTree`**: if `-FilePath` is a wrapper (`renderdoccmd.exe`, a `*.bat` shim) a single-pid kill leaves the real client alive as an orphan — measured 2026-09-25, `pid=26308 java "Minecraft* Forge …"` survived a `stall-killed` round. `-KillProcessTree` (opt-in, plus `-KillProcessTreeExcludePattern`, default `GradleDaemon`) kills the instance's **descendants** only, deepest-first, and records each kill in `instances[].treeKill`. It is deliberately not the default: on a `gradlew.bat` launch the descendant chain runs through a **shared Gradle daemon**. When the audit sees any survivor the run prints one line and records `audit.leftoverHint` telling you to add `-KillProcessTree` next time |
-| `run-bounded.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-bounded.test.ps1` → `RUN-BOUNDED-TEST PASS (81 checks)` (offline: drives the runner's 6 `-DryRun` scenarios, asserts exit code + audit verdict + the `caps` field semantics + the refusal's `blocking[]` attribution + the **guard scope** (unrelated signature must not block, same signature must block) + `slot` + pid-based window selection + the `-KillProcessTree` descendant kill **in both directions**; **never starts a JVM**) |
-| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below |
-| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (41 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, and **per-round outputs never clobber** — driven through a stub harness, so no JVM is ever started; `-OldRunner` enables the byte-identical single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
+| `run-bounded.ps1` | **Windows only** (process/watchdog/CPU audit) | `pwsh tools/run-bounded.ps1 -FilePath <exe> [-ArgumentList …] [-WorkingDirectory …] [-Windowed] [-OptionsFile run/options.txt] [-MaxInstances 1] [-Slot <name>] [-InstanceSignature <s>]` — hard caps **≤6 min/instance** (watchdog `Stop-Process`) and **≤25 min/round**, **refuses to start only if a process carrying THIS round's instance signature is already present** — and that match is **exact** (the candidate's parsed `--gameDir` must equal ours; a teammate's Gradle daemon or a sibling slot whose directory is a *prefix* of ours is reported `NOT BLOCKING:` and ignored). No signature ⇒ FAIL-CLOSED as before — see "Running several instances in parallel", always audits afterwards (target gone + no orphan `java.exe` + CPU/memory recovered) and writes per-run JSON/TXT metrics; `-DryRun -DryRunScenario ok\|timeout\|stall\|refuse\|orphan\|tree` self-tests every path **without starting a JVM**. **A REFUSAL (exit 3) now writes evidence too** — until 2026-09-27 it produced no file at all, which made refusals unattributable after the fact; the JSON now carries `verdict=REFUSED` plus a `blocking[]` array whose entries hold pid / name / title / reason / **scope** and a truncated **command line**, plus `blockingOutOfScope[]` for the matches that were ignored, because on a shared machine "a java process exists" cannot tell a teammate's build JVM from a real game client (all three refusals recorded 2026-09-25/26 were somebody else's Gradle daemon). It remains a refusal only: **nothing is launched, nothing is killed**, and no command-line exclusion was added. **Wrapper launches need `-KillProcessTree`**: if `-FilePath` is a wrapper (`renderdoccmd.exe`, a `*.bat` shim) a single-pid kill leaves the real client alive as an orphan — measured 2026-09-25, `pid=26308 java "Minecraft* Forge …"` survived a `stall-killed` round. `-KillProcessTree` (opt-in, plus `-KillProcessTreeExcludePattern`, default `GradleDaemon`) kills the instance's **descendants** only, deepest-first, and records each kill in `instances[].treeKill`. It is deliberately not the default: on a `gradlew.bat` launch the descendant chain runs through a **shared Gradle daemon**. When the audit sees any survivor the run prints one line and records `audit.leftoverHint` telling you to add `-KillProcessTree` next time |
+| `run-bounded.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-bounded.test.ps1` → `RUN-BOUNDED-TEST PASS (93 checks)` (offline: drives the runner's 6 `-DryRun` scenarios, asserts exit code + audit verdict + the `caps` field semantics + the refusal's `blocking[]` attribution + the **guard scope** (unrelated signature must not block, same signature must block) + `slot` + pid-based window selection + the `-KillProcessTree` descendant kill **in both directions**; **never starts a JVM**) |
+| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>] [-Slot <name>] [-InstanceSignature <sig>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below. `-Slot`/`-InstanceSignature` are forwarded to the bounded runner (default signature = the gameDir from `launch-args.json`), so a round is scoped to its own instance and parallel slots no longer refuse each other |
+| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (49 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, and **per-round outputs never clobber** — driven through a stub harness, so no JVM is ever started; `-OldRunner` enables the byte-identical single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
 
 ## Conventions
 
@@ -173,6 +173,45 @@ every `run-bounded-*.json` glob are unchanged by default.
 **harness's own** command line. If `-BlockingProcessNames` also matches the harness's own process name
 (e.g. `pwsh`), the guard matches **itself** and always refuses. `run-bounded.test.ps1` therefore drives
 both scope controls through a **non-harness peer** process.
+
+### How instance scope is decided — and why it must be EXACT (task-39)
+
+A process belongs to this round **only when its parsed `--gameDir` equals this round's signature
+exactly** (path-normalised, case-insensitive). The pre-launch guard and the post-run orphan audit call the
+same function (`Test-InstanceScopeMatch`) with the same value, so they cannot disagree. For a
+non-path signature (`-InstanceSignature <exe name>`) the fallback is equality with a **whole argument** or
+with an argument's **file name** — never a prefix, never a substring.
+
+**Why (measured on the real two-slot run, task-30):** slot A `…\versions\1.20.1-Forge` and slot B
+`…\versions\1.20.1-Forge-B` are siblings where **B's path starts with A's**. The scope test used to be a
+substring test, which produced:
+
+| symptom | old behaviour | exact behaviour |
+|---|---|---|
+| guard over-blocks | A's signature ⇒ `inScope=2 outOfScope=0` (B counted as ours) ⇒ exit 3 | `inScope=1 outOfScope=1` |
+| **false FAIL** | audit attributed B's live client to A ⇒ `orphans=1` ⇒ `VERDICT=FAIL:post-run-audit` (**exit 7**) although A's own instance had exited cleanly | `orphans=0`, `unattributedExcluded=1`, `VERDICT=PASS` |
+
+⚠️ **Renaming the slot does not help**: `…-Forge-B` still starts with `…-Forge`, so a substring rule stays
+wrong no matter what you call the directory. Exact matching is the fix. As *extra* defence (not a
+substitute) you may lay slots out so no path is a prefix of another, e.g. `…\slots\A\…` and
+`…\slots\B\…`.
+
+**Temporary ban, now lifted:** while this defect was open, **"the post-run audit is ok" could not be used
+as a criterion for a parallel round** — a sibling slot's client could turn it into a false FAIL — and
+functional verdicts had to come from game-side evidence. That ban is **lifted by this change** (proven by
+the prefix-sibling controls in `run-bounded.test.ps1`: 12 checks, 10 of which are red on the pre-fix
+runner).
+
+**Usage — through the documented entry point** (`run-round.ps1` now forwards both):
+
+```
+pwsh tools/run-round.ps1 -Evidence <dir>\B -Slot B -InstanceSignature '<gameDirB>'
+```
+
+`-InstanceSignature` defaults to the gameDir parsed out of `launch-args.json`, so **every** round is
+scoped to its own instance even if you pass nothing. `-Slot` only names the slot (banner + evidence file
+name when given). Before this passthrough existed the documented entry point could not run in parallel at
+all: the bounded runner stayed FAIL-CLOSED and refused with `java/javaw already running` (exit 5).
 
 ### Parallel builds (task-29)
 

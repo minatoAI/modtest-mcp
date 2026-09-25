@@ -90,11 +90,12 @@
     {
       "id": "B6",
       "group": "B",
+      "pendingJavaSide": "task-50",
       "relPath": "block.properties",
       "text": "#Thu Jan  1 00:00:00 UTC 1970\nkey=v\n",
-      "expect": { "normalized": "#Thu Jan  1 00:00:00 UTC 1970\nkey=v\n" },
-      "why": "store() pads single-digit days with a space: '#Thu Jan  1 ...' has TWO spaces before the day. \\w{3} consumes 'Jan', the literal space consumes the first space, then \\d{2} must match ' 1' ... which it CANNOT (a space is not a digit). So this line does NOT match and is returned unchanged.",
-      "trap": "TRAP DISARMED: I first WROTE the expectation as a strip (and the port caught it): the rule text says otherwise. This documents that space-padded days are NOT normalized -- see B10 for the zero-padded contrast."
+      "expect": { "normalized": "key=v\n" },
+      "why": "SPACE-PADDED day. java.util.Properties.store() writes single-digit days RIGHT-ALIGNED in a two-character field, so '#Thu Jan  1 ...' is the REAL shape of the header on days 1-9. task-49 widened the day field to (?:[0-9]{2}|[0-9]| [0-9]), so this header IS stripped now. Before that it survived and the digest kept drifting on those days -- the defect this corpus found.",
+      "trap": "Both sides must change together (task-49 here, task-50 in Java). If only one is widened, fingerprint-parity.test.ps1 goes red on this case."
     },
     {
       "id": "B10",
@@ -102,8 +103,27 @@
       "relPath": "block.properties",
       "text": "#Thu Jan 01 00:00:00 UTC 1970\nkey=v\n",
       "expect": { "normalized": "key=v\n" },
-      "why": "Zero-padded day ('01') DOES satisfy \\d{2}, so this header is stripped.",
-      "trap": "Contrast with B6: the rule strips only the zero-padded form, which is a REAL LIMITATION, because java.util.Properties.store() space-pads days 1-9. On those days the header survives normalization and the digest still drifts."
+      "why": "Zero-padded day ('01') also matches the widened day field, so this header is stripped.",
+      "trap": "Four day shapes must all be accepted: ' 1' (B6), '01' (B10), '1' (B12), '10' (B11)."
+    },
+    {
+      "id": "B11",
+      "group": "B",
+      "relPath": "block.properties",
+      "text": "#Thu Jan 10 02:03:04 CST 2026\nkey=v\n",
+      "expect": { "normalized": "key=v\n" },
+      "why": "Two-digit day ('10'): the widened field still matches two digits, so this header is stripped.",
+      "trap": "CONTROL for the red control: a port that reverts to a stricter day field must leave THIS case green, which is what proves the red control is not a blanket failure."
+    },
+    {
+      "id": "B12",
+      "group": "B",
+      "pendingJavaSide": "task-50",
+      "relPath": "block.properties",
+      "text": "#Thu Jan 1 02:03:04 CST 2026\nkey=v\n",
+      "expect": { "normalized": "key=v\n" },
+      "why": "UNPADDED single-digit day ('1', no leading space). The new rule accepts one digit as well as two, so this header is stripped.",
+      "trap": "A hand-edited or non-store()-generated file can use this shape; the rule must cover both."
     },
     {
       "id": "B7",
@@ -137,9 +157,10 @@
       "group": "C",
       "relPath": "block.properties",
       "text": "#Sat Sep 6 01:34:39 CST 2026\nkey=v\n",
-      "expect": { "normalized": "#Sat Sep 6 01:34:39 CST 2026\nkey=v\n" },
-      "why": "One-digit day: \\d{2} needs two digits.",
-      "trap": "Near miss; must NOT strip."
+      "pendingJavaSide": "task-50",
+      "expect": { "normalized": "key=v\n" },
+      "why": "UNPADDED one-digit day. Under the original \\d{2} rule this was a NEAR MISS that must not be stripped; task-49 widened the day field to accept one digit, so under the NEW rule text it IS stripped. Re-derived from the new rule -- not adjusted to keep an old answer.",
+      "trap": "The clearest measure of the widening's blast radius: a former near-miss becomes a match. Same shape as B12."
     },
     {
       "id": "C2",
@@ -230,6 +251,15 @@
       "expect": { "normalized": " \nkey=v\n" },
       "why": "Trailing space: the match ends after the four-digit year and \\R? cannot consume a space, so the matched part is removed and the space plus newline REMAIN.",
       "trap": "Documents that the result is not always 'the whole line disappears'."
+    },
+    {
+      "id": "C12",
+      "group": "C",
+      "relPath": "block.properties",
+      "text": "#Thu Jan  1 2:03:04 CST 2026\nkey=v\n",
+      "expect": { "normalized": "#Thu Jan  1 2:03:04 CST 2026\nkey=v\n" },
+      "why": "One-digit HOUR with a space-padded day. task-49 widened ONLY the day field; the hour still requires \\d{2}, so this line must NOT be stripped.",
+      "trap": "The guard against over-widening: relaxing the day must not relax the time-of-day fields. If a port widens the hour too, this goes red."
     },
     {
       "id": "D1",

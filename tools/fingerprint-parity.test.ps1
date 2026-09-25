@@ -57,6 +57,7 @@ $script:Total = 0
 $script:Passed = 0
 $script:Failed = 0
 $script:Skipped = 0
+$script:Diverge = 0
 function Add-Check {
     param([string]$Name, [bool]$Condition, [string]$Detail = '')
     $script:Total++
@@ -327,6 +328,23 @@ foreach ($case in $cases) {
     if ($null -eq $ps) { Add-Skip ('case ' + $case.id) 'real sample unavailable (game dir or archive missing)'; continue }
     $java = $null
     if ($javaAvailable) { $java = $javaResults[$case.id] }
+    $expectText = [string]$case.expect.normalized
+    # A case may DECLARE that the other side has not been updated yet. That is a transition state, not a
+    # silent exemption: the declaration is verified in both directions, so it can neither hide a one-sided
+    # change nor outlive the divergence. "Both sides must change together" is therefore a machine judgement.
+    $pending = [string]$case.pendingJavaSide
+    if ($pending.Length -gt 0) {
+        Add-Check ('case ' + $case.id + ' [2] powershell is already on the NEW rule') ($ps.normalizedText -eq $expectText) ('got=' + (ConvertTo-Visible $ps.normalizedText) + ' want=' + (ConvertTo-Visible $expectText))
+        if ($null -ne $java) {
+            $stillOld = ($java.normalizedText -ne $expectText)
+            Add-Check ('case ' + $case.id + ' the java side is still on the old rule (declared pending ' + $pending + ')') $stillOld ('java already matches the new rule: remove pendingJavaSide from ' + $case.id)
+            if ($stillOld) {
+                $script:Diverge++
+                Write-Output ('  DIVERGE case ' + $case.id + ' declared pending ' + $pending + ' ps=' + $ps.digest + ' java=' + $java.digest)
+            }
+        }
+        continue
+    }
     if ($null -ne $java) {
         $agree = ($ps.digest -eq $java.digest)
         Add-Check ('case ' + $case.id + ' [1] java and powershell agree') $agree ('ps=' + $ps.digest + ' java=' + $java.digest)
@@ -336,8 +354,6 @@ foreach ($case in $cases) {
         }
     }
     if ($case.kind -eq 'real-sample') { continue }
-    # condition 2: BOTH must match the pre-declared expectation
-    $expectText = [string]$case.expect.normalized
     Add-Check ('case ' + $case.id + ' [2] powershell matches the declared expectation') ($ps.normalizedText -eq $expectText) ('got=' + (ConvertTo-Visible $ps.normalizedText) + ' want=' + (ConvertTo-Visible $expectText))
     if ($null -ne $java -and $java.normalizedText -ne $expectText) {
         Add-Check ('case ' + $case.id + ' [2] java matches the declared expectation') $false ('got=' + (ConvertTo-Visible $java.normalizedText) + ' want=' + (ConvertTo-Visible $expectText))
@@ -443,6 +459,27 @@ $broke = @($mustBreak | Where-Object { $naiveVerdicts[$_] -eq $true })
 $held = @($mustHold | Where-Object { $naiveVerdicts[$_] -eq $false })
 Add-Check 'the naive port BREAKS every killer case (the corpus has teeth)' ($broke.Count -eq 0) ('still green under the naive port: ' + ($broke -join ','))
 Add-Check 'the naive port still passes the non-killer cases (not a blanket failure)' ($held.Count -eq 0) ('wrongly red: ' + ($held -join ','))
+Write-Output '--- red control: reverting the widened DAY field must break B6/B12/C1, not everything ---'
+# The widening is exactly one alternation. Reverting it must reproduce the original defect on the real
+# Properties.store() shape (" 1") and on the unpadded one, while two-digit days still pass -- which is what
+# shows the corpus has teeth rather than being all-red after any change.
+$oldDayPath = Join-Path $tempRoot 'pack-fingerprint-oldday.ps1'
+$oldDayText = $implText.Replace('[A-Za-z0-9_]{3} (?:[0-9]{2}|[0-9]| [0-9]) [0-9]{2}:', '[A-Za-z0-9_]{3} [0-9]{2} [0-9]{2}:')
+Add-Check 'the un-widened variant could be built from the real implementation' ($oldDayText -ne $implText)
+[System.IO.File]::WriteAllText($oldDayPath, $oldDayText, (New-Object System.Text.UTF8Encoding($false)))
+. $oldDayPath
+$oldDayVerdicts = [ordered]@{}
+foreach ($case in $cases) {
+    if ($case.kind -eq 'real-sample') { continue }
+    $got = Get-PackNormalizedText -RelPath ([string]$case.relPath) -Text ([string]$case.text)
+    $oldDayVerdicts[$case.id] = ($got -eq [string]$case.expect.normalized)
+}
+$dayBreak = @('B6', 'B12', 'C1')
+$dayHold = @('B10', 'B11', 'C12', 'B8', 'C10')
+$dayBroke = @($dayBreak | Where-Object { $oldDayVerdicts[$_] -eq $true })
+$dayHeld = @($dayHold | Where-Object { $oldDayVerdicts[$_] -eq $false })
+Add-Check 'the un-widened day field BREAKS the padded/unpadded day cases' ($dayBroke.Count -eq 0) ('still green under the old rule: ' + ($dayBroke -join ','))
+Add-Check 'and it still passes two-digit days and the one-digit-HOUR guard (not a blanket failure)' ($dayHeld.Count -eq 0) ('wrongly red: ' + ($dayHeld -join ','))
 $implShaAfter = (Get-FileHash -LiteralPath $ImplPath -Algorithm SHA256).Hash
 Add-Check 'the tested implementation file was not modified by this test (sha256 unchanged)' ($implShaAfter -eq $implShaBefore) ('before=' + $implShaBefore + ' after=' + $implShaAfter)
 Write-Output ('FINGERPRINT-PARITY implSha256-after=' + $implShaAfter)
@@ -452,6 +489,6 @@ if (-not $KeepTemp) {
 } else {
     Write-Output ('FINGERPRINT-PARITY temp kept at ' + $tempRoot)
 }
-Write-Output ('FINGERPRINT-PARITY ' + $(if ($script:Failed -eq 0) { 'PASS' } else { 'FAIL' }) + ' (' + $script:Passed + '/' + $script:Total + ' checks passed' + $(if ($script:Skipped -gt 0) { ', ' + $script:Skipped + ' skipped' } else { '' }) + ')')
+Write-Output ('FINGERPRINT-PARITY ' + $(if ($script:Failed -eq 0) { 'PASS' } else { 'FAIL' }) + ' (' + $script:Passed + '/' + $script:Total + ' checks passed' + $(if ($script:Skipped -gt 0) { ', ' + $script:Skipped + ' skipped' } else { '' }) + $(if ($script:Diverge -gt 0) { ', ' + $script:Diverge + ' declared divergence(s) awaiting the java side' } else { '' }) + ')')
 if ($script:Failed -eq 0) { exit 0 }
 exit 1

@@ -25,11 +25,17 @@
 #   3. (?m)^ in Java matches after ANY Java line terminator (\n, \r, \r\n, \u0085, \u2028, \u2029), while
 #      .NET's (?m)^ matches only after \n. Emulated with an explicit lookbehind instead of (?m).   (D5/D6/D7)
 #
-# KNOWN LIMITATION OF THE RULE ITSELF (not of this port), documented by corpus B6/B10:
-#   java.util.Properties.store() space-pads days 1-9 ("#Thu Jan  1 ..."), but the pattern requires
-#   \d{2}. Such a header is NOT stripped, so on those days the normalized digest still drifts. This port
-#   reproduces the Java behaviour exactly -- deliberately -- so that fixing it is a decision about the
-#   RULE (both sides together), not an accidental divergence.
+# FIXED DEFECT (task-49, found by this rule's own corpus): java.util.Properties.store() writes
+# single-digit days RIGHT-ALIGNED in a two-character field, i.e. "#Thu Jan  1 ...", and the original rule
+# required \d{2}. Such a header was NOT stripped, so on days 1-9 the normalized digest still drifted and
+# "same package?" silently failed exactly when a month started. The day field now accepts all the shapes
+# Properties.store() can emit -- " 1", "1", "01", "10" -- as (?:[0-9]{2}|[0-9]| [0-9]).
+# ONLY the day field was widened: the hour stays \d{2} (corpus C12: "#Thu Jan  1 2:03:04 ..." must NOT be
+# stripped), and the three Java semantics below are untouched.
+# BOTH SIDES MUST CHANGE TOGETHER: this port is task-49 and the Java class is task-50. Until task-50 lands
+# the cross-implementation test reports these cases as a DECLARED, LOUD divergence (the corpus says
+# pendingJavaSide) rather than quietly agreeing with a half-updated rule -- and the test FAILS if a side
+# changes without the other, or if the declaration outlives the divergence.
 #
 # ASCII only. Dot-source it to use the functions, or run it to self-report.
 #   . tools/pack-fingerprint.ps1
@@ -38,7 +44,7 @@
 
 # (?:\A|(?<=[\n\r\u0085\u2028\u2029])) emulates Java's multiline ^ (see note 3 above).
 # The trailing (?:\r\n|[\n\u000B\u000C\r\u0085\u2028\u2029])? emulates Java's \R? (see note 2 above).
-$script:PackDateHeaderPattern = '(?:\A|(?<=[\n\r\u0085\u2028\u2029]))#[A-Za-z0-9_]{3} [A-Za-z0-9_]{3} [0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} [A-Za-z0-9_]+ [0-9]{4}(?:\r\n|[\n\u000B\u000C\r\u0085\u2028\u2029])?'
+$script:PackDateHeaderPattern = '(?:\A|(?<=[\n\r\u0085\u2028\u2029]))#[A-Za-z0-9_]{3} [A-Za-z0-9_]{3} (?:[0-9]{2}|[0-9]| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [A-Za-z0-9_]+ [0-9]{4}(?:\r\n|[\n\u000B\u000C\r\u0085\u2028\u2029])?'
 
 function Test-PackPropertiesPath([string]$RelPath) {
     # Java: relPath.toLowerCase(Locale.ROOT).endsWith(".properties"). ToLowerInvariant is the locale-free

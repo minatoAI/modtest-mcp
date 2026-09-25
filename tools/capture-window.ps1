@@ -15,6 +15,11 @@
 # WHAT IT DOES INSTEAD
 #   1. PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=0x2) -- asks the window to render itself; no
 #      activation, no input. Works for DWM-composited windows (which includes normal app windows).
+#      VERIFIED ON A REAL GL WINDOW 2026-09-27 (qa-rounds, task-26): Minecraft 1.20.1 + Forge, window
+#      NOT in the foreground -> method=printwindow, 868x571, blackFraction=0, maxLuminance=243,
+#      targetWasForeground=False, foregroundUnchanged=True. The "a GL window may come back black"
+#      worry is therefore FALSIFIED for this setup -- but the exit-4 path below is KEPT: on some other
+#      driver/window a black frame must still fail honestly instead of being "fixed" by stealing focus.
 #   2. Fallback: GetWindowRect + Graphics.CopyFromScreen -- a plain screen grab of the window's
 #      rectangle, still without touching focus. CAVEAT, printed on every use: this captures whatever
 #      is ON SCREEN at those coordinates, so it is only valid while the window is NOT obscured.

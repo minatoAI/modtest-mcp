@@ -15,6 +15,8 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `move-flicker.js` | cross-platform | `node tools/move-flicker.js <dir> <tag> [count]` |
 | `tp-space-solve.js` | cross-platform | `node tools/tp-space-solve.js <samples…>` (see file header) |
 | `cropzoom.js` | cross-platform | `node tools/cropzoom.js IN.png OUT.png X0 Y0 X1 Y1 [SCALE]` |
+| `capture-window.ps1` | **Windows only** (user32 + System.Drawing) | `pwsh tools/capture-window.ps1 -Out shot.png [-Title <regex>\|-ProcessId N\|-WindowHandle H] [-Method auto\|printwindow\|rect] [-Json]` — captures a window **without ever activating it** (PrintWindow first; unobstructed-rect screen grab as fallback, with that caveat printed). Reports `CAPTURE_METHOD=`, `CAPTURE_BLACKFRACTION=` and `foregroundUnchanged=True`. Exits 4 rather than "fixing" an all-black frame by stealing focus. See "Never steal the user's window focus" below |
+| `no-focus-steal.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/no-focus-steal.test.ps1 [-ExtraScanPath <file>]` → `NO-FOCUS-STEAL-TEST PASS (N checks)` — scans `tools/**` code for activation / input-synthesis primitives (comments and the README's marked block are exempt); `-ExtraScanPath` runs the negative control |
 | `analyze-regions.js` | cross-platform (Node ≥ 18) | `node tools/analyze-regions.js A.png B.png [C.png …] [--regions <json\|@file>] [--label NAME] [--json]` — drift-controlled region analysis (per-image region mean luminance / lit≥128, plus adjacent-pair region diffs), because whole-image diffs are dominated by sky/HUD/particle noise. `--regions` overrides the rectangles (this is what the former per-pose **forked copies** were for); the frozen default set reproduces every archived `region-analysis.txt` **line for line** |
 | `analyze-regions.test.js` | cross-platform | `node tools/analyze-regions.test.js [--tool PATH] [--archived-root DIR] [--skip-archived]` (self-test, **30 checks on a default run**: region maths, frozen default preset, `--regions` validation, relative `imgdiff.js` resolution proved with a stub dependency, archived equivalence) |
 | `griddiff.ps1` | **Windows only** (GDI+) | `pwsh tools/griddiff.ps1 -A a.png -B b.png [-Cells 8] [-Threshold 10] [-Json]` |
@@ -69,10 +71,54 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
   usage); it is kept so readers of pre-2026-09-27 evidence keep working. New code must use
   `roundBudgetCapSec` / `roundBudgetElapsedSec`.
 * **Self-tests are the contract.** `imgdiff.test.js`, `rec-analyze.test.js`,
-  `analyze-regions.test.js`, `run-bounded.test.ps1` and `run-round.test.ps1` must pass **on a default
-  run** (no extra flags) before you change anything in this folder. A change to a tool whose behaviour
-  is not covered should add a check to the matching self-test **and prove it is red on the old code
-  first**.
+  `analyze-regions.test.js`, `run-bounded.test.ps1`, `run-round.test.ps1` and
+  `no-focus-steal.test.ps1` must pass **on a default run** (no extra flags) before you change anything
+  in this folder. A change to a tool whose behaviour is not covered should add a check to the matching
+  self-test **and prove it is red on the old code first**.
+
+## Never steal the user's window focus (policy — machine-checked)
+
+**This really happened.** On 2026-09-26 the user reported that a real-machine round **stole their
+window focus**: the round screenshotted by activating the game window and synthesising the vanilla F2
+key. The technique had already been written off twice in this project, and it came back only because a
+**release jar has no relay**, so the in-mod `!shot` was unavailable and somebody "just needed a
+picture". Documentation did not stop it, so it is enforced by
+`pwsh tools/no-focus-steal.test.ps1` — which scans **code lines** of every `*.ps1` / `*.js` / `*.md`
+in this directory (comments are ignored, so a comment may explain the ban; the block marked below is
+exempt so this list can live here).
+
+Everything between the markers below — the ban list **and** the two-sided control commands, which have
+to name the primitives — is exempt from the scan. Nothing outside them may contain these names.
+
+<!-- BEGIN-BANNED-API-LIST -->
+| Banned | Why |
+|---|---|
+| `SetForegroundWindow`, `SetActiveWindow`, `BringWindowToTop`, `SwitchToThisWindow`, `AttachThreadInput` | change the user's foreground window |
+| `ShowWindow(..., SW_RESTORE / SW_SHOW / SW_MINIMIZE / SW_SHOWNORMAL / SW_SHOWDEFAULT / SW_MAXIMIZE, or the numeric 1,2,3,5,6,9,10,11)` | un-minimises / raises the window and hands it the foreground (the real incident used the numeric form `ShowWindow(h,9)`) |
+| `keybd_event`, `SendInput`, `mouse_event` | synthesise input into whatever currently has focus — and can therefore type into the user's own applications |
+
+**Do not trust the policy test — run both sides of it** when you touch this area. The first command
+must stay GREEN, the second must go RED:
+
+```
+# GREEN: the real round script, which names the ban only in COMMENTS -> the scan must ignore them
+pwsh tools/no-focus-steal.test.ps1 -ExtraScanPath <workspace>/docs/evidence/2026-09-27-release-smoke/drive-release-smoke.ps1
+# RED: the historical synthetic-key screenshot route in a temp file
+#       (that is: ShowWindow with flag 9, then SetForegroundWindow, then keybd_event with VK_F2)
+pwsh tools/no-focus-steal.test.ps1 -ExtraScanPath <that temp file>
+```
+<!-- END-BANNED-API-LIST -->
+
+Read-only helpers are fine and are what `capture-window.ps1` uses: `GetForegroundWindow`,
+`IsWindowVisible`, `GetWindowRect`, `GetClientRect`, `PrintWindow`, `GetCursorPos`.
+
+**Correct alternatives — never synthesise keys to take a screenshot**
+
+| Situation | Use |
+|---|---|
+| dev / relay variant (the relay is present) | the mod's own `!shot` — in-process, no external input at all |
+| release jar, or no relay | `pwsh tools/capture-window.ps1 -Out shot.png -Title '<window title>'` |
+| you must show you did not steal focus | `capture-window.ps1` prints `CAPTURE_METHOD=`, `CAPTURE_BLACKFRACTION=` and `foregroundUnchanged=True` with the read-only foreground handle before/after |
 
 ## 驱动脚本坑清单（PowerShell / .NET）—— 每条都来自一次真机事故
 
@@ -88,6 +134,8 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | 3 | TSV 的 `shot` 列**变成数组/多行** ⇒ 列数错乱，后续解析全歪 | PowerShell 函数**把"未捕获的输出"当返回值**：`Write-Output` 与裸表达式都进管道 ⇒ 调用方拿到多值 | 进度信息一律用 `Write-Host`（不进管道）；返回值只留**一个** `return`；调用方要么 `$row.shot = Save-Shot …`，要么 `[void](Save-Shot …)` | `docs/evidence/2026-09-26-default-day/README.md:138`（明记"修掉 TSV `shot` 列变数组的**老坑**"；6 个驱动各自写过一份 `Save-Shot`，3 种修法混用） |
 | 4 | 证据文件名出现 `shot-…sphere:1.0-….png`；`Copy-Item` / `Get-FileHash` 行为**不可靠** | Windows 文件名里的 **`:` 是 NTFS 备用数据流（ADS）分隔符**，不是普通字符 | 拼文件名前净化：`$safe = ($Tag -replace '[^A-Za-z0-9._-]', '_')` | `docs/evidence/2026-09-26-default-day/README.md:135-139`（**真机轮已开跑**才发现，就地终止驱动、改脚本、重启驱动） |
 | 5 | ① 报 `does not contain op_Subtraction`；② 正则**匹配成功但 `$Matches` 是空的** ⇒ 相机坐标解析成 `(0,0,0)`，**整轮探针扫在世界原点、结论无效** | ① `@([int]$cam[0] - 16, …)` 里**逗号优先级低于 `-`**，减法拿到 `Object[]` 操作数；② 对**数组**做 `-match` 返回**过滤后的数组**、**不设置 `$Matches`** | ① 每个表达式加括号：`@(([int]$cam[0]) - 16, ([int]$cam[1]) - 2, …)`；② 先取标量再匹配：`$one = @($lines | Select-Object -Last 1); if ($one -match '…') { $Matches[1] }` | `docs/evidence/2026-09-26-classify/README.md:148-154`（两坑叠加；臂数据未受影响但该轮没有 `!quit`，被 150 s 上限杀掉） |
+| 6 | 报 `找不到"Add"的参数计数为"1"的重载` —— 明明是自己的 `List`，却像被换成了别的东西 | **自己的变量名撞上 PowerShell 自动变量 `$Matches`**：`$matches = New-Object ...List[object]` 之后，循环里任何一次成功的 `-match` 都会把 `$matches` **覆盖成哈希表**（哈希表的 `Add` 要 2 个参数） | **不要用 `$matches` / `$Matches` 当自己的变量名**（`$input` / `$args` / `$error` / `$host` / `$psitem` 同理）；叫 `$candidates`、`$found` 之类 | 本仓 `tools/capture-window.ps1` 首版（2026-09-27，笔者自己踩的；见 `docs/evidence/2026-09-27-harness-dev/README.md`） |
+| 7 | `[System.IO.File]::ReadAllBytes('tools\x.ps1')` 报 `Could not find a part of the path '…\<别的目录>\tools\x.ps1'`，而同一行上 `Get-Content tools\x.ps1` 却正常 | **`cd` 只改 PowerShell 的 provider location，不改 .NET 的 `[Environment]::CurrentDirectory`** ⇒ `[System.IO.*]` 的相对路径按**进程启动目录**解析 | 给 `[System.IO.*]`（以及 `[Parser]::ParseFile` 之类）**一律传绝对路径**：`Join-Path (Get-Location).Path 'tools\x.ps1'` | 同上（2026-09-27；顺带核对出 `parse-check.ps1` **不会**因此假绿：读不到文件会报 `ERRCOUNT=1`） |
 
 **通用纪律**（上表 5 条的教训）：
 * 驱动里的**每一条 sink**（`Write-Output` / 裸表达式）都要当成"会进 TSV / 会进返回值"来看待；不确定就

@@ -63,6 +63,29 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
   change anything in this folder. A change to a tool whose behaviour is not covered should add a check
   to the matching self-test **and prove it is red on the old code first**.
 
+## 驱动脚本坑清单（PowerShell / .NET）—— 每条都来自一次真机事故
+
+驱动脚本（通过文件中继 `<gameDir>/taclight-cmds.txt` 发命令、截图、解析日志的那一层）由每一轮的人
+现写，因此**同一批坑被反复踩**。下面 5 类是**已造成实际损失**的（空转整轮、作废整段数据、证据文件名
+非法）。**事故出处是工作区仓 `ray-traced-spotlight-mod-dev` 内的路径（相对其根）**，不在本仓内 —— 引
+用它们是为了让下一个人能去看原始记录，而不是当成理论风险。
+
+| # | 症状（观察到什么） | 根因 | 正确写法 | 事故出处（真实） |
+|---|---|---|---|---|
+| 1 | 驱动**秒退**、游戏**空转到 150 s 上限被杀**，harness 记 `FAIL:instance-timeout` | `pwsh -File script.ps1 -Array 0,15,30` **传不了数组**：`-File` 模式把元素摊成独立 argv token，第一个元素被当成另一个开关 ⇒ 参数绑定失败 | 传**逗号分隔字符串**再在脚本内 `-split ','`（`-LagList "0,15,30"`）；或不用 `-File` 而用 `& ./script.ps1 @arrayList` / dot-source | `docs/evidence/2026-09-25-voxel-turn/README.md:74-76`（**两次空转、两次 FAIL**，自述"**同一坑犯第二次**"）；另见 `docs/evidence/2026-09-25-voxel-box/README.md:123` |
+| 2 | 驱动在**采完第 1 臂之后**抛异常 ⇒ 游戏空转，**该轮 0 臂数据全部弃用** | `[math]::ToDegrees` **在 .NET / PowerShell 里不存在**（`System.Math` 只有三角函数本体，没有角度换算） | 自己算：`$deg = [math]::Acos($x) * 180 / [math]::PI`（`ToRadians` 同理不存在） | `docs/evidence/2026-09-26-throttle-speeds/README.md:105-109`；事后留注释 `drive-throttle-speeds.ps1:142` |
+| 3 | TSV 的 `shot` 列**变成数组/多行** ⇒ 列数错乱，后续解析全歪 | PowerShell 函数**把"未捕获的输出"当返回值**：`Write-Output` 与裸表达式都进管道 ⇒ 调用方拿到多值 | 进度信息一律用 `Write-Host`（不进管道）；返回值只留**一个** `return`；调用方要么 `$row.shot = Save-Shot …`，要么 `[void](Save-Shot …)` | `docs/evidence/2026-09-26-default-day/README.md:138`（明记"修掉 TSV `shot` 列变数组的**老坑**"；6 个驱动各自写过一份 `Save-Shot`，3 种修法混用） |
+| 4 | 证据文件名出现 `shot-…sphere:1.0-….png`；`Copy-Item` / `Get-FileHash` 行为**不可靠** | Windows 文件名里的 **`:` 是 NTFS 备用数据流（ADS）分隔符**，不是普通字符 | 拼文件名前净化：`$safe = ($Tag -replace '[^A-Za-z0-9._-]', '_')` | `docs/evidence/2026-09-26-default-day/README.md:135-139`（**真机轮已开跑**才发现，就地终止驱动、改脚本、重启驱动） |
+| 5 | ① 报 `does not contain op_Subtraction`；② 正则**匹配成功但 `$Matches` 是空的** ⇒ 相机坐标解析成 `(0,0,0)`，**整轮探针扫在世界原点、结论无效** | ① `@([int]$cam[0] - 16, …)` 里**逗号优先级低于 `-`**，减法拿到 `Object[]` 操作数；② 对**数组**做 `-match` 返回**过滤后的数组**、**不设置 `$Matches`** | ① 每个表达式加括号：`@(([int]$cam[0]) - 16, ([int]$cam[1]) - 2, …)`；② 先取标量再匹配：`$one = @($lines | Select-Object -Last 1); if ($one -match '…') { $Matches[1] }` | `docs/evidence/2026-09-26-classify/README.md:148-154`（两坑叠加；臂数据未受影响但该轮没有 `!quit`，被 150 s 上限杀掉） |
+
+**通用纪律**（上表 5 条的教训）：
+* 驱动里的**每一条 sink**（`Write-Output` / 裸表达式）都要当成"会进 TSV / 会进返回值"来看待；不确定就
+  用 `Write-Host` + `[void]`。
+* **先证明"改的那份真的被读/被加载"**，再报红绿 —— 上表 5 与 `run-round` 的"漏拷"事故都是同一族的
+  "假绿/假红"。
+* 驱动崩了要**先把实例收掉**（relay `!quit`），别让游戏空转到上限：`FAIL:instance-timeout` 会污染
+  "这一轮到底跑没跑"的判断。
+
 ## Adding a tool
 
 1. Take every input path as an argument (no defaults pointing outside the repo).

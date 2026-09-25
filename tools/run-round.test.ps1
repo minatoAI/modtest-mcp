@@ -286,7 +286,11 @@ param(
     [string]$Slot, [string]$InstanceSignature
 )
 Write-Output 'STUB-HARNESS: nothing launched'
-exit 0
+# Configurable so a test can drive a round through every failure mode WITHOUT a game: the harness exit
+# code is what decides the verdict that the restore must survive (audit FAIL=7, refused=3, timeout=4).
+$stubExit = 0
+if ($env:ROUND_TEST_STUB_EXIT) { $stubExit = [int]$env:ROUND_TEST_STUB_EXIT }
+exit $stubExit
 '@ | Set-Content -LiteralPath $stubHarness -Encoding UTF8
 
 function New-FakeGameDir {
@@ -326,6 +330,46 @@ function Get-ManifestMap {
         $map[$line.Substring(0, $index)] = $line.Substring($index + 1)
     }
     return $map
+}
+
+function Invoke-RoundWithExit {
+    # Runs a round whose (stub) harness exits with the given code -- i.e. the three failure modes of a real
+    # round, reproduced offline and deterministically.
+    param([string]$Script, [string]$EvidenceDir, [int]$HarnessExit, [string[]]$ExtraArgs = @())
+    $saved = $env:ROUND_TEST_STUB_EXIT
+    try {
+        $env:ROUND_TEST_STUB_EXIT = [string]$HarnessExit
+        return Invoke-Round -Script $Script -EvidenceDir $EvidenceDir -ExtraArgs $ExtraArgs
+    } finally {
+        $env:ROUND_TEST_STUB_EXIT = $saved
+    }
+}
+
+function New-InstrumentedGameDir {
+    # A synthetic game directory plus the shas of the three files a round temporarily changes, so a test
+    # can prove they all came back.
+    param([string]$Directory)
+    New-FakeGameDir -Directory $Directory
+    return [pscustomobject]@{
+        options = (Get-FileHash -LiteralPath (Join-Path $Directory 'options.txt') -Algorithm SHA256).Hash
+        toml = (Get-FileHash -LiteralPath (Join-Path $Directory 'config\taclight-client.toml') -Algorithm SHA256).Hash
+        oculus = (Get-FileHash -LiteralPath (Join-Path $Directory 'config\oculus.properties') -Algorithm SHA256).Hash
+    }
+}
+
+function Assert-RestoredToBaseline {
+    param([string]$Name, [string]$Directory, [object]$Baseline)
+    $map = @{}
+    $map['options.txt'] = (Join-Path $Directory 'options.txt')
+    $map['taclight-client.toml'] = (Join-Path $Directory 'config\taclight-client.toml')
+    $map['oculus.properties'] = (Join-Path $Directory 'config\oculus.properties')
+    $bad = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @('options', 'toml', 'oculus')) {
+        $leaf = switch ($key) { 'options' { 'options.txt' } 'toml' { 'taclight-client.toml' } 'oculus' { 'oculus.properties' } }
+        $now = (Get-FileHash -LiteralPath $map[$leaf] -Algorithm SHA256).Hash
+        if ($now -ne $Baseline.$key) { $bad.Add($leaf) | Out-Null }
+    }
+    Add-Check ($Name + ': every transiently-changed file is back at its pre-round sha') ($bad.Count -eq 0) ('dirty=' + ($bad -join ','))
 }
 
 $anyJava = @(Get-Process java, javaw -ErrorAction SilentlyContinue).Count -gt 0
@@ -414,13 +458,16 @@ if ($OldRunner.Length -eq 0) {
     # Everything below is guarded rather than thrown on: when this suite is pointed at the PRE-CHANGE
     # runner as a red control, those files legitimately do not exist, and the suite must still reach its
     # summary and report the remaining checks (a throw under $ErrorActionPreference='Stop' hid D4/D5 once).
-    foreach ($report in @('residue-before.txt', 'restore-report.txt')) {
-        $oldPath = Join-Path $evOld ('round-setup\' + $report)
-        $newPath = Join-Path $evNew ('round-setup\' + $report)
-        $oldText = if (Test-Path -LiteralPath $oldPath) { [System.IO.File]::ReadAllText($oldPath) } else { '<missing>' }
-        $newText = if (Test-Path -LiteralPath $newPath) { [System.IO.File]::ReadAllText($newPath) } else { '<missing>' }
-        Add-Check ('D6 ' + $report + ' is byte-identical to the old runner') (($oldText -ne '<missing>') -and ($oldText -eq $newText))
-    }
+    # residue-before.txt must stay byte-identical. restore-report.txt DELIBERATELY changed format (task-40):
+    # the old one carried no sha for the toml/oculus lines and no slot, which is exactly why it was
+    # unauditable. So this asserts the intended NEW shape instead of pretending the bytes are unchanged.
+    $oldResidue = if (Test-Path -LiteralPath (Join-Path $evOld 'round-setup\residue-before.txt')) { [System.IO.File]::ReadAllText((Join-Path $evOld 'round-setup\residue-before.txt')) } else { '<missing>' }
+    $newResidue = if (Test-Path -LiteralPath (Join-Path $evNew 'round-setup\residue-before.txt')) { [System.IO.File]::ReadAllText((Join-Path $evNew 'round-setup\residue-before.txt')) } else { '<missing>' }
+    Add-Check 'D6 residue-before.txt is byte-identical to the old runner' (($oldResidue -ne '<missing>') -and ($oldResidue -eq $newResidue))
+    $newRestore = if (Test-Path -LiteralPath (Join-Path $evNew 'round-setup\restore-report.txt')) { [System.IO.File]::ReadAllText((Join-Path $evNew 'round-setup\restore-report.txt')) } else { '' }
+    Add-Check 'D6 restore-report.txt is per-slot/per-file with ROUND_RESTORE=OK (intended change)' (($newRestore -match '(?m)^ROUND_RESTORE=OK\s*$') -and ($newRestore -match '(?m)^\[restore\] slot=.+ file=options\.txt before=[0-9A-F]+ after=[0-9A-F]+ match=True\s*$'))
+    $restoreLineCount = @([regex]::Matches($newRestore, '(?m)^\[restore\] slot=')).Count
+    Add-Check 'D6 every transiently-changed file has its own [restore] line' ($restoreLineCount -ge 3) ('lines=' + $restoreLineCount)
     # setup-manifest.txt legitimately differs in the fields that name THIS run's paths and time; every
     # other field -- and the field ORDER, which is the file's shape -- must be identical.
     $mapOld = $null
@@ -481,6 +528,80 @@ Add-Check 'F9 preflight still exits 0 and warns that a real round would refuse' 
 $shasAfterPreflight = Get-TreeShas -Directory $setupF
 Add-Check 'F10 preflight changed nothing under round-setup\' (($shasBeforePreflight.Count -eq $shasAfterPreflight.Count) -and (@($shasBeforePreflight.Keys | Where-Object { $shasAfterPreflight[$_] -ne $shasBeforePreflight[$_] }).Count -eq 0))
 
+# The whole group needs a machine with no java: run-round.ps1 rightly refuses to start while any
+# java/javaw exists (exit 5, before the setup), which is a safety property we must not weaken for a test.
+$anyJavaG = @(Get-Process java, javaw -ErrorAction SilentlyContinue).Count -gt 0
+if ($anyJavaG) {
+    Add-Skip 'G restore still runs after audit FAIL / refusal / timeout' 'a java/javaw process is running, and run-round.ps1 rightly refuses to start (exit 5)'
+    Add-Skip 'G a failure inside the setup still restores' 'a java/javaw process is running, and run-round.ps1 rightly refuses to start (exit 5)'
+    Add-Skip 'G an unverifiable restore fails loudly (exit 6)' 'a java/javaw process is running, and run-round.ps1 rightly refuses to start (exit 5)'
+} else {
+    # ---------------------------------------------------------------- (G) restore is unconditional (task-40)
+    Write-Output '--- G. the round restore always runs, and never fails silently ---'
+    # Task-30 left a game directory dirty with no [restore] line and no marker. The premise "restore is skipped
+    # because the audit failed" was falsified (a3-snow\ops restored with harnessExit=4), but three real gaps
+    # remained, and these checks pin them:
+    #   * a harness FAILURE of any kind must still restore (audit FAIL / refused / timeout);
+    #   * a failure INSIDE the setup must still restore what the setup already changed;
+    #   * a restore that cannot be verified must be LOUD (exit 6), not a line buried in a green-looking run.
+
+    # G1-G3: the three harness outcomes. The stub's exit code IS the round's outcome.
+    foreach ($case in @(
+            @{ name = 'audit FAIL (7)'; code = 7 },
+            @{ name = 'refused (3)'; code = 3 },
+            @{ name = 'timeout (4)'; code = 4 })) {
+        $tag = 'g' + $case.code
+        $evG = Join-Path $tempRoot ('ev-restore-' + $tag)
+        $gdG = Join-Path $tempRoot ('game-restore-' + $tag)
+        New-FakeEvidence -Directory $evG -GameDirectory $gdG
+        $baselineG = New-InstrumentedGameDir -Directory $gdG
+        $runG = Invoke-RoundWithExit -Script $RoundRunner -EvidenceDir $evG -HarnessExit $case.code
+        $restorePath = Join-Path $evG 'round-setup\restore-report.txt'
+        $restoreText = if (Test-Path -LiteralPath $restorePath) { [System.IO.File]::ReadAllText($restorePath) } else { '' }
+        Add-Check ('G/' + $case.name + ' the round still exits with the harness code') ($runG.exit -eq $case.code) ('exit=' + $runG.exit)
+        Add-Check ('G/' + $case.name + ' stdout carries ROUND_RESTORE=OK') ($runG.stdout -match 'ROUND_RESTORE=OK')
+        Add-Check ('G/' + $case.name + ' the report has one [restore] line per changed file, all match=True') (
+            (@([regex]::Matches($restoreText, '(?m)^\[restore\] slot=.+ match=True\s*$')).Count -ge 3) -and
+            ($restoreText -notmatch 'match=False')) ('lines=' + @([regex]::Matches($restoreText, '(?m)^\[restore\] slot=')).Count)
+        Assert-RestoredToBaseline -Name ('G/' + $case.name) -Directory $gdG -Baseline $baselineG
+    }
+
+    # G4: a failure INSIDE the setup must still restore what the setup already changed. A directory where
+    # oculus.properties should be makes the setup step throw -- and options.txt has already been modified by
+    # then. Old code: the throw happened before the try, so options.txt stayed modified.
+    $evG4 = Join-Path $tempRoot 'ev-restore-setup-throw'
+    $gdG4 = Join-Path $tempRoot 'game-restore-setup-throw'
+    New-FakeEvidence -Directory $evG4 -GameDirectory $gdG4
+    $baselineG4 = New-InstrumentedGameDir -Directory $gdG4
+    Remove-Item -LiteralPath (Join-Path $gdG4 'config\oculus.properties') -Force
+    New-Item -ItemType Directory -Force -Path (Join-Path $gdG4 'config\oculus.properties') | Out-Null
+    $runG4 = Invoke-RoundWithExit -Script $RoundRunner -EvidenceDir $evG4 -HarnessExit 0
+    $restoreG4 = if (Test-Path -LiteralPath (Join-Path $evG4 'round-setup\restore-report.txt')) { [System.IO.File]::ReadAllText((Join-Path $evG4 'round-setup\restore-report.txt')) } else { '' }
+    Add-Check 'G/setup throws -> the round still reports a restore outcome' ($runG4.stdout -match 'ROUND_RESTORE=')
+    Add-Check 'G/setup throws -> options.txt is restored to its pre-round sha anyway' ((Get-FileHash -LiteralPath (Join-Path $gdG4 'options.txt') -Algorithm SHA256).Hash -eq $baselineG4.options)
+    Add-Check 'G/setup throws -> the restore report records the successful per-file restore' ($restoreG4 -match '(?m)^ROUND_RESTORE=OK\s*$')
+
+    # G5: a restore that cannot be verified must FAIL LOUDLY with exit 6. Holding the file open for reading but
+    # not writing lets the setup's read succeed and makes both its write and the restore's copy fail.
+    $evG5 = Join-Path $tempRoot 'ev-restore-locked'
+    $gdG5 = Join-Path $tempRoot 'game-restore-locked'
+    New-FakeEvidence -Directory $evG5 -GameDirectory $gdG5
+    $baselineG5 = New-InstrumentedGameDir -Directory $gdG5
+    $optionsG5 = Join-Path $gdG5 'options.txt'
+    $lock = [System.IO.File]::Open($optionsG5, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $runG5 = Invoke-RoundWithExit -Script $RoundRunner -EvidenceDir $evG5 -HarnessExit 0
+    } finally {
+        $lock.Close(); $lock.Dispose()
+    }
+    $restoreG5 = if (Test-Path -LiteralPath (Join-Path $evG5 'round-setup\restore-report.txt')) { [System.IO.File]::ReadAllText((Join-Path $evG5 'round-setup\restore-report.txt')) } else { '' }
+    Add-Check 'G/unverifiable restore -> exit code 6 (RESTORE-FAILED), not a green-looking code' ($runG5.exit -eq 6) ('exit=' + $runG5.exit)
+    Add-Check 'G/unverifiable restore -> stdout says ROUND_RESTORE=FAIL and names the file' (($runG5.stdout -match 'ROUND_RESTORE=FAIL') -and ($runG5.stdout -match 'options\.txt'))
+    Add-Check 'G/unverifiable restore -> the failure is in the evidence too' (($restoreG5 -match '(?m)^ROUND_RESTORE=FAIL:.*options\.txt'))
+    Add-Check 'G/unverifiable restore -> the report marks that file match=False' ($restoreG5 -match '(?m)^\[restore\] slot=.+ file=options\.txt .* match=False\s*$')
+
+
+}
 # ---------------------------------------------------------------- (E) parallel scope passthrough
 Write-Output '--- E. -Slot / -InstanceSignature reach the bounded runner ---'
 # task-39 defect 2: the ability to scope a round to its own instance existed in run-bounded.ps1, but the

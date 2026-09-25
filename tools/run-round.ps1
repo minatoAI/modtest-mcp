@@ -240,6 +240,30 @@ New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
 
 function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 
+function Restore-OneFile {
+    # Restores one file from its pre-round backup and reports the result in ONE line that names the slot,
+    # the file and BOTH shas. Task-40: the old reporting was too weak to audit -- the toml and oculus
+    # lines carried no shas at all and nothing identified the slot -- and a failed restore was a single
+    # "ERROR" line while the exit code stayed the harness's, so a silently dirty game directory could be
+    # mistaken for a clean one. Every failure is collected; the caller turns that into exit code 6.
+    param([string]$Name, [string]$Backup, [string]$Target, [string]$ShaBefore, [bool]$Needed)
+    if (-not $Needed) { return }
+    $shaAfter = ''
+    $ok = $false
+    try {
+        Copy-Item -LiteralPath $Backup -Destination $Target -Force -ErrorAction Stop
+        $shaAfter = Get-Sha256 $Target
+        $ok = ($shaAfter -eq $ShaBefore)
+    } catch {
+        $shaAfter = '<error>'
+        Write-Output ('[restore] ERROR: ' + $Name + ' could not be restored: ' + $_.Exception.Message)
+    }
+    if (-not $ok) { [void]$script:restoreFailures.Add($Name) }
+    $line = ('[restore] slot={0} file={1} before={2} after={3} match={4}' -f $script:slotLabel, $Name, $ShaBefore, $shaAfter, $ok)
+    [void]$script:restoreLines.Add($line)
+    Write-Output $line
+}
+
 $manifest = New-Object System.Collections.Generic.List[string]
 $manifest.Add('round=' + (Get-Date).ToString('o'))
 $manifest.Add('gameDir=' + $gameDir)
@@ -291,7 +315,20 @@ $restoreOptions = $false
 $restoreToml = $false
 $restoreOculus = $false
 $optionsShaBefore = ''
+$tomlShaBefore = ''
 $oculusShaBefore = ''
+
+# --- everything from the FIRST modification onwards goes through the finally below -----------------
+# The setup MUST be inside the try (task-40): it exists to leave the game directory changed during the
+# round, so if it fails half way -- say at the toml step -- the files it already changed would otherwise
+# stay changed, with no restore attempted at all. The old shape only wrapped the launch.
+$harnessExit = 99
+$setupError = ''
+$script:restoreFailures = New-Object System.Collections.Generic.List[string]
+$script:restoreLines = New-Object System.Collections.Generic.List[string]
+$script:slotLabel = if ($Slot.Length -gt 0) { $Slot } else { (Split-Path -Leaf $gameDir) }
+if ($script:slotLabel.Length -eq 0) { $script:slotLabel = 'default' }
+try {
 
 if (-not $SkipOptionsSetup) {
     if (-not (Test-Path -LiteralPath $optionsPath)) { throw ('options.txt not found: ' + $optionsPath) }
@@ -312,8 +349,9 @@ if (-not $SkipOptionsSetup) {
 
     if (Test-Path -LiteralPath $tomlPath) {
         Copy-Item -LiteralPath $tomlPath -Destination $tomlBackup -Force
+        $tomlShaBefore = Get-Sha256 $tomlBackup
         $restoreToml = $true
-        $manifest.Add('taclightClientTomlBeforeSha256=' + (Get-Sha256 $tomlBackup))
+        $manifest.Add('taclightClientTomlBeforeSha256=' + $tomlShaBefore)
     }
 
     if (Test-Path -LiteralPath $oculusPath) {
@@ -337,39 +375,59 @@ if (-not $SkipOptionsSetup) {
 
 $manifest | Set-Content -Encoding UTF8 (Join-Path $setupDir 'setup-manifest.txt')
 
-# --- 3. run the bounded instance, then restore ----------------------------
-$harnessExit = 99
-try {
-    & $HarnessPath @harnessParameters
-    $harnessExit = $LASTEXITCODE
+# --- 3. run the bounded instance (the finally below restores whatever section 2 changed) ----------
+& $HarnessPath @harnessParameters
+$harnessExit = $LASTEXITCODE
+} catch {
+    # A setup failure (or anything unexpected around the launch) is CAUGHT, not left to kill the script:
+    # an unhandled exception would run the finally below and then terminate BEFORE the exit-code logic, so
+    # a failed restore would still have reported the wrong code (measured: exit 1 instead of 6).
+    $setupError = $_.Exception.Message
+    Write-Output ('[round] ERROR: ' + $setupError)
 } finally {
+    # RESTORE IS UNCONDITIONAL: it does not depend on the harness's exit code, on the audit verdict, or on
+    # whether the round was refused or timed out. Evidence that this already held: 2026-09-27-a3-snow\ops
+    # restored with match=True while the round itself exited 4 (instance timeout). What this change adds is
+    # (a) the setup being covered too -- see above -- and (b) reporting strong enough to audit, plus a
+    # dedicated exit code, so "silently left dirty" cannot happen again.
     $restore = New-Object System.Collections.Generic.List[string]
+    $restore.Add('slot=' + $script:slotLabel)
     $restore.Add('harnessExit=' + $harnessExit)
-    if ($restoreOptions) {
-        Copy-Item -LiteralPath $optionsBackup -Destination $optionsPath -Force
-        $shaNow = Get-Sha256 $optionsPath
-        $ok = ($shaNow -eq $optionsShaBefore)
-        $restore.Add(('options.txt restored sha256={0} matches-before={1}' -f $shaNow, $ok))
-        Write-Output ('[restore] options.txt sha ' + $shaNow.Substring(0, 12) + '... matches-before=' + $ok)
-        if (-not $ok) { Write-Output '[restore] ERROR: options.txt restore sha mismatch' }
-    }
-    if ($restoreToml) {
-        $tomlShaBefore = (Get-Sha256 $tomlBackup)
-        Copy-Item -LiteralPath $tomlBackup -Destination $tomlPath -Force
-        $tomlShaNow = Get-Sha256 $tomlPath
-        $restore.Add(('taclight-client.toml restored sha256={0} matches-before={1}' -f $tomlShaNow, ($tomlShaNow -eq $tomlShaBefore)))
-        Write-Output ('[restore] taclight-client.toml matches-before=' + ($tomlShaNow -eq $tomlShaBefore))
-    }
-    if ($restoreOculus) {
-        Copy-Item -LiteralPath $oculusBackup -Destination $oculusPath -Force
-        $oculusShaNow = Get-Sha256 $oculusPath
-        $restore.Add(('oculus.properties restored sha256={0} matches-before={1}' -f $oculusShaNow, ($oculusShaNow -eq $oculusShaBefore)))
-        Write-Output ('[restore] oculus.properties matches-before=' + ($oculusShaNow -eq $oculusShaBefore))
-    }
+    $restore.Add('canonicalScript=' + $PSCommandPath)
+
+    Restore-OneFile -Name 'options.txt' -Backup $optionsBackup -Target $optionsPath -ShaBefore $optionsShaBefore -Needed $restoreOptions
+    Restore-OneFile -Name 'taclight-client.toml' -Backup $tomlBackup -Target $tomlPath -ShaBefore $tomlShaBefore -Needed $restoreToml
+    Restore-OneFile -Name 'oculus.properties' -Backup $oculusBackup -Target $oculusPath -ShaBefore $oculusShaBefore -Needed $restoreOculus
+
     $javaAfter = @(Get-Process java, javaw -ErrorAction SilentlyContinue)
     $restore.Add('javaAfter=' + $javaAfter.Count)
-    Write-Output ('[restore] java processes after round = ' + $javaAfter.Count)
+    Write-Output ('[restore] slot=' + $script:slotLabel + ' java processes after round = ' + $javaAfter.Count)
+    if ($script:restoreFailures.Count -gt 0) {
+        $restore.Add('ROUND_RESTORE=FAIL:' + ($script:restoreFailures -join ','))
+    } else {
+        $restore.Add('ROUND_RESTORE=OK')
+    }
+    # The per-file lines go into the report too, so the evidence alone answers "which slot, which file,
+    # which shas, restored or not" without needing the captured stdout.
+    foreach ($line in $script:restoreLines) { $restore.Add($line) }
     $restore | Set-Content -Encoding UTF8 (Join-Path $setupDir 'restore-report.txt')
+
+    if ($script:restoreFailures.Count -gt 0) {
+        Write-Output ('ROUND_RESTORE=FAIL:' + ($script:restoreFailures -join ','))
+        Write-Output '[restore] FAIL-LOUD: the game directory is NOT verified back to its pre-round state; exit code 6. Fix it before starting another round.'
+    } else {
+        Write-Output ('ROUND_RESTORE=OK slot=' + $script:slotLabel)
+    }
 }
 
+if ($script:restoreFailures.Count -gt 0) {
+    # 6 = RESTORE-FAILED (documented in tools/README.md). Deliberately takes precedence over both the
+    # harness's exit code and a setup error: a dirty game directory is a failure the NEXT round inherits,
+    # and it must not be something a green-looking code can hide.
+    exit 6
+}
+if ($setupError.Length -gt 0) {
+    Write-Output ('ROUND_ERROR=' + $setupError)
+    exit 1
+}
 exit $harnessExit

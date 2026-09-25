@@ -12,7 +12,8 @@
 # ASCII only. Usage:
 #   pwsh post-round-gates.ps1 -ShadersDir <gameDir>\patched_shaders -Evidence <ev>\gates `
 #        -Require 'taclight_vox_transmit;code >= 4.0' -Forbid '/4u' `
-#        -GlslangBaseline <ev>\glslang-baseline.json -MinFiles 100
+#        -GlslangBaseline <ev>\glslang-baseline.json -MinFiles 100 `
+#        -RequireRestore -RoundEvidence <ev>          # <-- the round's evidence, holding round-setup\
 #
 # Exit: 0 = all gates passed, 1 = at least one gate failed, 2 = setup error.
 
@@ -41,7 +42,19 @@ param(
     # tool location (defaults to this script's directory)
     [string]$ToolsDir = '',
     [switch]$SkipAudit,
-    [switch]$SkipGlslang
+    [switch]$SkipGlslang,
+    # ---- gate 3: was the game directory put back? (task-40) --------------------------------------
+    # The ROUND's evidence directory (the one holding round-setup\). A round driven straight through
+    # run-bounded.ps1 bypasses run-round.ps1's transient setup/restore BY DESIGN, and the result is a
+    # silently dirty game directory -- measured on the task-30 parallel run, whose evidence has no
+    # round-setup\ at all. Nothing can force a caller to use the entry point after the fact, but the
+    # EVIDENCE can be required to prove it was used: round-setup\restore-report.txt must exist and must
+    # say ROUND_RESTORE=OK.
+    [string]$RoundEvidence = '',
+    # Make the restore gate mandatory: without -RoundEvidence this FAILS instead of being skipped. A round
+    # gate call should always pass this, so "no evidence" can never pass for "restored".
+    [switch]$RequireRestore,
+    [switch]$SkipRestoreGate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -103,6 +116,45 @@ if (-not $SkipGlslang) {
     if ($r.exit -ne 0) { $failed.Add("glslang-check exit=$($r.exit)") }
 }
 
+# ---- gate 3: did the round give the game directory back? (task-40) --------
+if (-not $SkipRestoreGate) {
+    $restoreReport = ''
+    if ($RoundEvidence.Length -gt 0) { $restoreReport = Join-Path $RoundEvidence 'round-setup\restore-report.txt' }
+    $restoreText = ''
+    if ($restoreReport.Length -gt 0 -and (Test-Path -LiteralPath $restoreReport -PathType Leaf)) {
+        $restoreText = [System.IO.File]::ReadAllText($restoreReport)
+    }
+    $r = [ordered]@{
+        name = 'restore'
+        roundEvidence = $RoundEvidence
+        report = $restoreReport
+        reportSha256 = (Get-Sha256 $restoreReport)
+        present = ($restoreText.Length -gt 0)
+        roundRestoreOk = ($restoreText -match '(?m)^ROUND_RESTORE=OK\s*$')
+        perFileLines = @([regex]::Matches($restoreText, '(?m)^\[restore\] slot=')).Count
+        output = @()
+    }
+    if ($RoundEvidence.Length -eq 0) {
+        # Only a failure when the caller said the check is required; otherwise it is reported as skipped so
+        # shader-only invocations keep working. -RequireRestore exists so "forgot the flag" cannot be the
+        # reason a round passed.
+        $r.exit = if ($RequireRestore) { 1 } else { -1 }
+        $r.skipped = (-not $RequireRestore)
+        $r.reason = 'no -RoundEvidence given: cannot prove the game directory was restored by run-round.ps1'
+    } elseif (-not $r.present) {
+        $r.exit = 1
+        $r.reason = 'round-setup\restore-report.txt is missing: this round did not go through run-round.ps1 (which is what restores), or it died before writing the report'
+    } elseif (-not $r.roundRestoreOk) {
+        $r.exit = 1
+        $r.reason = 'restore-report.txt has no ROUND_RESTORE=OK: the game directory was NOT verified back to its pre-round state'
+    } else {
+        $r.exit = 0
+    }
+    $gates['restore'] = $r
+    if ($r.exit -gt 0) { $failed.Add('restore gate: ' + $r.reason) }
+    if ($r.exit -eq -1) { Write-Output ('[restore-gate] SKIPPED: ' + $r.reason) }
+}
+
 $verdict = if ($failed.Count -eq 0) { 'PASS' } else { 'FAIL' }
 $report = [ordered]@{
     label = $Label
@@ -111,6 +163,8 @@ $report = [ordered]@{
     forbid = $Forbid
     minFiles = $MinFiles
     glslangBaseline = $GlslangBaseline
+    roundEvidence = $RoundEvidence
+    restoreRequired = [bool]$RequireRestore
     verdict = $verdict
     failed = $failed.ToArray()
     gates = $gates
@@ -118,7 +172,10 @@ $report = [ordered]@{
 $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $Evidence 'post-round-gates.json') -Encoding UTF8
 
 foreach ($k in $gates.Keys) {
-    Write-Output ("[$k] exit=" + $gates[$k].exit + " toolSha256=" + $gates[$k].toolSha256.Substring(0, [Math]::Min(16, $gates[$k].toolSha256.Length)))
+    # The restore gate is decided in-script, so it has no tool sha; guard the field rather than assuming it.
+    $toolSha = [string]$gates[$k].toolSha256
+    $shaText = if ($toolSha.Length -gt 0) { ' toolSha256=' + $toolSha.Substring(0, [Math]::Min(16, $toolSha.Length)) } else { '' }
+    Write-Output ("[$k] exit=" + $gates[$k].exit + $shaText)
     $gates[$k].output | Select-Object -Last 6 | ForEach-Object { Write-Output ("    " + $_) }
 }
 Write-Output ("GATES_REPORT=" + (Join-Path $Evidence 'post-round-gates.json'))

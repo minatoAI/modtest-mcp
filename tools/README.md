@@ -30,8 +30,10 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `rcon.ps1` | PowerShell 5.1 / 7 | `pwsh tools/rcon.ps1 -ServerHost <host> -Command "list"` (password via prompt/env) |
 | `run-bounded.ps1` | **Windows only** (process/watchdog/CPU audit) | `pwsh tools/run-bounded.ps1 -FilePath <exe> [-ArgumentList …] [-WorkingDirectory …] [-Windowed] [-OptionsFile run/options.txt] [-MaxInstances 1] [-Slot <name>] [-InstanceSignature <s>]` — hard caps **≤6 min/instance** (watchdog `Stop-Process`) and **≤25 min/round**, **refuses to start only if a process carrying THIS round's instance signature is already present** — and that match is **exact** (the candidate's parsed `--gameDir` must equal ours; a teammate's Gradle daemon or a sibling slot whose directory is a *prefix* of ours is reported `NOT BLOCKING:` and ignored). No signature ⇒ FAIL-CLOSED as before — see "Running several instances in parallel", always audits afterwards (target gone + no orphan `java.exe` + CPU/memory recovered) and writes per-run JSON/TXT metrics; `-DryRun -DryRunScenario ok\|timeout\|stall\|refuse\|orphan\|tree` self-tests every path **without starting a JVM**. **A REFUSAL (exit 3) now writes evidence too** — until 2026-09-27 it produced no file at all, which made refusals unattributable after the fact; the JSON now carries `verdict=REFUSED` plus a `blocking[]` array whose entries hold pid / name / title / reason / **scope** and a truncated **command line**, plus `blockingOutOfScope[]` for the matches that were ignored, because on a shared machine "a java process exists" cannot tell a teammate's build JVM from a real game client (all three refusals recorded 2026-09-25/26 were somebody else's Gradle daemon). It remains a refusal only: **nothing is launched, nothing is killed**, and no command-line exclusion was added. **Wrapper launches need `-KillProcessTree`**: if `-FilePath` is a wrapper (`renderdoccmd.exe`, a `*.bat` shim) a single-pid kill leaves the real client alive as an orphan — measured 2026-09-25, `pid=26308 java "Minecraft* Forge …"` survived a `stall-killed` round. `-KillProcessTree` (opt-in, plus `-KillProcessTreeExcludePattern`, default `GradleDaemon`) kills the instance's **descendants** only, deepest-first, and records each kill in `instances[].treeKill`. It is deliberately not the default: on a `gradlew.bat` launch the descendant chain runs through a **shared Gradle daemon**. When the audit sees any survivor the run prints one line and records `audit.leftoverHint` telling you to add `-KillProcessTree` next time |
 | `run-bounded.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-bounded.test.ps1` → `RUN-BOUNDED-TEST PASS (93 checks)` (offline: drives the runner's 6 `-DryRun` scenarios, asserts exit code + audit verdict + the `caps` field semantics + the refusal's `blocking[]` attribution + the **guard scope** (unrelated signature must not block, same signature must block) + `slot` + pid-based window selection + the `-KillProcessTree` descendant kill **in both directions**; **never starts a JVM**) |
-| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>] [-Slot <name>] [-InstanceSignature <sig>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below. `-Slot`/`-InstanceSignature` are forwarded to the bounded runner (default signature = the gameDir from `launch-args.json`), so a round is scoped to its own instance and parallel slots no longer refuse each other |
-| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (49 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, and **per-round outputs never clobber** — driven through a stub harness, so no JVM is ever started; `-OldRunner` enables the byte-identical single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
+| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>] [-Slot <name>] [-InstanceSignature <sig>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below. `-Slot`/`-InstanceSignature` are forwarded to the bounded runner (default signature = the gameDir from `launch-args.json`), so a round is scoped to its own instance and parallel slots no longer refuse each other. **Restore is unconditional and reported per slot** (`[restore] slot=… file=… before=… after=… match=…`, `ROUND_RESTORE=OK`), and a restore that cannot be verified exits **6** — see "Round teardown" below |
+| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (79 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, **per-round outputs never clobber**, **the round restore is unconditional and fails loudly** — all driven through a stub harness whose exit code is configurable, so no JVM is ever started; `-OldRunner` enables the single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
+| `post-round-gates.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.ps1 -ShadersDir <gameDir>\patched_shaders -Evidence <ev>\gates [-Require ...] [-RequireRestore -RoundEvidence <ev>]` → `GATES_VERDICT=PASS\|FAIL` — runs the offline shader gates (injection audit + glslang compile) as one step, **plus a restore gate**: `-RequireRestore -RoundEvidence <ev>` asserts the round's `round-setup\restore-report.txt` exists and says `ROUND_RESTORE=OK`, else FAIL. Without `-RoundEvidence` the restore gate is **skipped and says so** (shader-only callers keep working); with `-RequireRestore` but no evidence it FAILs, so "forgot the flag" cannot pass |
+| `post-round-gates.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/post-round-gates.test.ps1` → `POST-ROUND-GATES-TEST PASS (12 checks)` — offline (~1 s, shader gates switched off): the restore gate's four verdicts (skipped/required-without-evidence/missing report/`ROUND_RESTORE=FAIL`) and the recorded per-file line count |
 
 ## Conventions
 
@@ -283,6 +285,46 @@ yielding the same sha; the code carrying that property has not been changed sinc
 `docs/.gradle-lock` before any gradle**; and **no gradle while a real round is running** — it is CPU / RAM /
 disk noise the round did not ask for. `assert-no-round.ps1 -What gradle-build` enforces both conditions
 (no real round AND no lock holder) and is meant to be run as its own command before every build.
+
+### Round teardown: the restore must be unconditional and loud (task-40)
+
+`run-round.ps1` changes the game directory for the duration of a round (`pauseOnLostFocus=false`,
+`enableDebugOptions=true`, plus backups of `config\taclight-client.toml`) and must put it all back. What it
+guarantees now:
+
+1. **Restore is unconditional.** The setup, the launch and the restore are inside one `try/finally`, so a
+   failure **inside the setup** still restores whatever the setup already changed (before task-40 the
+   `try` began at the launch, so a mid-setup failure left `options.txt` modified). The restore does not
+   depend on the harness exit code, on the audit verdict, or on the round being refused or timed out —
+   evidence from before the change: `2026-09-27-a3-snow\ops` restored with `match=True` while that round
+   exited **4** (instance timeout).
+2. **One line per file per slot**, in stdout **and** in `round-setup\restore-report.txt`:
+   ```
+   [restore] slot=<slot> file=options.txt          before=<sha256> after=<sha256> match=True
+   [restore] slot=<slot> file=taclight-client.toml before=<sha256> after=<sha256> match=True
+   [restore] slot=<slot> file=oculus.properties    before=<sha256> after=<sha256> match=True
+   ROUND_RESTORE=OK
+   ```
+3. **A failed restore is loud**: `ROUND_RESTORE=FAIL:<files>` in stdout and in the report, and the process
+   exits **6 = RESTORE-FAILED**, which takes precedence over the harness's own code. Exit codes so far:
+   `0` ok, `2` bad params/refused-to-overwrite, `3` refused (bounded runner), `4` instance timeout,
+   `5` java already running, `6` **restore failed**, `7` audit failed, `8` launch failed.
+
+**What "back to before the round" means for `taclight-client.toml`**: the baseline is the harness's
+pre-round `.orig` backup, **not** "the value the mod considers default". The mod writes that file during a
+round on purpose (`TacLightCommand` / `TuneService`: 调参写回, "重启保留"), so if a round retuned knobs, the
+restore **is supposed to undo it** — that is exactly what `match=True` against the `.orig` means.
+
+⚠️ **If you bypass the entry point there is no restore, by design.** A round driven straight through
+`run-bounded.ps1` (or a bespoke driver) gets no transient setup and therefore no teardown; the driver owns
+the game directory. That is what happened on the 2026-09-27 task-30 parallel run: its evidence contains no
+`round-setup\` at all, and two slots were left dirty until they were restored by hand. Two consequences:
+
+- a **parallel driver must call `run-round.ps1` per slot** —
+  `run-round.ps1 -Evidence <ev>\B -Slot B -InstanceSignature <gameDirB>` (task-39 forwards both);
+- the bypass is now a **machine-checkable** evidence failure rather than a convention:
+  `post-round-gates.ps1 -RequireRestore -RoundEvidence <ev>` FAILs when that round has no
+  `round-setup\restore-report.txt` or no `ROUND_RESTORE=OK` in it.
 
 ### Per-round outputs (task-38)
 

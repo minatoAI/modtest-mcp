@@ -14,6 +14,17 @@
 #   $PSScriptRoot; -Evidence is still resolved against the CALLER's working directory, exactly as
 #   the archived copies did.
 #
+# PER-ROUND OUTPUTS -- ONE ROUND MUST NEVER OVERWRITE ANOTHER (2026-09-27, task-38)
+#   This script's outputs under -Evidence have FIXED names: round-setup\residue-before.txt,
+#   round-setup\setup-manifest.txt, round-setup\restore-report.txt (plus the three *.orig backups).
+#   Two rounds sharing one -Evidence root therefore clobbered each other, and round 1's harness verdict
+#   became permanently unreferenceable (measured on task-31/A2). Consequences, in order of preference:
+#     1. give each round its own subdirectory:  -Evidence <dir>\r1   (the historical practice)
+#     2. or share one root and tag the round:   -RunTag r1  ->  round-setup\r1\...
+#   And by default, if any of those outputs already exists, this script REFUSES (exit 2) and names each
+#   conflict instead of overwriting it. The untagged layout and file names are unchanged, so
+#   single-round evidence stays byte-identical to earlier rounds.
+#
 # Reads launch-args.json (produced by make-launch-args.ps1) and splats the argument array from
 # THIS session -- `pwsh -File runner.ps1 -ArgumentList <array>` cannot work, because -File mode
 # flattens the array into separate argv tokens and the first element is read as another switch.
@@ -71,7 +82,13 @@ param(
     # Escape hatch for a deliberate "leave it as found" diagnostic round.
     [switch]$SkipOptionsSetup,
     # Read-only: resolve + report, touch nothing (no residue cleanup, no options.txt edit, no launch).
-    [switch]$PreflightOnly
+    [switch]$PreflightOnly,
+    # Per-round output subdirectory. Empty (the default) keeps the historical layout EXACTLY: the three
+    # report files and the three *.orig backups go straight into round-setup\, so single-round evidence
+    # stays byte-identical to what earlier rounds produced. When set, those files go into
+    # round-setup\<tag>\ instead -- which is how two rounds share one -Evidence root without
+    # overwriting each other. See the clobber check below for why this is not just tidiness.
+    [string]$RunTag = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,6 +103,43 @@ if (-not (Test-Path -LiteralPath $launchPath)) {
 $launch = Get-Content -LiteralPath $launchPath -Raw | ConvertFrom-Json
 $gameDir = [string]$launch.game_directory
 $setupDir = Join-Path $Evidence 'round-setup'
+
+# --- per-round setup outputs: NEVER clobber a previous round ------------------------------------
+# Measured loss (2026-09-27, task-31/A2): two rounds sharing one -Evidence root overwrote each other's
+# fixed-name outputs, so round 1's harness verdict became PERMANENTLY UNREFERENCEABLE. The fix is
+# "refuse to overwrite by default", not "rename": the file names stay stable, and the caller either
+# gives each round its own -Evidence subdirectory (the historical practice -- r1/, r2/, rA-narrow/, ...)
+# or passes -RunTag <tag> so the files land in round-setup\<tag>\.
+#
+# The check covers every file this script writes in that directory, INCLUDING the three *.orig backups:
+# those hold the "as found" bytes that the restore step restores FROM, so letting a later round
+# overwrite them with its own pre-round state would silently destroy the pristine reference.
+$setupOutputNames = @(
+    'residue-before.txt',
+    'setup-manifest.txt',
+    'restore-report.txt',
+    'options.txt.orig',
+    'taclight-client.toml.orig',
+    'oculus.properties.orig'
+)
+if ($RunTag.Length -gt 0) {
+    # The tag becomes one directory name: reject anything that could escape it, or is empty.
+    if ($RunTag.Trim().Length -eq 0 -or $RunTag -match '[\\/:*?"<>|]' -or $RunTag -match '^\.+$') {
+        Write-Output ('ROUND_PREFLIGHT=FAIL:bad-run-tag [' + $RunTag + ']')
+        Write-Output '[round] -RunTag must be a single directory name: no path separators, and not "." or ".."'
+        exit 2
+    }
+    $setupDir = Join-Path $setupDir $RunTag
+}
+function Get-SetupOutputConflicts([string]$Directory, [string[]]$Names) {
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $Names) {
+        $candidate = Join-Path $Directory $name
+        if (Test-Path -LiteralPath $candidate) { $hits.Add($candidate) }
+    }
+    return $hits
+}
+$runTagDirExists = ($RunTag.Length -gt 0) -and (Test-Path -LiteralPath $setupDir)
 
 # --- resolve the harness WITHOUT any machine-absolute path (v3) -------------
 if ($HarnessPath.Length -eq 0) {
@@ -126,6 +180,17 @@ Write-Output ('[round] harnessExists=' + $harnessExists)
 if ($PreflightOnly) {
     # READ-ONLY: no residue cleanup, no options.txt / toml / oculus edits, no process launched.
     Write-Output ('[round] evidence=' + (Resolve-Path -LiteralPath $Evidence).Path)
+    Write-Output ('[round] setupDir=' + $setupDir)
+    # Reporting the clobber condition here is a courtesy, not a behaviour change: preflight keeps its
+    # exit codes and still writes nothing (a test asserts that). The refusing happens below, in the
+    # real-round path, so that "preflight says OK" keeps meaning "the invocation itself is well-formed".
+    if ($runTagDirExists) { Write-Output ('[round] WARNING: that -RunTag directory already exists: ' + $setupDir) }
+    $preflightConflicts = @(Get-SetupOutputConflicts -Directory $setupDir -Names $setupOutputNames)
+    if ($preflightConflicts.Count -gt 0) {
+        Write-Output ('[round] WARNING: a real round would REFUSE -- ' + $preflightConflicts.Count + ' round-setup output(s) already exist:')
+        foreach ($conflict in $preflightConflicts) { Write-Output ('  conflict: ' + $conflict) }
+        Write-Output '[round] WARNING: use a per-round -Evidence subdirectory, or -RunTag <tag>.'
+    }
     Write-Output ('[round] harnessArgv=' + ($harnessParameters | ConvertTo-Json -Compress -Depth 4))
     if (-not $harnessExists) {
         Write-Output 'ROUND_PREFLIGHT=FAIL:no-harness'
@@ -140,6 +205,21 @@ if (-not $harnessExists) {
     exit 2
 }
 
+# --- refuse to clobber: this is the property that protects a previous round's evidence -----------
+if ($runTagDirExists) {
+    Write-Output ('ROUND_PREFLIGHT=FAIL:run-tag-exists ' + $setupDir)
+    Write-Output '[round] REFUSING: that -RunTag directory already exists. Pick another tag, or another -Evidence subdirectory. Nothing was written.'
+    exit 2
+}
+$setupConflicts = @(Get-SetupOutputConflicts -Directory $setupDir -Names $setupOutputNames)
+if ($setupConflicts.Count -gt 0) {
+    Write-Output 'ROUND_PREFLIGHT=FAIL:outputs-exist'
+    Write-Output ('[round] REFUSING to overwrite ' + $setupConflicts.Count + ' existing round-setup output(s) -- a previous round''s evidence must stay intact:')
+    foreach ($conflict in $setupConflicts) { Write-Output ('  conflict: ' + $conflict) }
+    Write-Output '[round] Use a per-round -Evidence subdirectory (historical practice: -Evidence <dir>\r1), or pass -RunTag <tag> to write into round-setup\<tag>\. Nothing was written.'
+    exit 2
+}
+
 New-Item -ItemType Directory -Force -Path $setupDir | Out-Null
 
 function Get-Sha256([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
@@ -150,6 +230,11 @@ $manifest.Add('gameDir=' + $gameDir)
 $manifest.Add('timeoutSec=' + $TimeoutSec)
 $manifest.Add('harnessPath=' + $HarnessPath)
 $manifest.Add('canonicalScript=' + $PSCommandPath)
+if ($RunTag.Length -gt 0) {
+    # Additive, and only when tagged: an untagged manifest must stay byte-identical to before, which is
+    # the compatibility property this change is required to preserve.
+    $manifest.Add('runTag=' + $RunTag)
+}
 
 # --- 1. residue cleanup ---------------------------------------------------
 $javaNow = @(Get-Process java, javaw -ErrorAction SilentlyContinue)

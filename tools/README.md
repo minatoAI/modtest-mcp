@@ -30,8 +30,8 @@ position/telemetry CSVs). They contain no game code and no knowledge of any part
 | `rcon.ps1` | PowerShell 5.1 / 7 | `pwsh tools/rcon.ps1 -ServerHost <host> -Command "list"` (password via prompt/env) |
 | `run-bounded.ps1` | **Windows only** (process/watchdog/CPU audit) | `pwsh tools/run-bounded.ps1 -FilePath <exe> [-ArgumentList …] [-WorkingDirectory …] [-Windowed] [-OptionsFile run/options.txt] [-MaxInstances 1] [-Slot <name>] [-InstanceSignature <s>]` — hard caps **≤6 min/instance** (watchdog `Stop-Process`) and **≤25 min/round**, **refuses to start only if a process carrying THIS round's instance signature is already present** (a teammate's Gradle daemon or another slot is reported `NOT BLOCKING:` and ignored; no signature ⇒ FAIL-CLOSED as before — see "Running several instances in parallel"), always audits afterwards (target gone + no orphan `java.exe` + CPU/memory recovered) and writes per-run JSON/TXT metrics; `-DryRun -DryRunScenario ok\|timeout\|stall\|refuse\|orphan\|tree` self-tests every path **without starting a JVM**. **A REFUSAL (exit 3) now writes evidence too** — until 2026-09-27 it produced no file at all, which made refusals unattributable after the fact; the JSON now carries `verdict=REFUSED` plus a `blocking[]` array whose entries hold pid / name / title / reason / **scope** and a truncated **command line**, plus `blockingOutOfScope[]` for the matches that were ignored, because on a shared machine "a java process exists" cannot tell a teammate's build JVM from a real game client (all three refusals recorded 2026-09-25/26 were somebody else's Gradle daemon). It remains a refusal only: **nothing is launched, nothing is killed**, and no command-line exclusion was added. **Wrapper launches need `-KillProcessTree`**: if `-FilePath` is a wrapper (`renderdoccmd.exe`, a `*.bat` shim) a single-pid kill leaves the real client alive as an orphan — measured 2026-09-25, `pid=26308 java "Minecraft* Forge …"` survived a `stall-killed` round. `-KillProcessTree` (opt-in, plus `-KillProcessTreeExcludePattern`, default `GradleDaemon`) kills the instance's **descendants** only, deepest-first, and records each kill in `instances[].treeKill`. It is deliberately not the default: on a `gradlew.bat` launch the descendant chain runs through a **shared Gradle daemon**. When the audit sees any survivor the run prints one line and records `audit.leftoverHint` telling you to add `-KillProcessTree` next time |
 | `run-bounded.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-bounded.test.ps1` → `RUN-BOUNDED-TEST PASS (81 checks)` (offline: drives the runner's 6 `-DryRun` scenarios, asserts exit code + audit verdict + the `caps` field semantics + the refusal's `blocking[]` attribution + the **guard scope** (unrelated signature must not block, same signature must block) + `slot` + pid-based window selection + the `-KillProcessTree` descendant kill **in both directions**; **never starts a JVM**) |
-| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing** |
-| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence]` → `RUN-ROUND-TEST PASS (19 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance; never starts a JVM) |
+| `run-round.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.ps1 -Evidence <evidence dir> [-TimeoutSec 150] [-RestoreCursor] [-PreflightOnly] [-RunTag <tag>]` — **the canonical round entry point**: snapshots/restores `options.txt` / `taclight-client.toml` / `oculus.properties`, clears per-round residue, then calls `run-bounded.ps1`. **Do not copy it into an evidence directory** — see the Conventions note below; it resolves the bounded runner beside itself (or `$env:MODTEST_HARNESS_PATH`, or `-HarnessPath`). `-PreflightOnly` resolves and reports everything and touches **nothing**. **It refuses to overwrite a previous round's outputs (exit 2, each conflict named)** — see "Per-round outputs (task-38)" below |
+| `run-round.test.ps1` | PowerShell 5.1 / 7 | `pwsh tools/run-round.test.ps1 [-ArchivedEvidenceRoot <dir>] [-SkipArchivedEquivalence] [-OldRunner <pre-change run-round.ps1>]` → `RUN-ROUND-TEST PASS (41 checks on a default run)` (offline: canonical-file shape, CLI **superset** of the archived copies, directory-independent harness resolution, read-only preflight, archived-copy provenance, and **per-round outputs never clobber** — driven through a stub harness, so no JVM is ever started; `-OldRunner` enables the byte-identical single-round comparison and is reported as SKIPPED, never as a pass, when absent) |
 
 ## Conventions
 
@@ -244,6 +244,30 @@ yielding the same sha; the code carrying that property has not been changed sinc
 `docs/.gradle-lock` before any gradle**; and **no gradle while a real round is running** — it is CPU / RAM /
 disk noise the round did not ask for. `assert-no-round.ps1 -What gradle-build` enforces both conditions
 (no real round AND no lock holder) and is meant to be run as its own command before every build.
+
+### Per-round outputs (task-38)
+
+`run-round.ps1` writes **fixed names** under `-Evidence`: `round-setup\residue-before.txt`,
+`round-setup\setup-manifest.txt`, `round-setup\restore-report.txt`, plus the three `*.orig` backups.
+Two rounds sharing one `-Evidence` root therefore used to overwrite each other, and **round 1's harness
+verdict became permanently unreferenceable** (measured on `2026-09-27-a2-doubleimage`, task-31/A2).
+
+**Rules**
+
+1. **One round, one directory** — the historical practice: `-Evidence <dir>\r1`, `-Evidence <dir>\r2`.
+2. **Sharing one root is allowed, but tag every round**: `-RunTag r1` writes those files into
+   `round-setup\r1\` with the file names unchanged, so nothing has to re-learn a path.
+3. **By default the script refuses to overwrite.** If any of those outputs already exists it exits **2**
+   and prints one `conflict:` line per file, plus how to proceed. It writes nothing in that case, so a
+   previous round's evidence stays byte-identical. A reused `-RunTag` is refused the same way, and a tag
+   that is not a plain directory name (path separators, `.`, `..`) is rejected.
+4. **An untagged single round stays byte-identical to what earlier rounds produced** — only a tagged
+   round adds a `runTag=` line to its manifest. `run-round.test.ps1 -OldRunner <pre-change script>`
+   proves this by running both versions and comparing the outputs field by field.
+
+⚠️ **The archived `run-round.ps1` copies under `docs/evidence/**` are FROZEN HISTORY** — they are the
+bytes that actually ran. Do not edit them, and do not back-fill this change into them. The live copy is
+`tools/run-round.ps1` only.
 
 ## 驱动脚本坑清单（PowerShell / .NET）—— 每条都来自一次真机事故
 

@@ -34,6 +34,11 @@
 param(
     [string]$RoundRunner = '',
     [string]$ArchivedEvidenceRoot = '',
+    # Optional: the PRE-CHANGE run-round.ps1. When supplied, a single untagged round is run through both
+    # versions and their outputs are compared field by field -- that is the strongest available statement
+    # of "existing single-round behaviour is unchanged". Supplying it is optional so the suite still runs
+    # anywhere, but the byte-identical check is reported as SKIPPED (never as a pass) when it is absent.
+    [string]$OldRunner = '',
     [switch]$SkipArchivedEquivalence,
     [switch]$KeepTemp
 )
@@ -258,6 +263,184 @@ $emptyEvidence = Join-Path $tempRoot 'ev-empty'
 New-Item -ItemType Directory -Force -Path $emptyEvidence | Out-Null
 $missingOut = @(& pwsh -NoProfile -File $RoundRunner -Evidence $emptyEvidence -PreflightOnly 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
 Add-Check 'missing launch-args.json -> exit 2 with ROUND_PREFLIGHT=FAIL:no-launch-args' (($LASTEXITCODE -eq 2) -and ($missingOut -match 'ROUND_PREFLIGHT=FAIL:no-launch-args')) ('exit=' + $LASTEXITCODE)
+
+# ---------------------------------------------------------------- (D) per-round outputs never clobber
+Write-Output '--- D. per-round setup outputs never clobber ---'
+function Add-Skip {
+    param([string]$Name, [string]$Reason)
+    $script:Skipped++
+    Write-Output ('  SKIP  ' + $Name + ' -- ' + $Reason)
+}
+# These scenarios run a REAL round against a synthetic gameDir, but through a STUB harness, so no JVM is
+# ever started. run-round.ps1 refuses to run while any java/javaw exists (a safety property we must not
+# weaken for a test), so the scenarios that reach the write path report SKIP on a busy machine rather
+# than passing vacuously.
+$stubHarness = Join-Path $tempRoot 'stub-harness-bounded.ps1'
+@'
+# Test double for run-bounded.ps1: accepts the harness contract and exits 0 without launching anything.
+# Declaring the parameters is deliberate -- it also PINS the contract run-round.ps1 splats.
+param(
+    [string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [string]$OptionsFile,
+    [int]$PerInstanceTimeoutSec, [int]$MaxInstances, [string]$EvidenceDir,
+    [switch]$Windowed, [switch]$VerifyWindow, [string]$BlockingWindowTitlePattern, [switch]$RestoreCursor
+)
+Write-Output 'STUB-HARNESS: nothing launched'
+exit 0
+'@ | Set-Content -LiteralPath $stubHarness -Encoding UTF8
+
+function New-FakeGameDir {
+    param([string]$Directory)
+    New-Item -ItemType Directory -Force -Path (Join-Path $Directory 'config') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $Directory 'saves') | Out-Null
+    Set-Content -LiteralPath (Join-Path $Directory 'options.txt') -Value "pauseOnLostFocus:true`nfov:0.0`n" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $Directory 'config\taclight-client.toml') -Value "schema = 1`n" -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $Directory 'config\oculus.properties') -Value "enableDebugOptions=false`n" -Encoding UTF8
+}
+
+function Invoke-Round {
+    param([string]$Script, [string]$EvidenceDir, [string[]]$ExtraArgs = @())
+    $argv = @('-NoProfile', '-File', $Script, '-Evidence', $EvidenceDir, '-HarnessPath', $stubHarness) + $ExtraArgs
+    $stdout = @(& pwsh @argv 2>&1 | ForEach-Object { [string]$_ })
+    return [pscustomobject]@{ exit = $LASTEXITCODE; stdout = ($stdout -join "`n") }
+}
+
+function Get-TreeShas {
+    param([string]$Directory)
+    $map = @{}
+    if (Test-Path -LiteralPath $Directory) {
+        Get-ChildItem -LiteralPath $Directory -Recurse -File | ForEach-Object {
+            $rel = $_.FullName.Substring($Directory.Length).TrimStart('\')
+            $map[$rel] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        }
+    }
+    return $map
+}
+
+function Get-ManifestMap {
+    param([string]$Path)
+    $map = [ordered]@{}
+    foreach ($line in @(Get-Content -LiteralPath $Path)) {
+        $index = $line.IndexOf('=')
+        if ($index -lt 1) { continue }
+        $map[$line.Substring(0, $index)] = $line.Substring($index + 1)
+    }
+    return $map
+}
+
+$anyJava = @(Get-Process java, javaw -ErrorAction SilentlyContinue).Count -gt 0
+$javaReason = 'a java/javaw process is running, and run-round.ps1 rightly refuses to start (exit 5)'
+
+# D1/D2: first untagged round writes the historical layout; a second one refuses and touches nothing.
+$evD = Join-Path $tempRoot 'ev-noclobber'
+New-FakeEvidence -Directory $evD -GameDirectory (Join-Path $tempRoot 'game-noclobber')
+New-FakeGameDir -Directory (Join-Path $tempRoot 'game-noclobber')
+if ($anyJava) {
+    Add-Skip 'D1 first untagged round + layout' $javaReason
+    Add-Skip 'D2 second untagged round refuses (exit 2, names conflicts)' $javaReason
+    Add-Skip 'D2 round 1 evidence untouched by the refused round' $javaReason
+    Add-Skip 'D3 -RunTag writes into round-setup\<tag>\' $javaReason
+    Add-Skip 'D4 a reused -RunTag refuses' $javaReason
+} else {
+    $setupDirD = Join-Path $evD 'round-setup'
+    $d1 = Invoke-Round -Script $RoundRunner -EvidenceDir $evD
+    Add-Check 'D1 a first untagged round still succeeds' ($d1.exit -eq 0) ('exit=' + $d1.exit)
+    Add-Check 'D1 the three outputs land DIRECTLY in round-setup\ (historical layout, no subdir)' (
+        (Test-Path -LiteralPath (Join-Path $setupDirD 'residue-before.txt')) -and
+        (Test-Path -LiteralPath (Join-Path $setupDirD 'setup-manifest.txt')) -and
+        (Test-Path -LiteralPath (Join-Path $setupDirD 'restore-report.txt')))
+    $shasD1 = Get-TreeShas -Directory $setupDirD
+
+    $d2 = Invoke-Round -Script $RoundRunner -EvidenceDir $evD
+    Add-Check 'D2 a second untagged round REFUSES (exit 2)' ($d2.exit -eq 2) ('exit=' + $d2.exit)
+    Add-Check 'D2 it reports ROUND_PREFLIGHT=FAIL:outputs-exist' ($d2.stdout -match 'ROUND_PREFLIGHT=FAIL:outputs-exist')
+    Add-Check 'D2 it names EACH conflicting file' (
+        ($d2.stdout -match 'conflict: .*setup-manifest\.txt') -and
+        ($d2.stdout -match 'conflict: .*restore-report\.txt') -and
+        ($d2.stdout -match 'conflict: .*residue-before\.txt')) ('named=' + (($d2.stdout -split "`n") | Where-Object { $_ -match 'conflict:' }).Count)
+    Add-Check 'D2 it tells the caller how to proceed (subdirectory or -RunTag)' (($d2.stdout -match '\-RunTag') -and ($d2.stdout -match 'subdirectory'))
+    $shasD2 = Get-TreeShas -Directory $setupDirD
+    Add-Check 'D2 round 1 evidence is byte-identical after the refusal (nothing was touched)' (
+        ($shasD1.Count -eq $shasD2.Count) -and (@($shasD1.Keys | Where-Object { $shasD2[$_] -ne $shasD1[$_] }).Count -eq 0)) ('files=' + $shasD1.Count)
+
+    # D3: -RunTag puts the same file names in a per-round subdirectory, leaving the untagged set alone.
+    $d3 = Invoke-Round -Script $RoundRunner -EvidenceDir $evD -ExtraArgs @('-RunTag', 't1')
+    Add-Check 'D3 a tagged round succeeds' ($d3.exit -eq 0) ('exit=' + $d3.exit)
+    $tagDir = Join-Path $setupDirD 't1'
+    Add-Check 'D3 the three files land in round-setup\t1\ with UNCHANGED names' (
+        (Test-Path -LiteralPath (Join-Path $tagDir 'residue-before.txt')) -and
+        (Test-Path -LiteralPath (Join-Path $tagDir 'setup-manifest.txt')) -and
+        (Test-Path -LiteralPath (Join-Path $tagDir 'restore-report.txt')))
+    $tagManifestPath = Join-Path $tagDir 'setup-manifest.txt'
+    $tagManifest = $null
+    if (Test-Path -LiteralPath $tagManifestPath) { $tagManifest = Get-ManifestMap -Path $tagManifestPath }
+    Add-Check 'D3 the tagged manifest records runTag=t1' (($null -ne $tagManifest) -and ($tagManifest['runTag'] -eq 't1')) ('runTag=' + $(if ($null -ne $tagManifest) { [string]$tagManifest['runTag'] } else { '<no manifest>' }))
+    $untaggedManifest = Get-ManifestMap -Path (Join-Path $setupDirD 'setup-manifest.txt')
+    Add-Check 'D3 the UNtagged manifest has no runTag field (the addition is tagged-only)' (($null -ne $untaggedManifest) -and (-not $untaggedManifest.Contains('runTag')))
+    $shasD3 = Get-TreeShas -Directory $setupDirD
+    Add-Check 'D3 the untagged files are untouched by the tagged round' (
+        @($shasD1.Keys | Where-Object { $shasD3[$_] -ne $shasD1[$_] }).Count -eq 0)
+
+    # D4: reusing a tag is refused too -- a tag is a new round, never a place to overwrite.
+    $d4 = Invoke-Round -Script $RoundRunner -EvidenceDir $evD -ExtraArgs @('-RunTag', 't1')
+    Add-Check 'D4 reusing -RunTag t1 REFUSES (exit 2, no silent overwrite)' (($d4.exit -eq 2) -and ($d4.stdout -match 'ROUND_PREFLIGHT=FAIL:run-tag-exists')) ('exit=' + $d4.exit)
+    $shasD4 = Get-TreeShas -Directory $setupDirD
+    Add-Check 'D4 the tagged round evidence is unchanged after the refusal' (
+        @($shasD3.Keys | Where-Object { $shasD4[$_] -ne $shasD3[$_] }).Count -eq 0)
+
+    # D5: a tag must be a directory NAME -- anything that could escape the directory is rejected.
+    $d5 = Invoke-Round -Script $RoundRunner -EvidenceDir $evD -ExtraArgs @('-RunTag', '..\escape')
+    Add-Check 'D5 a path-like -RunTag is rejected (exit 2)' (($d5.exit -eq 2) -and ($d5.stdout -match 'ROUND_PREFLIGHT=FAIL:bad-run-tag')) ('exit=' + $d5.exit)
+    Add-Check 'D5 nothing was written outside the evidence root' (-not (Test-Path -LiteralPath (Join-Path $evD 'escape')))
+}
+
+# D6: compatibility -- one untagged round must produce the same bytes as the pre-change runner.
+if ($OldRunner.Length -eq 0) {
+    Add-Skip 'D6 single untagged round is byte-identical to the pre-change runner' 'pass -OldRunner <pre-change run-round.ps1> to enable this comparison'
+} elseif (-not (Test-Path -LiteralPath $OldRunner -PathType Leaf)) {
+    Add-Check 'D6 -OldRunner path exists' $false ('not a file: ' + $OldRunner)
+} elseif ($anyJava) {
+    Add-Skip 'D6 single untagged round is byte-identical to the pre-change runner' $javaReason
+} else {
+    $evOld = Join-Path $tempRoot 'ev-old-runner'
+    New-FakeEvidence -Directory $evOld -GameDirectory (Join-Path $tempRoot 'game-old-runner')
+    New-FakeGameDir -Directory (Join-Path $tempRoot 'game-old-runner')
+    $evNew = Join-Path $tempRoot 'ev-new-runner'
+    New-FakeEvidence -Directory $evNew -GameDirectory (Join-Path $tempRoot 'game-new-runner')
+    New-FakeGameDir -Directory (Join-Path $tempRoot 'game-new-runner')
+    $runOld = Invoke-Round -Script (Resolve-Path -LiteralPath $OldRunner).Path -EvidenceDir $evOld
+    $runNew = Invoke-Round -Script $RoundRunner -EvidenceDir $evNew
+    Add-Check 'D6 both the old and the new runner complete one untagged round' (($runOld.exit -eq 0) -and ($runNew.exit -eq 0)) ('old=' + $runOld.exit + ' new=' + $runNew.exit)
+    # Everything below is guarded rather than thrown on: when this suite is pointed at the PRE-CHANGE
+    # runner as a red control, those files legitimately do not exist, and the suite must still reach its
+    # summary and report the remaining checks (a throw under $ErrorActionPreference='Stop' hid D4/D5 once).
+    foreach ($report in @('residue-before.txt', 'restore-report.txt')) {
+        $oldPath = Join-Path $evOld ('round-setup\' + $report)
+        $newPath = Join-Path $evNew ('round-setup\' + $report)
+        $oldText = if (Test-Path -LiteralPath $oldPath) { [System.IO.File]::ReadAllText($oldPath) } else { '<missing>' }
+        $newText = if (Test-Path -LiteralPath $newPath) { [System.IO.File]::ReadAllText($newPath) } else { '<missing>' }
+        Add-Check ('D6 ' + $report + ' is byte-identical to the old runner') (($oldText -ne '<missing>') -and ($oldText -eq $newText))
+    }
+    # setup-manifest.txt legitimately differs in the fields that name THIS run's paths and time; every
+    # other field -- and the field ORDER, which is the file's shape -- must be identical.
+    $mapOld = $null
+    $mapNew = $null
+    $oldManifestPath = Join-Path $evOld 'round-setup\setup-manifest.txt'
+    $newManifestPath = Join-Path $evNew 'round-setup\setup-manifest.txt'
+    if (Test-Path -LiteralPath $oldManifestPath) { $mapOld = Get-ManifestMap -Path $oldManifestPath }
+    if (Test-Path -LiteralPath $newManifestPath) { $mapNew = Get-ManifestMap -Path $newManifestPath }
+    $volatileKeys = @('round', 'gameDir', 'harnessPath', 'canonicalScript')
+    $stableOld = @()
+    $stableNew = @()
+    $mismatch = @()
+    if (($null -ne $mapOld) -and ($null -ne $mapNew)) {
+        $stableOld = @($mapOld.Keys | Where-Object { $volatileKeys -notcontains $_ })
+        $stableNew = @($mapNew.Keys | Where-Object { $volatileKeys -notcontains $_ })
+        $mismatch = @($stableOld | Where-Object { $mapOld[$_] -ne $mapNew[$_] })
+    }
+    Add-Check 'D6 the manifest has the same STABLE fields in the same order' (($stableOld.Count -gt 0) -and (($stableOld -join '|') -eq ($stableNew -join '|'))) ('old=' + ($stableOld -join ',') + ' new=' + ($stableNew -join ','))
+    Add-Check 'D6 every stable manifest field has the same value' (($stableOld.Count -gt 0) -and ($mismatch.Count -eq 0)) ('differing=' + ($mismatch -join ','))
+    Add-Check 'D6 no per-tag subdirectory is created without -RunTag' (-not (Test-Path -LiteralPath (Join-Path $evNew 'round-setup\t1')))
+}
 
 # ---------------------------------------------------------------- result
 if (-not $KeepTemp) {

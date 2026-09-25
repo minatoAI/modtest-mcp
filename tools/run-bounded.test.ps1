@@ -302,6 +302,93 @@ if ($null -ne $runTreeNew.json) {
 # never leave a stray sleeper behind even if an assertion above failed
 if (Test-ProcessAlive -ProcessId $grandchildNew) { try { Stop-Process -Id $grandchildNew -Force -ErrorAction Stop } catch { } }
 
+# ---------------------------------------------------------------- 7. guard SCOPE (task-28)
+# The pre-launch guard used to refuse whenever ANY process matched -BlockingProcessNames, so a
+# teammate's Gradle daemon blocked real rounds (measured twice) and two isolated instances could never
+# coexist. It is now scoped exactly like the post-run audit: a match blocks only if its command line
+# carries THIS round's instance signature. Three controls:
+#   1. an UNRELATED signature present  -> must NOT block (it is reported as NOT BLOCKING and ignored)
+#   2. a match carrying OUR signature  -> MUST block, and be named
+#   3. -DryRunScenario refuse          -> unchanged (asserted in section 4 above)
+# The signature used here is the scenario's own evidence directory: it is unique, and the harness's own
+# process command line contains it, so control 2 has a real in-scope match without pretending that a
+# shared interpreter path is an instance signature.
+# The signature passed on the command line ends up in THE HARNESS'S OWN command line. If
+# -BlockingProcessNames also matched the harness's own process name (pwsh), the guard would match
+# ITSELF and always refuse -- a self-match artefact that would silently make both controls meaningless.
+# So pick a PEER process whose name is not pwsh/powershell, and drive both controls through it.
+$peer = $null
+foreach ($peerCandidate in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    if ($peerCandidate.Name -in @('pwsh.exe', 'powershell.exe')) { continue }
+    $peerCommandLine = [string]$peerCandidate.CommandLine
+    if ($peerCommandLine.Length -lt 12) { continue }
+    $peer = [pscustomobject]@{ pid = $peerCandidate.ProcessId; exe = $peerCandidate.Name; bare = [System.IO.Path]::GetFileNameWithoutExtension($peerCandidate.Name) }
+    break
+}
+Add-Check 'scope/a non-harness peer process exists for the scope controls' ($null -ne $peer) 'none found: every candidate was pwsh/powershell (the harness itself)'
+
+Write-Output '--- guard scope: an UNRELATED instance signature must NOT block ---'
+$dirScopeUnrelated = Join-Path $testRoot 'scope-unrelated'
+New-Item -ItemType Directory -Force -Path $dirScopeUnrelated | Out-Null
+$foreignSignature = 'modtest-signature-absent-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$peerName = if ($null -ne $peer) { $peer.exe } else { 'modtest-no-such-process' }
+$argvUnrelated = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', 'ok',
+    '-EvidenceDir', $dirScopeUnrelated, '-PollSeconds', '1',
+    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $foreignSignature)
+$outUnrelated = @(& pwsh @argvUnrelated 2>&1 | ForEach-Object { [string]$_ })
+$exitUnrelated = $LASTEXITCODE
+$textUnrelated = ($outUnrelated -join "`n")
+Add-Check 'scope/unrelated process does NOT block (exit 0)' ($exitUnrelated -eq 0) ('exit=' + $exitUnrelated + ' peer=' + $peerName)
+Add-Check 'scope/unrelated process is reported as NOT BLOCKING' ($textUnrelated -match 'NOT BLOCKING:')
+Add-Check 'scope/scope line records inScope=0 with outOfScope>=1' ($textUnrelated -match 'inScope=0 outOfScope=[1-9]')
+Add-Check 'scope/no refusal was printed for an unrelated process' (-not ($textUnrelated -match 'REFUSING TO START'))
+Add-Check 'scope/the round then ran normally (verdict PASS)' ($textUnrelated -match 'VERDICT=PASS')
+
+Write-Output '--- guard scope: a process carrying OUR signature MUST block ---'
+$dirScopeSame = Join-Path $testRoot 'scope-same'
+New-Item -ItemType Directory -Force -Path $dirScopeSame | Out-Null
+# The peer's own image path is always in its command line, so its executable name is a real in-scope
+# signature for it -- and it is NOT in the harness's command line, so the harness is not a candidate.
+$ourSignature = if ($null -ne $peer) { $peer.exe } else { $dirScopeSame }
+$argvSame = @('-NoProfile', '-File', $Runner, '-DryRun', '-DryRunScenario', 'ok',
+    '-EvidenceDir', $dirScopeSame, '-PollSeconds', '1',
+    '-BlockingProcessNames', $peerName, '-BlockingWindowTitlePattern', '', '-InstanceSignature', $ourSignature)
+$outSame = @(& pwsh @argvSame 2>&1 | ForEach-Object { [string]$_ })
+$exitSame = $LASTEXITCODE
+$textSame = ($outSame -join "`n")
+Add-Check 'scope/same-signature process DOES block (exit 3)' ($exitSame -eq 3) ('exit=' + $exitSame + ' signature=' + $ourSignature)
+Add-Check 'scope/scope line records inScope>=1' ($textSame -match 'inScope=[1-9]')
+Add-Check 'scope/the in-scope process is named with its command line' (($textSame -match 'REFUSING TO START: pid=') -and ($textSame -match '(?i)cmdline:'))
+Add-Check 'scope/nothing was launched on this refusal' (@(Get-ChildItem -LiteralPath $dirScopeSame -File -Filter '*-instance*-out.txt' -ErrorAction SilentlyContinue).Count -eq 0)
+$sameJsonFiles = @(Get-ChildItem -LiteralPath $dirScopeSame -File -Filter 'run-bounded-*.json' -ErrorAction SilentlyContinue)
+Add-Check 'scope/refusal evidence records verdict=REFUSED' ($sameJsonFiles.Count -gt 0)
+if ($sameJsonFiles.Count -gt 0) {
+    $sameSummary = Get-Content -LiteralPath $sameJsonFiles[0].FullName -Raw | ConvertFrom-Json
+    Add-Check 'scope/evidence records the instance signature it matched on' (([string]$sameSummary.instanceSignature) -eq $ourSignature) ('sig=' + $sameSummary.instanceSignature)
+    Add-Check 'scope/evidence blocking[] holds only the in-scope match(es)' ([int]$sameSummary.blockingCount -ge 1) ('count=' + $sameSummary.blockingCount)
+    Add-Check 'scope/every in-scope entry is tagged in-scope' (@($sameSummary.blocking | Where-Object { [string]$_.scope -ne 'in-scope' }).Count -eq 0)
+    Add-Check 'scope/evidence lists the out-of-scope matches separately' ($null -ne $sameSummary.PSObject.Properties['blockingOutOfScope'])
+    Add-Check 'scope/out-of-scope entries explain why they did not block' (@($sameSummary.blockingOutOfScope | Where-Object { [string]$_.scopeReason -notmatch 'does not carry' }).Count -eq 0)
+} else {
+    Add-Check 'scope/evidence records the instance signature it matched on' $false 'no evidence JSON'
+    Add-Check 'scope/evidence blocking[] holds only the in-scope match(es)' $false 'no evidence JSON'
+    Add-Check 'scope/every in-scope entry is tagged in-scope' $false 'no evidence JSON'
+    Add-Check 'scope/evidence lists the out-of-scope matches separately' $false 'no evidence JSON'
+    Add-Check 'scope/out-of-scope entries explain why they did not block' $false 'no evidence JSON'
+}
+Write-Output '--- guard scope: -Slot is printed and recorded ---'
+Add-Check 'scope/slot is printed on the run banner' ($textUnrelated -match 'slot=') 
+$slotJsonFiles = @(Get-ChildItem -LiteralPath $dirScopeUnrelated -File -Filter 'run-bounded-*.json' -ErrorAction SilentlyContinue)
+if ($slotJsonFiles.Count -gt 0) {
+    $slotSummary = Get-Content -LiteralPath $slotJsonFiles[0].FullName -Raw | ConvertFrom-Json
+    Add-Check 'scope/evidence records a non-empty slot' (([string]$slotSummary.slot).Length -gt 0) ('slot=' + $slotSummary.slot)
+    # Default (no explicit -Slot) must NOT change the evidence filename: run-bounded-<stamp>.json
+    Add-Check 'scope/default slot leaves the evidence filename unchanged' ($slotJsonFiles[0].Name -match '^run-bounded-\d{8}-\d{6}\.json$') ($slotJsonFiles[0].Name)
+} else {
+    Add-Check 'scope/evidence records a non-empty slot' $false 'no evidence JSON'
+    Add-Check 'scope/default slot leaves the evidence filename unchanged' $false 'no evidence JSON'
+}
+
 # ---------------------------------------------------------------- result
 if (-not $KeepEvidence) {
     try { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
